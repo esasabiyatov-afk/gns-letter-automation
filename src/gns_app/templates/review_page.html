@@ -1,0 +1,140 @@
+{% extends "base.html" %}
+{% block title %}Проверка страницы {{ page.page_number }} · ГНС{% endblock %}
+{% block content %}
+<div class="review-workspace">
+  <section class="document-viewer">
+    <div class="viewer-toolbar">
+      <a class="back-link" href="/review">← К очереди</a>
+      <strong>Страница {{ page.page_number }}</strong>
+      <div class="viewer-actions">
+        <button type="button" data-zoom="-0.15">−</button>
+        <button type="button" data-zoom="0">100%</button>
+        <button type="button" data-zoom="0.15">+</button>
+        <button type="button" id="toggle-image">Улучшенная</button>
+      </div>
+    </div>
+    <div class="viewer-canvas">
+      {% if page.preview_path %}
+        <img id="review-image" src="/pages/{{ page.id }}/image"
+             data-original="/pages/{{ page.id }}/image"
+             data-enhanced="/pages/{{ page.id }}/image?variant=enhanced"
+             alt="Проблемная страница {{ page.page_number }}">
+      {% else %}
+        <div class="empty-state">Превью не создано.</div>
+      {% endif %}
+    </div>
+  </section>
+
+  <aside class="review-form-panel">
+    <div class="review-form-header">
+      <p class="eyebrow">РУЧНОЕ ПОДТВЕРЖДЕНИЕ</p>
+      <h1>Обозначьте страницу</h1>
+      <p class="issue-box">{{ page.issue_message or 'Проверьте данные.' }}</p>
+    </div>
+    {% if error %}
+      <div class="alert alert-error">{{ error }}</div>
+    {% endif %}
+    <form method="post" action="/review/{{ page.id }}" id="review-form">
+      <fieldset>
+        <legend>Тип страницы</legend>
+        <div class="type-selector">
+        {% for value, label in page_type_labels.items() %}
+          {% if value != 'unknown' %}
+          <label>
+            <input type="radio" name="page_type" value="{{ value }}"
+              {% if page.page_type == value %}checked{% endif %} required>
+            <span>{{ label }}</span>
+          </label>
+          {% endif %}
+        {% endfor %}
+        </div>
+      </fieldset>
+
+      <div id="letter-fields">
+        <div class="section-title">
+          <h2>Данные письма</h2>
+          <span>Обязательные поля</span>
+        </div>
+        <label class="field">
+          <span>Район и место</span>
+          <input name="district_place" value="{{ case.get('district_place') or '' }}"
+                 placeholder="по Ленинскому району города Бишкек">
+        </label>
+        <label class="field">
+          <span>Должность адресата</span>
+          <input name="recipient_position" value="{{ case.get('recipient_position') or '' }}"
+                 placeholder="Зам. начальника управления">
+        </label>
+        <label class="field">
+          <span>Полное ФИО адресата</span>
+          <input name="recipient_full_name" value="{{ case.get('recipient_full_name') or '' }}"
+                 placeholder="Телтаев Рахатбек Замирбекович">
+        </label>
+        <label class="field">
+          <span>Обращение в ответе</span>
+          <input name="recipient_display_name" value="{{ case.get('recipient_display_name') or '' }}"
+                 placeholder="Оставьте пустым для безопасного склонения">
+        </label>
+        <div class="two-columns">
+          <label class="field">
+            <span>Начало периода</span>
+            <input type="date" name="period_start" value="{{ case.get('period_start') or '' }}">
+          </label>
+          <label class="field">
+            <span>Конец периода</span>
+            <input type="date" name="period_end" value="{{ case.get('period_end') or '' }}">
+          </label>
+        </div>
+
+        <div class="section-title">
+          <h2>Налогоплательщики</h2>
+          <button type="button" class="text-button" id="add-taxpayer">+ Добавить</button>
+        </div>
+        <div id="taxpayer-list">
+        {% for taxpayer in taxpayers %}
+          <div class="taxpayer-row">
+            <label class="field">
+              <span>Наименование</span>
+              <input name="taxpayer_name" value="{{ taxpayer.name }}"
+                     placeholder="Наименование или ФИО">
+            </label>
+            <label class="field inn-field">
+              <span>ИНН</span>
+              <input name="taxpayer_inn" value="{{ taxpayer.inn }}"
+                     inputmode="numeric" maxlength="14" placeholder="14 цифр">
+            </label>
+            <button type="button" class="remove-row" aria-label="Удалить">×</button>
+          </div>
+        {% endfor %}
+        </div>
+
+        <label class="field">
+          <span>Исполнитель банка</span>
+          <input name="employee_name" value="{{ case.get('employee_name') or '' }}"
+                 placeholder="Гапарова Э.">
+        </label>
+
+        <div class="kyrgyz-keyboard" aria-label="Кыргызские буквы">
+          <span>Кыргызские буквы:</span>
+          {% for letter in ['Ң','ң','Ө','ө','Ү','ү'] %}
+            <button type="button" data-letter="{{ letter }}">{{ letter }}</button>
+          {% endfor %}
+        </div>
+      </div>
+
+      <details class="ocr-details">
+        <summary>Показать текстовый слой PDF</summary>
+        <pre>{{ page.extracted_text or 'Текстовый слой отсутствует.' }}</pre>
+      </details>
+
+      <button class="button button-primary button-block" type="submit">
+        Подтвердить и продолжить
+      </button>
+      <p class="form-note">
+        Подтверждение и ручные изменения будут записаны в журнал.
+      </p>
+    </form>
+  </aside>
+</div>
+{% endblock %}
+

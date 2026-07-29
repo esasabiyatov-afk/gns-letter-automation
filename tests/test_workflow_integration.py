@@ -1,0 +1,64 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from gns_app.domain import AbsStatus, CaseStatus
+
+
+def test_sample_pdf_end_to_end_without_guessing(
+    workflow, project_root: Path
+):
+    sample = project_root / "УГНС" / "пример письма.pdf"
+    with sample.open("rb") as stream:
+        upload_id = workflow.create_upload(sample.name, stream)
+
+    workflow.process_upload(upload_id)
+    upload = workflow.get_upload(upload_id)
+    pages = workflow.get_upload_pages(upload_id)
+
+    assert upload["page_count"] == 2
+    assert len(pages) == 2
+    assert {page["qr_status"] for page in pages} == {"found"}
+    assert all(
+        page["status"]
+        not in {"registered", "preview_ready", "processing"}
+        for page in pages
+    )
+
+    letter_page = next(
+        page for page in pages if page["page_type"] == "letter"
+    )
+    assert workflow.get_case(letter_page["case_id"])["source_kind"] == "qr_link"
+    case_id = workflow.confirm_page(
+        letter_page["id"],
+        page_type="letter",
+        district_place="по Ленинскому району города Бишкек",
+        recipient_position="Зам. начальника управления",
+        recipient_full_name="Телтаев Рахатбек Замирбекович",
+        recipient_display_name="",
+        period_start="2019-11-14",
+        period_end="2025-09-10",
+        employee_name="Гапарова Э.",
+        taxpayers=[
+            {
+                "name": (
+                    'Филиал Общества с ограниченной ответственностью '
+                    '"ВИТЕЛ 11" в Кыргызской Республике'
+                ),
+                "inn": "01411201910186",
+            }
+        ],
+    )
+    case = workflow.get_case(case_id)
+    assert case["recipient_display_name"] == "Телтаеву Р. З."
+    assert case["source_kind"] == "manual"
+    assert case["status"] == CaseStatus.READY_FOR_ABS
+
+    abs_result = workflow.check_abs(case_id, "test-user", "one-time-password")
+    assert abs_result.status == AbsStatus.NOT_FOUND
+    case = workflow.get_case(case_id)
+    assert case["status"] == CaseStatus.READY_FOR_RESPONSE
+
+    response = workflow.generate_response(case_id)
+    assert response.exists()
+    assert workflow.get_case(case_id)["status"] == CaseStatus.RESPONSE_CREATED

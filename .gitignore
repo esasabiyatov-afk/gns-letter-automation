@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+runtime/
+dist/
+build/
+*.egg-info/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Входящие и шаблоны могут содержать банковскую и налоговую информацию.
+# Они остаются локально и не должны случайно попасть в репозиторий.
+*.pdf
+*.PDF
+*.doc
+*.docx

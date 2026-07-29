@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Ручная проверка · ГНС{% endblock %}
+{% block content %}
+<div class="page-heading">
+  <div>
+    <p class="eyebrow">ОЧЕРЕДЬ СОТРУДНИКА</p>
+    <h1>Проблемные страницы</h1>
+    <p>Исправьте только выделенные страницы. Затем обработка продолжится.</p>
+  </div>
+  <span class="count-pill">{{ pages|length }}</span>
+</div>
+
+{% if pages %}
+<section class="review-list">
+{% for page in pages %}
+  <article class="review-row">
+    <a class="review-thumb" href="/review/{{ page.id }}">
+      {% if page.preview_path %}
+        <img src="/pages/{{ page.id }}/image" alt="Страница {{ page.page_number }}">
+      {% else %}
+        <span>{{ page.page_number }}</span>
+      {% endif %}
+    </a>
+    <div class="review-info">
+      <p class="eyebrow">{{ page.original_filename }}</p>
+      <h2>Страница {{ page.page_number }}</h2>
+      <p>{{ page.issue_message or 'Нужна ручная проверка.' }}</p>
+      <div class="tag-row">
+        <span class="tag">{{ page_type_labels.get(page.page_type, page.page_type) }}</span>
+        <span class="tag">QR: {{ page.qr_status }}</span>
+        <span class="tag">OCR: {{ (page.ocr_confidence * 100)|round|int }}%</span>
+      </div>
+    </div>
+    <a class="button button-danger" href="/review/{{ page.id }}">Открыть</a>
+  </article>
+{% endfor %}
+</section>
+{% else %}
+<div class="empty-state large">
+  <strong>Проблемных страниц нет</strong>
+  <span>Все зарегистрированные страницы имеют итоговый статус.</span>
+</div>
+{% endif %}
+{% endblock %}
+

@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}{{ upload.original_filename }} · ГНС{% endblock %}
+{% block head %}
+{% if upload.status in ['registered', 'processing'] %}
+  <meta http-equiv="refresh" content="5">
+{% endif %}
+{% endblock %}
+{% block content %}
+<div class="page-heading">
+  <div>
+    <a class="back-link" href="/">← Главная</a>
+    <p class="eyebrow">ПАКЕТНЫЙ PDF</p>
+    <h1>{{ upload.original_filename }}</h1>
+    <p>{{ upload.page_count }} страниц · SHA-256 {{ upload.sha256[:12] }}…</p>
+  </div>
+  <span class="status status-{{ upload.status }}">
+    {{ status_labels.get(upload.status, upload.status) }}
+  </span>
+</div>
+
+{% if upload.status in ['registered', 'processing'] %}
+<div class="progress-note">
+  <span class="spinner"></span>
+  Обработка идёт в фоне. Страница обновляется автоматически.
+</div>
+{% endif %}
+
+<section class="page-grid">
+{% for page in pages %}
+  <article class="page-card {% if page.status in ['needs_review', 'technical_error'] %}page-card-problem{% endif %}">
+    <div class="page-preview">
+      {% if page.preview_path %}
+        <img src="/pages/{{ page.id }}/image" alt="Страница {{ page.page_number }}">
+      {% else %}
+        <div class="preview-placeholder"><span>{{ page.page_number }}</span></div>
+      {% endif %}
+      <span class="page-number">Стр. {{ page.page_number }}</span>
+    </div>
+    <div class="page-card-body">
+      <div class="page-meta">
+        <strong>{{ page_type_labels.get(page.page_type, page.page_type) }}</strong>
+        <span class="status status-{{ page.status }}">
+          {{ status_labels.get(page.status, page.status) }}
+        </span>
+      </div>
+      <dl>
+        <div><dt>QR</dt><dd>{{ page.qr_status }}</dd></div>
+        <div><dt>Качество</dt><dd>{% if page.quality_score is not none %}{{ (page.quality_score * 100)|round|int }}%{% else %}—{% endif %}</dd></div>
+      </dl>
+      {% if page.issue_message %}
+        <p class="issue-text">{{ page.issue_message }}</p>
+      {% endif %}
+      {% if page.status in ['needs_review', 'technical_error'] %}
+        <a class="button button-danger button-block" href="/review/{{ page.id }}">
+          Проверить страницу
+        </a>
+      {% elif page.preview_path %}
+        <a class="button button-secondary button-block" href="/pages/{{ page.id }}/image" target="_blank">
+          Открыть превью
+        </a>
+      {% endif %}
+    </div>
+  </article>
+{% endfor %}
+</section>
+{% endblock %}
+

@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Журнал · ГНС{% endblock %}
+{% block content %}
+<div class="page-heading">
+  <div>
+    <p class="eyebrow">АУДИТ</p>
+    <h1>Журнал обработки</h1>
+    <p>Учётные данные АБС в журнал не записываются.</p>
+  </div>
+</div>
+
+<section class="timeline">
+{% for event in events %}
+  <article>
+    <span class="timeline-dot"></span>
+    <div class="timeline-body">
+      <div class="timeline-title">
+        <strong>{{ event_labels.get(event.event_type, event.event_type) }}</strong>
+        <time>{{ event.created_at.replace('T', ' ') }}</time>
+      </div>
+      <p>{{ entity_labels.get(event.entity_type, event.entity_type) }} · {{ event.entity_id[:12] }}… · {{ 'система' if event.actor == 'system' else event.actor }}</p>
+      {% if event.payload %}
+        <details><summary>Детали</summary><pre>{{ event.payload | tojson(indent=2) }}</pre></details>
+      {% endif %}
+    </div>
+  </article>
+{% else %}
+  <div class="empty-state">Журнал пока пуст.</div>
+{% endfor %}
+</section>
+{% endblock %}

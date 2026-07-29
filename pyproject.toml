@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gns-letter-automation"
+version = "0.1.0"
+description = "Локальное приложение для безопасной обработки писем ГНС"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.116,<1",
+    "jinja2>=3.1,<4",
+    "python-multipart>=0.0.20,<1",
+    "uvicorn>=0.35,<1",
+    "pillow>=11,<13",
+    "pydantic>=2.11,<3",
+    "pypdf>=6,<7",
+    "pypdfium2>=5,<6",
+    "python-docx>=1.2,<2",
+    "zxing-cpp>=3.0,<4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.28,<1",
+    "pytest>=8.4,<9",
+]
+
+[project.scripts]
+gns-app = "gns_app.main:run"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+gns_app = ["templates/*.html", "static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block title %}Обращение · ГНС{% endblock %}
+{% block content %}
+<div class="page-heading">
+  <div>
+    <a class="back-link" href="/cases">← Обращения</a>
+    <p class="eyebrow">КАРТОЧКА ОБРАЩЕНИЯ</p>
+    <h1>{{ case.recipient_display_name or 'Не завершено' }}</h1>
+    <p>{{ case.district_place or 'Район не заполнен' }}</p>
+  </div>
+  <span class="status status-{{ case.status }}">{{ status_labels.get(case.status, case.status) }}</span>
+</div>
+
+{% if message %}<div class="alert alert-success">{{ message }}</div>{% endif %}
+{% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
+
+<div class="case-grid">
+  <section class="panel">
+    <p class="eyebrow">ПИСЬМО</p>
+    <h2>Подтверждённые данные</h2>
+    <dl class="detail-list">
+      <div><dt>Район и место</dt><dd>{{ case.district_place or '—' }}</dd></div>
+      <div><dt>Должность</dt><dd>{{ case.recipient_position or '—' }}</dd></div>
+      <div><dt>Полное ФИО</dt><dd>{{ case.recipient_full_name or '—' }}</dd></div>
+      <div><dt>Обращение</dt><dd>{{ case.recipient_display_name or '—' }}</dd></div>
+      <div><dt>Период</dt><dd>{{ case.period_start or '—' }} — {{ case.period_end or '—' }}</dd></div>
+      <div><dt>Исполнитель</dt><dd>{{ case.employee_name or '—' }}</dd></div>
+      <div><dt>Источник</dt><dd>{{ source_labels.get(case.source_kind, case.source_kind or '—') }}</dd></div>
+    </dl>
+  </section>
+
+  <section class="panel">
+    <p class="eyebrow">НАЛОГОПЛАТЕЛЬЩИКИ</p>
+    <h2>{{ taxpayers|length }} {{ taxpayer_word(taxpayers|length) }}</h2>
+    <div class="taxpayer-cards">
+    {% for taxpayer in taxpayers %}
+      <article>
+        <span>{{ loop.index }}</span>
+        <div><strong>{{ taxpayer.name }}</strong><small>ИНН {{ taxpayer.inn }}</small></div>
+        <em class="abs-result abs-{{ taxpayer.abs_result or 'not_checked' }}">
+          {{ abs_status_labels.get(taxpayer.abs_result or 'not_checked', taxpayer.abs_result or 'не проверен') }}
+        </em>
+      </article>
+    {% endfor %}
+    </div>
+  </section>
+</div>
+
+<section class="action-panel">
+  <div>
+    <p class="eyebrow">СЛЕДУЮЩЕЕ ДЕЙСТВИЕ</p>
+    {% if case.status == 'ready_for_abs' %}
+      <h2>Проверить налогоплательщиков в тестовой АБС</h2>
+      <p>Логин и пароль используются только для одного запроса и не сохраняются.</p>
+    {% elif case.status == 'ready_for_response' %}
+      <h2>Создать проект ответа Word</h2>
+      <p>Все налогоплательщики получили однозначный результат «не найден».</p>
+    {% elif case.status == 'manual_period_rule' %}
+      <h2>Требуется ручная обработка периода</h2>
+      <p>Начало периода раньше установленного порога {{ threshold }}.</p>
+    {% elif case.status == 'response_created' %}
+      <h2>Проект ответа готов</h2>
+      <p>Документ создан по копии утверждённого шаблона.</p>
+    {% else %}
+      <h2>Нужно завершить ручную проверку</h2>
+      <p>Автоматические действия пока заблокированы.</p>
+    {% endif %}
+  </div>
+  <div class="action-buttons">
+    {% if case.status == 'ready_for_abs' %}
+      <button class="button button-primary" type="button" data-open-dialog="abs-dialog">
+        Открыть проверку АБС
+      </button>
+    {% elif case.status == 'ready_for_response' %}
+      <form method="post" action="/cases/{{ case.id }}/response">
+        <button class="button button-primary" type="submit">Создать Word</button>
+      </form>
+    {% elif case.status == 'response_created' %}
+      <a class="button button-primary" href="/cases/{{ case.id }}/response">Скачать Word</a>
+    {% endif %}
+  </div>
+</section>
+
+<dialog id="abs-dialog" class="modal">
+  <form method="post" action="/cases/{{ case.id }}/abs" autocomplete="off">
+    <div class="modal-heading">
+      <div><p class="eyebrow">ТЕСТОВАЯ АБС</p><h2>Введите учётные данные</h2></div>
+      <button type="button" class="modal-close" data-close-dialog>×</button>
+    </div>
+    <p class="warning-note">
+      Данные не сохраняются. В текущей версии используется фейковая база.
+    </p>
+    <label class="field"><span>Логин АБС</span><input name="username" autocomplete="off" required></label>
+    <label class="field"><span>Пароль АБС</span><input name="password" type="password" autocomplete="new-password" required></label>
+    <button class="button button-primary button-block" type="submit">Проверить один раз</button>
+  </form>
+</dialog>
+{% endblock %}

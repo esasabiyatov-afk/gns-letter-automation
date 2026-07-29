@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Обращения · ГНС{% endblock %}
+{% block content %}
+<div class="page-heading">
+  <div>
+    <p class="eyebrow">РАБОЧИЙ ПРОЦЕСС</p>
+    <h1>Обращения</h1>
+    <p>Подтверждённые письма, проверка АБС и проекты ответов.</p>
+  </div>
+</div>
+
+<section class="panel">
+{% if cases %}
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr><th>Источник</th><th>Адресат</th><th>Период</th><th>Лиц</th><th>Статус</th><th></th></tr>
+    </thead>
+    <tbody>
+    {% for case in cases %}
+      <tr>
+        <td><strong>{{ case.original_filename }}</strong><small>{{ source_labels.get(case.source_kind, case.source_kind or '—') }}</small></td>
+        <td>{{ case.recipient_display_name or 'Не заполнено' }}</td>
+        <td>{{ case.period_start or '—' }} — {{ case.period_end or '—' }}</td>
+        <td>{{ case.taxpayer_count }}</td>
+        <td><span class="status status-{{ case.status }}">{{ status_labels.get(case.status, case.status) }}</span></td>
+        <td><a class="text-link" href="/cases/{{ case.id }}">Открыть</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="empty-state">Подтверждённых обращений пока нет.</div>
+{% endif %}
+</section>
+{% endblock %}
