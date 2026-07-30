@@ -68,7 +68,7 @@ STATUS_LABELS = {
     "ready": "Готово",
     "ready_for_abs": "Готово к АБС",
     "abs_checking": "Проверка АБС",
-    "manual_period_rule": "Ручная проверка периода",
+    "manual_period_rule": "Требуется проверка ОДБ",
     "ready_for_response": "Можно создать ответ",
     "response_created": "Ответ создан",
     "completed": "Успешно",
@@ -122,6 +122,20 @@ ABS_STATUS_LABELS = {
     "technical_error": "техническая ошибка",
 }
 
+ODB_STATUS_LABELS = {
+    "not_checked": "не проверен",
+    "found": "найден в ОДБ",
+    "not_found": "не найден в ОДБ",
+}
+
+REGISTRY_STATUS_LABELS = {
+    "match": "название совпадает",
+    "mismatch": "название отличается",
+    "not_found": "ИНН не найден",
+    "multiple": "несколько совпадений",
+    "error": "сверка недоступна",
+}
+
 EVENT_LABELS = {
     "upload_registered": "PDF зарегистрирован",
     "upload_reprocess_requested": "Запрошена повторная обработка",
@@ -139,6 +153,10 @@ EVENT_LABELS = {
     "page_manually_confirmed": "Страница подтверждена сотрудником",
     "fake_abs_checked": "Выполнена тестовая проверка АБС",
     "fake_abs_batch_checked": "Выполнена пакетная проверка АБС",
+    "odb_checked": "Записана ручная проверка ОДБ",
+    "registry_checked": "Выполнена сверка с ОсОО.KG",
+    "registry_variance_accepted": "Подтверждены расхождения ОсОО.KG",
+    "inbox_scanned": "Просканирована папка входящих",
     "response_created": "Создан ответ Word",
     "grouped_response_created": "Создан общий ответ Word",
     "district_place_edge_noise_removed": (
@@ -157,6 +175,7 @@ ENTITY_LABELS = {
     "case": "Обращение",
     "settings": "Настройка",
     "response_group": "Общий ответ",
+    "taxpayer": "Налогоплательщик",
 }
 
 
@@ -186,6 +205,8 @@ def context(request: Request, **values):
         "ocr_status_labels": OCR_STATUS_LABELS,
         "source_labels": SOURCE_LABELS,
         "abs_status_labels": ABS_STATUS_LABELS,
+        "odb_status_labels": ODB_STATUS_LABELS,
+        "registry_status_labels": REGISTRY_STATUS_LABELS,
         "event_labels": EVENT_LABELS,
         "entity_labels": ENTITY_LABELS,
         "taxpayer_word": taxpayer_word,
@@ -198,7 +219,7 @@ def context(request: Request, **values):
 
 
 @app.get("/", response_class=HTMLResponse)
-def index(request: Request):
+def index(request: Request, message: str = "", error: str = ""):
     return templates.TemplateResponse(
         request,
         "index.html",
@@ -207,6 +228,9 @@ def index(request: Request):
             stats=workflow.dashboard_stats(),
             uploads=workflow.list_uploads()[:12],
             cases=workflow.list_cases()[:8],
+            inbox_dir=str(settings.inbox_dir),
+            message=message,
+            error=error,
         ),
     )
 
@@ -226,14 +250,19 @@ def today(request: Request, message: str = "", error: str = ""):
 
 
 @app.get("/registry", response_class=HTMLResponse)
-def registry_lookup_page(request: Request):
+def registry_lookup_page(
+    request: Request,
+    query: str = "",
+    search_mode: str = "inn",
+):
     return templates.TemplateResponse(
         request,
         "registry.html",
         context(
             request,
             lookup=None,
-            lookup_inn="",
+            lookup_query=query,
+            search_mode=search_mode,
             error="",
         ),
     )
@@ -242,10 +271,11 @@ def registry_lookup_page(request: Request):
 @app.post("/registry", response_class=HTMLResponse)
 def registry_lookup(
     request: Request,
-    inn: str = Form(...),
+    query: str = Form(...),
+    search_mode: str = Form("inn"),
 ):
     try:
-        result = workflow.lookup_registry(inn)
+        result = workflow.search_registry(query, search_mode)
         error = ""
     except RegistryLookupError as exc:
         result = None
@@ -256,7 +286,8 @@ def registry_lookup(
         context(
             request,
             lookup=result,
-            lookup_inn=inn,
+            lookup_query=query,
+            search_mode=search_mode,
             error=error,
         ),
     )
@@ -379,6 +410,28 @@ def create_upload(
         file.file.close()
     background_tasks.add_task(workflow.process_upload, upload_id)
     return RedirectResponse(f"/uploads/{upload_id}", status_code=303)
+
+
+@app.post("/inbox/scan")
+def scan_inbox(background_tasks: BackgroundTasks):
+    try:
+        summary = workflow.import_inbox()
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            f"/?error={quote(str(exc))}",
+            status_code=303,
+        )
+    for upload_id in summary["imported"]:
+        background_tasks.add_task(workflow.process_upload, upload_id)
+    message = (
+        f"Папка проверена. Загружено PDF: {len(summary['imported'])}; "
+        f"пропущено повторов: {len(summary['skipped'])}; "
+        f"ошибок: {len(summary['errors'])}."
+    )
+    return RedirectResponse(
+        f"/?message={quote(message)}",
+        status_code=303,
+    )
 
 
 @app.get("/uploads/{upload_id}", response_class=HTMLResponse)
@@ -576,13 +629,31 @@ def case_detail(request: Request, case_id: str, message: str = "", error: str = 
     case = workflow.get_case(case_id)
     if not case:
         raise HTTPException(404, "Обращение не найдено")
+    taxpayers = workflow.get_taxpayers(case_id)
     return templates.TemplateResponse(
         request,
         "case_detail.html",
         context(
             request,
             case=case,
-            taxpayers=workflow.get_taxpayers(case_id),
+            taxpayers=taxpayers,
+            odb_pending=(
+                case["status"] == "manual_period_rule"
+                and any(not item.get("odb_result") for item in taxpayers)
+            ),
+            odb_has_found=any(
+                item.get("odb_result") == "found"
+                or item.get("abs_result") == "found"
+                for item in taxpayers
+            ),
+            registry_needs_confirmation=(
+                case["source_kind"] != "qr_official"
+                and any(
+                    item.get("registry_status")
+                    and item.get("registry_status") != "match"
+                    for item in taxpayers
+                )
+            ),
             recipient_position_display=workflow.names.position_display(
                 case.get("recipient_position") or ""
             ),
@@ -610,6 +681,56 @@ def abs_check(
             f"/cases/{case_id}?error={quote(str(exc))}",
             status_code=303,
         )
+
+
+@app.post("/cases/{case_id}/registry/accept")
+def accept_registry_variance(case_id: str):
+    try:
+        workflow.accept_registry_variance(case_id)
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            f"/cases/{case_id}?error={quote(str(exc))}",
+            status_code=303,
+        )
+    return RedirectResponse(
+        (
+            f"/cases/{case_id}?message="
+            f"{quote('Данные письма оставлены без подмены. Можно проверить АБС.')}"
+        ),
+        status_code=303,
+    )
+
+
+@app.post("/cases/{case_id}/odb")
+def odb_check(
+    case_id: str,
+    taxpayer_inn: list[str] = Form(default=[]),
+    odb_result: list[str] = Form(default=[]),
+):
+    results = [
+        {"inn": inn, "result": result}
+        for inn, result in zip(
+            taxpayer_inn,
+            odb_result,
+            strict=False,
+        )
+    ]
+    try:
+        next_status = workflow.confirm_odb(case_id, results)
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            f"/cases/{case_id}?error={quote(str(exc))}",
+            status_code=303,
+        )
+    message = (
+        "ОДБ проверена. Можно готовить ответ."
+        if next_status == "ready_for_response"
+        else "ОДБ проверена. Найденные записи оставлены для ручной обработки."
+    )
+    return RedirectResponse(
+        f"/cases/{case_id}?message={quote(message)}",
+        status_code=303,
+    )
 
 
 @app.post("/cases/{case_id}/response")

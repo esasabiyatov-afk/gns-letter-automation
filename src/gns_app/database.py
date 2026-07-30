@@ -98,6 +98,11 @@ CREATE TABLE IF NOT EXISTS taxpayers (
     inn_source TEXT NOT NULL,
     manually_confirmed INTEGER NOT NULL DEFAULT 0,
     abs_result TEXT,
+    odb_result TEXT,
+    registry_status TEXT,
+    registry_name TEXT,
+    registry_director TEXT,
+    registry_checked_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -216,7 +221,29 @@ class Database:
                   AND fields_confirmed = 1
                 """
             )
+            self._ensure_taxpayer_columns(connection)
             self._clean_legacy_district_places(connection)
+
+    @staticmethod
+    def _ensure_taxpayer_columns(connection: sqlite3.Connection) -> None:
+        existing = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(taxpayers)"
+            ).fetchall()
+        }
+        additions = {
+            "odb_result": "TEXT",
+            "registry_status": "TEXT",
+            "registry_name": "TEXT",
+            "registry_director": "TEXT",
+            "registry_checked_at": "TEXT",
+        }
+        for name, column_type in additions.items():
+            if name not in existing:
+                connection.execute(
+                    f"ALTER TABLE taxpayers ADD COLUMN {name} {column_type}"
+                )
 
     @staticmethod
     def _clean_legacy_district_places(

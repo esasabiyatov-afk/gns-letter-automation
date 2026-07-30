@@ -4,10 +4,10 @@
 <div class="page-heading">
   <div>
     <p class="eyebrow">РУЧНАЯ СВЕРКА</p>
-    <h1>Проверить ИНН в ОсОО.KG</h1>
+    <h1>Поиск в ОсОО.KG</h1>
     <p>
-      Внешнему сайту передаются только 14 цифр ИНН. PDF, OCR-текст,
-      наименование из письма и банковские данные не отправляются.
+      Внешнему сайту передаётся только введённый ИНН или название. PDF,
+      полный OCR-текст и банковские данные не отправляются.
     </p>
   </div>
 </div>
@@ -17,20 +17,32 @@
 <div class="registry-layout">
   <section class="panel">
     <p class="eyebrow">HTML-ЗАПРОС</p>
-    <h2>Введите ИНН вручную</h2>
+    <h2>ИНН или название</h2>
     <form method="post" action="/registry" class="registry-form">
+      <div class="type-selector registry-mode">
+        <label>
+          <input type="radio" name="search_mode" value="inn"
+                 {% if search_mode != 'name' %}checked{% endif %}>
+          <span>По ИНН</span>
+        </label>
+        <label>
+          <input type="radio" name="search_mode" value="name"
+                 {% if search_mode == 'name' %}checked{% endif %}>
+          <span>По названию</span>
+        </label>
+      </div>
       <label class="field">
-        <span>ИНН юридического лица</span>
-        <input name="inn" inputmode="numeric" maxlength="14"
-               pattern="[0-9]{14}" value="{{ lookup_inn }}"
-               placeholder="14 цифр" required>
+        <span>Запрос</span>
+        <input name="query" maxlength="160"
+               value="{{ lookup_query }}"
+               placeholder="14 цифр ИНН или часть названия" required>
       </label>
       <p class="warning-note">
-        ОсОО.KG требует паузу между HTML-запросами. Первая проверка может
-        занять около 10 секунд. Массовая автоматическая сверка отключена.
+        ОсОО.KG требует паузу между HTML-запросами. Проверки выполняются
+        последовательно, по одному запросу.
       </p>
       <button class="button button-primary" type="submit">
-        Проверить один ИНН
+        Найти
       </button>
     </form>
   </section>
@@ -42,18 +54,33 @@
         <span class="status status-completed">Найдено точное совпадение</span>
         <h2>{{ lookup.official_name }}</h2>
         <p class="registry-inn">ИНН {{ lookup.inn }}</p>
+        {% if lookup.director %}
+          <p><strong>Руководитель:</strong> {{ lookup.director }}</p>
+        {% endif %}
         {% if lookup.from_cache %}
           <small>Показан результат недавней проверки без нового запроса.</small>
         {% endif %}
         <div class="warning-note">
           Это дополнительная сверка, а не замена официального документа по
-          QR. Название нужно перенести в карточку только после проверки
-          сотрудником.
+          QR. Для OCR-письма приложение автоматически покажет совпадение или
+          расхождение, но не подменит сомнительное название молча.
         </div>
       {% elif lookup.status == 'multiple' %}
-        <span class="status status-needs_review">Несколько совпадений</span>
-        <h2>Нужна ручная проверка</h2>
-        <p>Сайт вернул несколько названий для одного ИНН.</p>
+        <span class="status status-needs_review">
+          Найдено {{ lookup.matches|length }}
+        </span>
+        <h2>Результаты поиска</h2>
+        <div class="registry-match-list">
+        {% for company in lookup.matches %}
+          <article>
+            <strong>{{ company.name }}</strong>
+            <span>ИНН {{ company.inn }}</span>
+            <small>
+              Руководитель: {{ company.director or 'не указан' }}
+            </small>
+          </article>
+        {% endfor %}
+        </div>
       {% else %}
         <span class="status status-needs_review">Не найдено</span>
         <h2>Совпадение отсутствует</h2>

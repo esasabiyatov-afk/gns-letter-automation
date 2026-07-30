@@ -16,10 +16,21 @@ class RegistryLookupError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class RegistryCompany:
+    inn: str
+    name: str
+    director: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class RegistryLookupResult:
     status: str
-    inn: str
+    query: str
+    search_mode: str
+    matches: tuple[RegistryCompany, ...] = ()
+    inn: str | None = None
     official_name: str | None = None
+    director: str | None = None
     provider: str = "ОсОО.KG"
     from_cache: bool = False
 
@@ -63,12 +74,17 @@ class _CompanySearchParser(HTMLParser):
             self._row = None
             self._cell = None
 
-    def companies(self) -> list[tuple[str, str]]:
-        companies: list[tuple[str, str]] = []
+    def companies(self) -> list[RegistryCompany]:
+        companies: list[RegistryCompany] = []
         for row in self.rows:
             if len(row) < 2:
                 continue
             name = str(row[0]["text"]).strip()
+            director = (
+                str(row[2]["text"]).strip()
+                if len(row) >= 3 and str(row[2]["text"]).strip()
+                else None
+            )
             inn_candidates: list[str] = []
             inn_candidates.extend(
                 re.findall(r"(?<!\d)\d{14}(?!\d)", str(row[1]["text"]))
@@ -79,7 +95,13 @@ class _CompanySearchParser(HTMLParser):
                     inn_candidates.append(match.group(1))
             for inn in dict.fromkeys(inn_candidates):
                 if name:
-                    companies.append((inn, name))
+                    companies.append(
+                        RegistryCompany(
+                            inn=inn,
+                            name=name,
+                            director=director,
+                        )
+                    )
         return companies
 
 
@@ -127,30 +149,57 @@ class OsooRegistryClient:
         clean_inn = re.sub(r"\D", "", inn)
         if len(clean_inn) != 14:
             raise RegistryLookupError("Для сверки нужны ровно 14 цифр ИНН")
+        return self._search(clean_inn, search_mode="inn", exact=True)
 
+    def search_by_name(self, name: str) -> RegistryLookupResult:
+        clean_name = " ".join(name.split())
+        if len(clean_name) < 2:
+            raise RegistryLookupError(
+                "Для поиска по названию введите минимум 2 символа"
+            )
+        if len(clean_name) > 160:
+            raise RegistryLookupError(
+                "Название для поиска не должно быть длиннее 160 символов"
+            )
+        return self._search(clean_name, search_mode="name", exact=False)
+
+    def _search(
+        self,
+        query: str,
+        *,
+        search_mode: str,
+        exact: bool,
+    ) -> RegistryLookupResult:
+        cache_key = f"{search_mode}:{query.casefold()}"
         with self._lock:
-            cached = self._cache.get(clean_inn)
+            cached = self._cache.get(cache_key)
             now = self.clock()
             if cached and now - cached[0] <= self.cache_seconds:
                 value = cached[1]
                 return RegistryLookupResult(
                     status=value.status,
+                    query=value.query,
+                    search_mode=value.search_mode,
+                    matches=value.matches,
                     inn=value.inn,
                     official_name=value.official_name,
+                    director=value.director,
                     provider=value.provider,
                     from_cache=True,
                 )
 
             try:
                 self._ensure_csrf()
+                form_data = {
+                    "csrfmiddlewaretoken": self._csrf_token or "",
+                    "text": query,
+                }
+                if exact:
+                    form_data["exact"] = "on"
                 response = self._request(
                     "POST",
                     "/search/",
-                    data={
-                        "csrfmiddlewaretoken": self._csrf_token or "",
-                        "text": clean_inn,
-                        "exact": "on",
-                    },
+                    data=form_data,
                     headers={"Referer": f"{self.BASE_URL}/"},
                 )
             except httpx.TimeoutException as exc:
@@ -166,29 +215,63 @@ class OsooRegistryClient:
             self._update_csrf(response.text)
             parser = _CompanySearchParser()
             parser.feed(response.text)
-            exact = [
-                (found_inn, name)
-                for found_inn, name in parser.companies()
-                if found_inn == clean_inn
-            ]
-            unique_names = list(dict.fromkeys(name for _, name in exact))
-            if len(unique_names) == 1:
+            parsed_matches = parser.companies()
+            if search_mode == "inn":
+                parsed_matches = [
+                    company
+                    for company in parsed_matches
+                    if company.inn == query
+                ]
+            unique_matches = tuple(
+                {
+                    (company.inn, company.name, company.director): company
+                    for company in parsed_matches
+                }.values()
+            )
+            if search_mode == "inn" and len(unique_matches) == 1:
+                company = unique_matches[0]
                 result = RegistryLookupResult(
                     status="found",
-                    inn=clean_inn,
-                    official_name=unique_names[0],
+                    query=query,
+                    search_mode=search_mode,
+                    matches=unique_matches,
+                    inn=company.inn,
+                    official_name=company.name,
+                    director=company.director,
                 )
-            elif len(unique_names) > 1:
+            elif unique_matches:
                 result = RegistryLookupResult(
-                    status="multiple",
-                    inn=clean_inn,
+                    status=(
+                        "multiple"
+                        if len(unique_matches) > 1
+                        else "found"
+                    ),
+                    query=query,
+                    search_mode=search_mode,
+                    matches=unique_matches,
+                    inn=(
+                        unique_matches[0].inn
+                        if len(unique_matches) == 1
+                        else None
+                    ),
+                    official_name=(
+                        unique_matches[0].name
+                        if len(unique_matches) == 1
+                        else None
+                    ),
+                    director=(
+                        unique_matches[0].director
+                        if len(unique_matches) == 1
+                        else None
+                    ),
                 )
             else:
                 result = RegistryLookupResult(
                     status="not_found",
-                    inn=clean_inn,
+                    query=query,
+                    search_mode=search_mode,
                 )
-            self._cache[clean_inn] = (self.clock(), result)
+            self._cache[cache_key] = (self.clock(), result)
             return result
 
     def _ensure_csrf(self) -> None:

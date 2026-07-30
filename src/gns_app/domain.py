@@ -75,6 +75,12 @@ class AbsStatus(StrEnum):
     TECHNICAL_ERROR = "technical_error"
 
 
+class OdbStatus(StrEnum):
+    NOT_CHECKED = "not_checked"
+    FOUND = "found"
+    NOT_FOUND = "not_found"
+
+
 class ValueSource(StrEnum):
     QR_LINK = "qr_link"
     QR_OFFICIAL = "qr_official"

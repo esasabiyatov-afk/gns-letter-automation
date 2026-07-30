@@ -86,6 +86,13 @@ def test_today_batch_checks_and_groups_by_recipient(workflow):
     assert 'ОсОО "Второй"' in document_text
     assert "12345678901234" in document_text
     assert "23456789012345" in document_text
+    taxpayer_lines = [
+        line.strip()
+        for line in document_text.splitlines()
+        if "ИНН:" in line
+    ]
+    assert taxpayer_lines[0].startswith("1. ")
+    assert taxpayer_lines[1].startswith("2. ")
     assert workflow.get_case(first)["status"] == CaseStatus.RESPONSE_CREATED
     assert workflow.get_case(second)["status"] == CaseStatus.RESPONSE_CREATED
     assert not workflow.today_overview()["not_found_groups"]

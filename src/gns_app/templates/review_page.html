@@ -89,7 +89,9 @@
         <div class="section-title">
           <h2>Налогоплательщики</h2>
           <div class="section-title-actions">
-            <a class="text-link" href="/registry" target="_blank">
+            <a class="text-link"
+               href="/registry{% if taxpayers and taxpayers[0].inn %}?query={{ taxpayers[0].inn }}&search_mode=inn{% endif %}"
+               target="_blank">
               Сверить ИНН
             </a>
             <button type="button" class="text-button" id="add-taxpayer">
@@ -104,6 +106,20 @@
               <span>Наименование</span>
               <input name="taxpayer_name" value="{{ taxpayer.name }}"
                      placeholder="Наименование или ФИО">
+              {% if taxpayer.registry_status %}
+                <small class="registry-state registry-{{ taxpayer.registry_status }}">
+                  ОсОО.KG:
+                  {{ registry_status_labels.get(taxpayer.registry_status,
+                                                 taxpayer.registry_status) }}
+                </small>
+                {% if taxpayer.registry_name
+                      and taxpayer.registry_status == 'mismatch' %}
+                  <small>Название в реестре: {{ taxpayer.registry_name }}</small>
+                {% endif %}
+                {% if taxpayer.registry_director %}
+                  <small>Руководитель: {{ taxpayer.registry_director }}</small>
+                {% endif %}
+              {% endif %}
             </label>
             <label class="field inn-field">
               <span>ИНН</span>

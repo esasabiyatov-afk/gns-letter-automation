@@ -15,6 +15,7 @@ class Settings:
     previews_dir: Path
     official_dir: Path
     responses_dir: Path
+    inbox_dir: Path
     source_templates_dir: Path
     period_threshold: date
     max_upload_bytes: int
@@ -22,6 +23,7 @@ class Settings:
     allowed_qr_paths: frozenset[str]
     auto_download_official: bool
     employee_name: str
+    auto_registry_check: bool = True
     ocr_fast_data_dir: Path | None = None
     ocr_best_data_dir: Path | None = None
 
@@ -50,6 +52,12 @@ class Settings:
             previews_dir=runtime_dir / "previews",
             official_dir=runtime_dir / "official",
             responses_dir=runtime_dir / "responses",
+            inbox_dir=Path(
+                os.environ.get(
+                    "GNS_INBOX_DIR",
+                    project_root / "Входящие",
+                )
+            ).resolve(),
             source_templates_dir=project_root / "УГНС",
             period_threshold=date.fromisoformat(threshold_text),
             max_upload_bytes=int(
@@ -62,6 +70,10 @@ class Settings:
                 == "true"
             ),
             employee_name=os.environ.get("GNS_EMPLOYEE_NAME", "").strip(),
+            auto_registry_check=(
+                os.environ.get("GNS_AUTO_REGISTRY_CHECK", "true").lower()
+                == "true"
+            ),
             ocr_fast_data_dir=ocr_model_root / "tessdata_fast",
             ocr_best_data_dir=ocr_model_root / "tessdata_best",
         )
@@ -73,6 +85,7 @@ class Settings:
             self.previews_dir,
             self.official_dir,
             self.responses_dir,
+            self.inbox_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
 

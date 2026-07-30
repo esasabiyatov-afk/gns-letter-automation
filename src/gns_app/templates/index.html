@@ -50,6 +50,9 @@
   </div>
 </section>
 
+{% if message %}<div class="alert alert-success">{{ message }}</div>{% endif %}
+{% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
+
 <section class="hero">
   <div>
     <h1>Автоматизатор писем</h1>
@@ -75,6 +78,23 @@
     {% if not active_employee %}
       <p class="form-note">Сначала выберите исполнителя выше.</p>
     {% endif %}
+  </form>
+</section>
+
+<section class="inbox-scan-card">
+  <div>
+    <p class="eyebrow">ПАПКА ВХОДЯЩИХ</p>
+    <h2>Загрузить все новые PDF из папки</h2>
+    <p>
+      Поместите письма в <code>{{ inbox_dir }}</code>. Повторно загруженные
+      файлы определяются по содержимому и пропускаются.
+    </p>
+  </div>
+  <form method="post" action="/inbox/scan">
+    <button class="button button-secondary" type="submit"
+            {% if not active_employee %}disabled{% endif %}>
+      Сканировать папку
+    </button>
   </form>
 </section>
 

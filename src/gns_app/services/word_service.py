@@ -162,11 +162,12 @@ class WordTemplateService:
             reference_properties = deepcopy(target.runs[0]._r.rPr)
 
         target.clear()
-        for index, taxpayer in enumerate(taxpayers):
-            if index:
+        for index, taxpayer in enumerate(taxpayers, 1):
+            if index > 1:
                 target.add_run().add_break()
             run = target.add_run(
-                f"{taxpayer['name'].strip()} ИНН: {taxpayer['inn'].strip()};"
+                f"{index}. {taxpayer['name'].strip()} "
+                f"ИНН: {taxpayer['inn'].strip()};"
             )
             if reference_properties is not None:
                 run._r.insert(0, deepcopy(reference_properties))
@@ -174,8 +175,8 @@ class WordTemplateService:
     @staticmethod
     def _plain_taxpayer_list(taxpayers: list[dict[str, str]]) -> str:
         return "; ".join(
-            f"{item['name'].strip()} ИНН: {item['inn'].strip()}"
-            for item in taxpayers
+            f"{index}. {item['name'].strip()} ИНН: {item['inn'].strip()}"
+            for index, item in enumerate(taxpayers, 1)
         )
 
     @staticmethod

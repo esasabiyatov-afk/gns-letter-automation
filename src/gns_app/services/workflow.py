@@ -16,6 +16,7 @@ from gns_app.database import Database, utc_now
 from gns_app.domain import (
     AbsStatus,
     CaseStatus,
+    OdbStatus,
     PageStatus,
     PageType,
     QrStatus,
@@ -35,9 +36,14 @@ from gns_app.services.pdf_service import PdfService
 from gns_app.services.qr_service import QrService
 from gns_app.services.registry_service import (
     OsooRegistryClient,
+    RegistryLookupError,
     RegistryLookupResult,
 )
-from gns_app.services.storage import sanitize_filename, save_pdf_stream
+from gns_app.services.storage import (
+    ensure_within,
+    sanitize_filename,
+    save_pdf_stream,
+)
 from gns_app.services.word_service import WordTemplateService
 from gns_app.text_cleanup import clean_location
 
@@ -79,6 +85,15 @@ class WorkflowService:
 
     def lookup_registry(self, inn: str) -> RegistryLookupResult:
         return self.registry.lookup_by_inn(inn)
+
+    def search_registry(
+        self,
+        query: str,
+        search_mode: str,
+    ) -> RegistryLookupResult:
+        if search_mode == "name":
+            return self.registry.search_by_name(query)
+        return self.registry.lookup_by_inn(query)
 
     def initialize_employee_profiles(self) -> None:
         configured = self.settings.employee_name.strip()
@@ -313,6 +328,77 @@ class WorkflowService:
             },
         )
         return upload_id
+
+    def import_inbox(self, max_files: int = 200) -> dict[str, Any]:
+        if not self.get_active_employee():
+            raise WorkflowValidationError(
+                "Сначала выберите или добавьте исполнителя"
+            )
+        inbox = self.settings.inbox_dir.resolve()
+        inbox.mkdir(parents=True, exist_ok=True)
+        candidates = sorted(
+            (
+                path
+                for path in inbox.rglob("*")
+                if path.is_file() and path.suffix.casefold() == ".pdf"
+            ),
+            key=lambda path: str(path).casefold(),
+        )[:max_files]
+        imported: list[str] = []
+        skipped: list[str] = []
+        errors: list[dict[str, str]] = []
+
+        for source in candidates:
+            try:
+                safe_source = ensure_within(source, inbox)
+                digest = hashlib.sha256()
+                total = 0
+                with safe_source.open("rb") as stream:
+                    while chunk := stream.read(1024 * 1024):
+                        total += len(chunk)
+                        if total > self.settings.max_upload_bytes:
+                            raise WorkflowValidationError(
+                                "PDF превышает допустимый размер"
+                            )
+                        digest.update(chunk)
+                existing = self.db.fetch_one(
+                    "SELECT id FROM uploads WHERE sha256 = ?",
+                    (digest.hexdigest(),),
+                )
+                if existing:
+                    skipped.append(safe_source.name)
+                    continue
+                with safe_source.open("rb") as stream:
+                    imported.append(
+                        self.create_upload(safe_source.name, stream)
+                    )
+            except Exception as exc:
+                errors.append(
+                    {
+                        "filename": source.name,
+                        "message": str(exc)[:300],
+                    }
+                )
+
+        self.db.audit(
+            "settings",
+            "inbox",
+            "inbox_scanned",
+            {
+                "folder": str(inbox),
+                "found": len(candidates),
+                "imported": len(imported),
+                "skipped_duplicates": len(skipped),
+                "errors": errors,
+            },
+        )
+        return {
+            "folder": str(inbox),
+            "found": len(candidates),
+            "imported": imported,
+            "skipped": skipped,
+            "errors": errors,
+        }
 
     def process_upload(
         self, upload_id: str, only_registered_pages: bool = False
@@ -947,6 +1033,7 @@ class WorkflowService:
                     """,
                     rows,
                 )
+                self.check_registry_case(case_id, automatic=True)
 
     def _apply_official_document(
         self, case_id: str, official_path: Path
@@ -1150,6 +1237,8 @@ class WorkflowService:
                 ),
             )
             self._replace_taxpayers(case_id, clean_taxpayers)
+            if page.get("qr_status") != QrStatus.FOUND:
+                self.check_registry_case(case_id, automatic=True)
 
         self.db.execute(
             """
@@ -1180,6 +1269,139 @@ class WorkflowService:
         )
         self._refresh_upload_status(page["upload_id"])
         return case_id
+
+    @staticmethod
+    def _registry_name_key(value: str) -> str:
+        normalized = value.casefold().replace("ё", "е")
+        normalized = re.sub(
+            r"\bобщество\s+с\s+ограниченной\s+ответственностью\b",
+            "осоо",
+            normalized,
+        )
+        normalized = re.sub(
+            r"\bиндивидуальный\s+предприниматель\b",
+            "ип",
+            normalized,
+        )
+        return "".join(character for character in normalized if character.isalnum())
+
+    def check_registry_case(
+        self,
+        case_id: str,
+        *,
+        automatic: bool = False,
+    ) -> dict[str, int]:
+        if automatic and not self.settings.auto_registry_check:
+            return {"skipped": 1}
+        taxpayers = self.get_taxpayers(case_id)
+        summary: dict[str, int] = {}
+        for taxpayer in taxpayers:
+            status = "error"
+            official_name = None
+            director = None
+            try:
+                result = self.registry.lookup_by_inn(taxpayer["inn"])
+                official_name = result.official_name
+                director = result.director
+                if result.status == "found" and official_name:
+                    status = (
+                        "match"
+                        if self._registry_name_key(taxpayer["name"])
+                        == self._registry_name_key(official_name)
+                        else "mismatch"
+                    )
+                else:
+                    status = result.status
+            except RegistryLookupError:
+                status = "error"
+
+            checked_at = utc_now()
+            self.db.execute(
+                """
+                UPDATE taxpayers
+                SET registry_status = ?, registry_name = ?,
+                    registry_director = ?, registry_checked_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    official_name,
+                    director,
+                    checked_at,
+                    checked_at,
+                    taxpayer["id"],
+                ),
+            )
+            summary[status] = summary.get(status, 0) + 1
+            self.db.audit(
+                "taxpayer",
+                taxpayer["id"],
+                "registry_checked",
+                {
+                    "automatic": automatic,
+                    "status": status,
+                    "provider": "ОсОО.KG",
+                },
+            )
+        case = self.get_case(case_id)
+        needs_confirmation = bool(
+            automatic
+            and case
+            and case.get("source_kind") != ValueSource.QR_OFFICIAL
+            and any(status != "match" for status in summary)
+        )
+        if needs_confirmation:
+            self.db.execute(
+                "UPDATE cases SET status = ?, updated_at = ? WHERE id = ?",
+                (CaseStatus.NEEDS_REVIEW, utc_now(), case_id),
+            )
+        return summary
+
+    def accept_registry_variance(
+        self,
+        case_id: str,
+        actor: str = "Сотрудник",
+    ) -> None:
+        case = self.get_case(case_id)
+        if not case:
+            raise WorkflowValidationError("Обращение не найдено")
+        if case.get("source_kind") == ValueSource.QR_OFFICIAL:
+            raise WorkflowValidationError(
+                "Официальные данные QR не требуют подтверждения по реестру"
+            )
+        taxpayers = self.get_taxpayers(case_id)
+        if not case.get("fields_confirmed") or not taxpayers:
+            raise WorkflowValidationError(
+                "Сначала подтвердите данные письма и налогоплательщиков"
+            )
+        if not any(
+            taxpayer.get("registry_status")
+            and taxpayer.get("registry_status") != "match"
+            for taxpayer in taxpayers
+        ):
+            raise WorkflowValidationError(
+                "В карточке нет расхождений ОсОО.KG для подтверждения"
+            )
+        self.db.execute(
+            "UPDATE cases SET status = ?, updated_at = ? WHERE id = ?",
+            (CaseStatus.READY_FOR_ABS, utc_now(), case_id),
+        )
+        self.db.audit(
+            "case",
+            case_id,
+            "registry_variance_accepted",
+            {
+                "results": [
+                    {
+                        "inn": taxpayer["inn"],
+                        "status": taxpayer.get("registry_status"),
+                    }
+                    for taxpayer in taxpayers
+                ]
+            },
+            actor=actor,
+        )
 
     @staticmethod
     def _validate_manual_fields(
@@ -1293,7 +1515,8 @@ class WorkflowService:
         for taxpayer_result in result.taxpayers:
             self.db.execute(
                 """
-                UPDATE taxpayers SET abs_result = ?, updated_at = ?
+                UPDATE taxpayers
+                SET abs_result = ?, odb_result = NULL, updated_at = ?
                 WHERE case_id = ? AND inn = ?
                 """,
                 (
@@ -1304,23 +1527,20 @@ class WorkflowService:
                 ),
             )
 
-        next_status = (
-            CaseStatus.READY_FOR_ABS
-            if result.status
-            in {
-                AbsStatus.AUTH_ERROR,
-                AbsStatus.UNAVAILABLE,
-                AbsStatus.TECHNICAL_ERROR,
-            }
-            else CaseStatus.NEEDS_REVIEW
-        )
-        if result.status == AbsStatus.NOT_FOUND:
-            start = date.fromisoformat(case["period_start"])
-            next_status = (
-                CaseStatus.MANUAL_PERIOD_RULE
-                if start < self.settings.period_threshold
-                else CaseStatus.READY_FOR_RESPONSE
-            )
+        failed_statuses = {
+            AbsStatus.AUTH_ERROR,
+            AbsStatus.UNAVAILABLE,
+            AbsStatus.TECHNICAL_ERROR,
+        }
+        start = date.fromisoformat(case["period_start"])
+        if result.status in failed_statuses:
+            next_status = CaseStatus.READY_FOR_ABS
+        elif start < self.settings.period_threshold:
+            next_status = CaseStatus.MANUAL_PERIOD_RULE
+        elif result.status == AbsStatus.NOT_FOUND:
+            next_status = CaseStatus.READY_FOR_RESPONSE
+        else:
+            next_status = CaseStatus.NEEDS_REVIEW
 
         self.db.execute(
             """
@@ -1342,6 +1562,88 @@ class WorkflowService:
             },
         )
         return result
+
+    def confirm_odb(
+        self,
+        case_id: str,
+        results: list[dict[str, str]],
+        actor: str = "Сотрудник",
+    ) -> str:
+        case = self.get_case(case_id)
+        if not case:
+            raise WorkflowValidationError("Обращение не найдено")
+        if case["status"] != CaseStatus.MANUAL_PERIOD_RULE:
+            raise WorkflowValidationError(
+                "Проверка ОДБ для этого обращения не требуется"
+            )
+        if date.fromisoformat(case["period_start"]) >= (
+            self.settings.period_threshold
+        ):
+            raise WorkflowValidationError(
+                "Период обращения не относится к старой АБС"
+            )
+
+        taxpayers = self.get_taxpayers(case_id)
+        expected = {taxpayer["inn"] for taxpayer in taxpayers}
+        supplied = {item.get("inn", "") for item in results}
+        if expected != supplied:
+            raise WorkflowValidationError(
+                "Нужно отметить результат ОДБ для каждого налогоплательщика"
+            )
+        allowed = {OdbStatus.FOUND, OdbStatus.NOT_FOUND}
+        normalized: dict[str, OdbStatus] = {}
+        for item in results:
+            try:
+                normalized[item["inn"]] = OdbStatus(item["result"])
+            except (KeyError, ValueError) as exc:
+                raise WorkflowValidationError(
+                    "Неизвестный результат проверки ОДБ"
+                ) from exc
+        if set(normalized.values()) - allowed:
+            raise WorkflowValidationError(
+                "Неизвестный результат проверки ОДБ"
+            )
+
+        now = utc_now()
+        for inn, odb_result in normalized.items():
+            self.db.execute(
+                """
+                UPDATE taxpayers
+                SET odb_result = ?, updated_at = ?
+                WHERE case_id = ? AND inn = ?
+                """,
+                (odb_result, now, case_id, inn),
+            )
+
+        refreshed = self.get_taxpayers(case_id)
+        all_absent = all(
+            taxpayer.get("abs_result") == AbsStatus.NOT_FOUND
+            and taxpayer.get("odb_result") == OdbStatus.NOT_FOUND
+            for taxpayer in refreshed
+        )
+        next_status = (
+            CaseStatus.READY_FOR_RESPONSE
+            if all_absent
+            else CaseStatus.MANUAL_PERIOD_RULE
+        )
+        self.db.execute(
+            "UPDATE cases SET status = ?, updated_at = ? WHERE id = ?",
+            (next_status, now, case_id),
+        )
+        self.db.audit(
+            "case",
+            case_id,
+            "odb_checked",
+            {
+                "results": [
+                    {"inn": inn, "result": result}
+                    for inn, result in normalized.items()
+                ],
+                "next_status": next_status,
+            },
+            actor=actor,
+        )
+        return next_status
 
     def check_abs_today(
         self,
@@ -1409,7 +1711,17 @@ class WorkflowService:
                           AND cases.source_kind = 'qr_official'
                     THEN 1 ELSE 0 END) AS ready_qr,
                 SUM(CASE WHEN cases.status = 'ready_for_response'
-                    THEN 1 ELSE 0 END) AS ready_response
+                    THEN 1 ELSE 0 END) AS ready_response,
+                SUM(CASE
+                    WHEN cases.status = 'manual_period_rule'
+                     AND EXISTS (
+                        SELECT 1
+                        FROM taxpayers AS odb_taxpayers
+                        WHERE odb_taxpayers.case_id = cases.id
+                          AND odb_taxpayers.odb_result IS NULL
+                     )
+                    THEN 1 ELSE 0
+                END) AS odb_pending
             FROM cases
             JOIN uploads ON uploads.id = cases.upload_id
             WHERE uploads.created_at >= ? AND uploads.created_at < ?
@@ -1440,7 +1752,27 @@ class WorkflowService:
             "ready_abs": int(counts.get("ready_abs") or 0),
             "ready_qr": int(counts.get("ready_qr") or 0),
             "ready_response": int(counts.get("ready_response") or 0),
+            "odb_pending": int(counts.get("odb_pending") or 0),
             "unresolved_pages": int(unresolved["count"]),
+            "odb_cases": self.db.fetch_all(
+                """
+                SELECT cases.id, cases.recipient_display_name,
+                       cases.district_place, cases.period_start,
+                       COUNT(taxpayers.id) AS taxpayer_count,
+                       SUM(CASE WHEN taxpayers.odb_result IS NULL
+                           THEN 1 ELSE 0 END) AS pending_count
+                FROM cases
+                JOIN uploads ON uploads.id = cases.upload_id
+                JOIN taxpayers ON taxpayers.case_id = cases.id
+                WHERE uploads.created_at >= ? AND uploads.created_at < ?
+                  AND cases.status = 'manual_period_rule'
+                GROUP BY cases.id
+                HAVING SUM(CASE WHEN taxpayers.odb_result IS NULL
+                    THEN 1 ELSE 0 END) > 0
+                ORDER BY cases.created_at
+                """,
+                (start_utc, end_utc),
+            ),
             "not_found_groups": self._daily_response_groups(
                 day, AbsStatus.NOT_FOUND
             ),
@@ -1463,8 +1795,16 @@ class WorkflowService:
             )
         else:
             extra_where = (
-                "cases.abs_status = 'found' "
-                "AND taxpayers.abs_result = 'found'"
+                "(taxpayers.abs_result = 'found' "
+                "OR taxpayers.odb_result = 'found') "
+                "AND ("
+                "cases.status != 'manual_period_rule' "
+                "OR NOT EXISTS ("
+                "SELECT 1 FROM taxpayers AS pending_odb "
+                "WHERE pending_odb.case_id = cases.id "
+                "AND pending_odb.odb_result IS NULL"
+                ")"
+                ")"
             )
         rows = self.db.fetch_all(
             f"""

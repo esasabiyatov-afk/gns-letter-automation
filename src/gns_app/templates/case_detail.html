@@ -3,7 +3,10 @@
 {% block content %}
 <div class="page-heading">
   <div>
-    <a class="back-link" href="/cases">← Обращения</a>
+    <div class="breadcrumb-links">
+      <a class="back-link" href="/today">← Сегодня</a>
+      <a class="back-link" href="/cases">Все обращения</a>
+    </div>
     <p class="eyebrow">КАРТОЧКА ОБРАЩЕНИЯ</p>
     <h1>{{ case.recipient_display_name or 'Не завершено' }}</h1>
     <p>{{ case.district_place or 'Район не заполнен' }}</p>
@@ -43,10 +46,37 @@
     {% for taxpayer in taxpayers %}
       <article>
         <span>{{ loop.index }}</span>
-        <div><strong>{{ taxpayer.name }}</strong><small>ИНН {{ taxpayer.inn }}</small></div>
-        <em class="abs-result abs-{{ taxpayer.abs_result or 'not_checked' }}">
-          {{ abs_status_labels.get(taxpayer.abs_result or 'not_checked', taxpayer.abs_result or 'не проверен') }}
-        </em>
+        <div>
+          <strong>{{ taxpayer.name }}</strong>
+          <small>ИНН {{ taxpayer.inn }}</small>
+          {% if taxpayer.registry_status %}
+            <small class="registry-state registry-{{ taxpayer.registry_status }}">
+              ОсОО.KG:
+              {{ registry_status_labels.get(taxpayer.registry_status,
+                                             taxpayer.registry_status) }}
+            </small>
+            {% if taxpayer.registry_name
+                  and taxpayer.registry_status == 'mismatch' %}
+              <small>В реестре: {{ taxpayer.registry_name }}</small>
+            {% endif %}
+            {% if taxpayer.registry_director %}
+              <small>Руководитель: {{ taxpayer.registry_director }}</small>
+            {% endif %}
+          {% endif %}
+        </div>
+        <div class="taxpayer-checks">
+          <em class="abs-result abs-{{ taxpayer.abs_result or 'not_checked' }}">
+            АБС: {{ abs_status_labels.get(taxpayer.abs_result or 'not_checked',
+                                          taxpayer.abs_result or 'не проверен') }}
+          </em>
+          {% if case.status == 'manual_period_rule'
+                or taxpayer.odb_result %}
+            <em class="abs-result abs-{{ taxpayer.odb_result or 'not_checked' }}">
+              ОДБ: {{ odb_status_labels.get(taxpayer.odb_result or 'not_checked',
+                                            taxpayer.odb_result or 'не проверен') }}
+            </em>
+          {% endif %}
+        </div>
       </article>
     {% endfor %}
     </div>
@@ -56,7 +86,15 @@
 <section class="action-panel">
   <div>
     <p class="eyebrow">СЛЕДУЮЩЕЕ ДЕЙСТВИЕ</p>
-    {% if case.status == 'ready_for_abs' %}
+    {% if case.status == 'needs_review'
+          and registry_needs_confirmation %}
+      <h2>Проверить расхождение с ОсОО.KG</h2>
+      <p>
+        Автоматический маршрут остановлен. Сравните название из письма с
+        данными реестра и руководителем. Если в письме всё указано верно,
+        явно оставьте его данные без автоматической подмены.
+      </p>
+    {% elif case.status == 'ready_for_abs' %}
       <h2>Проверить налогоплательщиков в тестовой АБС</h2>
       <p>Логин и пароль используются только для одного запроса и не сохраняются.</p>
     {% elif case.status == 'ready_for_response' %}
@@ -65,8 +103,16 @@
         Обращение будет объединено с другими письмами тому же адресату.
       </p>
     {% elif case.status == 'manual_period_rule' %}
-      <h2>Требуется ручная обработка периода</h2>
-      <p>Начало периода раньше установленного порога {{ threshold }}.</p>
+      {% if odb_pending %}
+        <h2>Проверить налогоплательщиков в ОДБ</h2>
+        <p>
+          АБС уже проверена. Начало периода раньше {{ threshold }}, поэтому
+          требуется вторая проверка в старой базе ОДБ.
+        </p>
+      {% elif odb_has_found %}
+        <h2>Найдены записи в АБС или ОДБ</h2>
+        <p>Обращение оставлено для ручного ответа сотрудника.</p>
+      {% endif %}
     {% elif case.status == 'response_created' %}
       <h2>Проект ответа готов</h2>
       <p>Документ создан по копии утверждённого шаблона.</p>
@@ -76,7 +122,15 @@
     {% endif %}
   </div>
   <div class="action-buttons">
-    {% if case.status == 'ready_for_abs' %}
+    {% if case.status == 'needs_review'
+          and registry_needs_confirmation %}
+      <form method="post"
+            action="/cases/{{ case.id }}/registry/accept">
+        <button class="button button-primary" type="submit">
+          Оставить данные письма и продолжить
+        </button>
+      </form>
+    {% elif case.status == 'ready_for_abs' %}
       <button class="button button-primary" type="button" data-open-dialog="abs-dialog">
         Открыть проверку АБС
       </button>
@@ -89,6 +143,46 @@
     {% endif %}
   </div>
 </section>
+
+{% if case.status == 'manual_period_rule' and odb_pending %}
+<section class="panel odb-panel">
+  <div class="panel-heading">
+    <div>
+      <p class="eyebrow">РУЧНАЯ ПРОВЕРКА ОДБ</p>
+      <h2>Отметьте результат по каждому ИНН</h2>
+      <p>
+        Сначала выполнена АБС. Теперь сотрудник проверяет старую базу ОДБ;
+        приложение только записывает результат.
+      </p>
+    </div>
+  </div>
+  <form method="post" action="/cases/{{ case.id }}/odb">
+    <div class="odb-list">
+    {% for taxpayer in taxpayers %}
+      <article>
+        <div>
+          <strong>{{ taxpayer.name }}</strong>
+          <small>ИНН {{ taxpayer.inn }}</small>
+          <input type="hidden" name="taxpayer_inn"
+                 value="{{ taxpayer.inn }}">
+        </div>
+        <label class="field odb-selector">
+          <span>Результат ОДБ</span>
+          <select name="odb_result" required>
+            <option value="">Выберите</option>
+            <option value="not_found">Не найден</option>
+            <option value="found">Найден</option>
+          </select>
+        </label>
+      </article>
+    {% endfor %}
+    </div>
+    <button class="button button-primary" type="submit">
+      Сохранить проверку ОДБ
+    </button>
+  </form>
+</section>
+{% endif %}
 
 <dialog id="abs-dialog" class="modal">
   <form method="post" action="/cases/{{ case.id }}/abs" autocomplete="off">

@@ -3,11 +3,12 @@
 {% block content %}
 <div class="page-heading">
   <div>
+    <a class="back-link" href="/">← Главная</a>
     <p class="eyebrow">РАБОТА ЗА {{ overview.business_date }}</p>
     <h1>Проверка и общие ответы</h1>
     <p>
       QR-письма уже подтверждены. Одним запросом проверьте готовые обращения
-      в АБС, затем создайте общий ответ каждому адресату.
+      в АБС; старые периоды после этого будут направлены на проверку ОДБ.
     </p>
   </div>
 </div>
@@ -27,6 +28,10 @@
   <article>
     <strong>{{ overview.ready_response }}</strong>
     <span>обращений готовы к ответу</span>
+  </article>
+  <article class="{% if overview.odb_pending %}summary-warning{% endif %}">
+    <strong>{{ overview.odb_pending }}</strong>
+    <span>ожидают ручную ОДБ</span>
   </article>
   <article class="{% if overview.unresolved_pages %}summary-problem{% endif %}">
     <strong>{{ overview.unresolved_pages }}</strong>
@@ -63,10 +68,39 @@
 </div>
 {% endif %}
 
+{% if overview.odb_cases %}
+<section class="panel today-groups odb-today-panel">
+  <div class="panel-heading">
+    <div>
+      <p class="eyebrow">СТАРАЯ БАЗА ДО {{ threshold }}</p>
+      <h2>Проверить в ОДБ</h2>
+      <p>
+        Эти обращения уже прошли АБС. Откройте карточку и вручную отметьте
+        результат проверки старой базы ОДБ.
+      </p>
+    </div>
+  </div>
+  <div class="odb-case-list">
+  {% for item in overview.odb_cases %}
+    <a href="/cases/{{ item.id }}">
+      <div>
+        <strong>{{ item.recipient_display_name }}</strong>
+        <span>{{ item.district_place }}</span>
+      </div>
+      <small>
+        {{ item.taxpayer_count }} {{ taxpayer_word(item.taxpayer_count) }} ·
+        период с {{ item.period_start }}
+      </small>
+    </a>
+  {% endfor %}
+  </div>
+</section>
+{% endif %}
+
 <section class="panel today-groups">
   <div class="panel-heading">
     <div>
-      <p class="eyebrow">НЕ НАЙДЕНЫ В АБС</p>
+      <p class="eyebrow">НЕ НАЙДЕНЫ В ПРОВЕРЯЕМЫХ БАЗАХ</p>
       <h2>Общие ответы по адресатам</h2>
       <p>
         В одной карточке собраны все лица для одного налогового органа и
@@ -90,14 +124,33 @@
           {{ group.recipient_position }} ·
           {{ group.case_count }} {{ case_word(group.case_count) }}
         </p>
-        <ol class="group-taxpayers">
-        {% for taxpayer in group.taxpayers %}
+        <ol class="group-taxpayers compact-taxpayers">
+        {% for taxpayer in group.taxpayers[:2] %}
           <li>
-            <span>{{ taxpayer.name }}</span>
+            <a href="/cases/{{ taxpayer.source_case_id }}">
+              {{ taxpayer.name }}
+            </a>
             <strong>ИНН {{ taxpayer.inn }}</strong>
           </li>
         {% endfor %}
         </ol>
+        {% if group.taxpayer_count > 2 %}
+          <details class="group-more">
+            <summary>
+              Показать ещё {{ group.taxpayer_count - 2 }}
+            </summary>
+            <ol class="group-taxpayers" start="3">
+            {% for taxpayer in group.taxpayers[2:] %}
+              <li>
+                <a href="/cases/{{ taxpayer.source_case_id }}">
+                  {{ taxpayer.name }}
+                </a>
+                <strong>ИНН {{ taxpayer.inn }}</strong>
+              </li>
+            {% endfor %}
+            </ol>
+          </details>
+        {% endif %}
         {% if group.issues %}
           <div class="group-issues">
           {% for issue in group.issues %}<p>{{ issue }}</p>{% endfor %}
@@ -114,7 +167,7 @@
     </div>
   {% else %}
     <div class="empty-state">
-      После пакетной проверки здесь появятся лица, не найденные в АБС.
+      После проверок здесь появятся лица, по которым счета не найдены.
     </div>
   {% endif %}
 </section>
@@ -122,12 +175,12 @@
 <section class="panel today-groups found-groups">
   <div class="panel-heading">
     <div>
-      <p class="eyebrow">НАЙДЕНЫ В АБС</p>
+      <p class="eyebrow">НАЙДЕНЫ В АБС ИЛИ ОДБ</p>
       <h2>Отдельные группы для ручного ответа</h2>
       <p>
-        Шаблон «счетов нет» к ним не применяется. Они уже отсортированы по
-        адресату, но Word появится только после добавления утверждённого
-        шаблона для найденных клиентов.
+        Шаблон «счетов нет» к ним не применяется. Здесь показаны только
+        найденные лица, уже отсортированные по адресату. Для них нужен
+        отдельный утверждённый шаблон ответа.
       </p>
     </div>
   </div>
@@ -142,14 +195,33 @@
           </div>
           <span>{{ group.taxpayer_count }} {{ taxpayer_word(group.taxpayer_count) }}</span>
         </div>
-        <ol class="group-taxpayers">
-        {% for taxpayer in group.taxpayers %}
+        <ol class="group-taxpayers compact-taxpayers">
+        {% for taxpayer in group.taxpayers[:2] %}
           <li>
-            <span>{{ taxpayer.name }}</span>
+            <a href="/cases/{{ taxpayer.source_case_id }}">
+              {{ taxpayer.name }}
+            </a>
             <strong>ИНН {{ taxpayer.inn }}</strong>
           </li>
         {% endfor %}
         </ol>
+        {% if group.taxpayer_count > 2 %}
+          <details class="group-more">
+            <summary>
+              Показать ещё {{ group.taxpayer_count - 2 }}
+            </summary>
+            <ol class="group-taxpayers" start="3">
+            {% for taxpayer in group.taxpayers[2:] %}
+              <li>
+                <a href="/cases/{{ taxpayer.source_case_id }}">
+                  {{ taxpayer.name }}
+                </a>
+                <strong>ИНН {{ taxpayer.inn }}</strong>
+              </li>
+            {% endfor %}
+            </ol>
+          </details>
+        {% endif %}
         <div class="group-issues">
           <p>Нужен отдельный утверждённый шаблон ответа.</p>
         </div>
@@ -157,7 +229,7 @@
     {% endfor %}
     </div>
   {% else %}
-    <div class="empty-state">Найденных в АБС лиц за сегодня нет.</div>
+    <div class="empty-state">Найденных в АБС или ОДБ лиц за сегодня нет.</div>
   {% endif %}
 </section>
 

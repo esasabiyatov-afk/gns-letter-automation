@@ -26,6 +26,7 @@ def test_settings(tmp_path: Path, project_root: Path) -> Settings:
         previews_dir=runtime / "previews",
         official_dir=runtime / "official",
         responses_dir=runtime / "responses",
+        inbox_dir=runtime / "inbox",
         source_templates_dir=project_root / "УГНС",
         period_threshold=date(2019, 1, 1),
         max_upload_bytes=150 * 1024 * 1024,
@@ -33,6 +34,7 @@ def test_settings(tmp_path: Path, project_root: Path) -> Settings:
         allowed_qr_paths=frozenset({"/getsti010decission"}),
         auto_download_official=False,
         employee_name="Гапарова Э.",
+        auto_registry_check=False,
     )
     settings.ensure_directories()
     return settings
@@ -43,4 +45,3 @@ def workflow(test_settings: Settings) -> WorkflowService:
     database = Database(test_settings.database_path)
     database.initialize()
     return WorkflowService(database, test_settings)
-

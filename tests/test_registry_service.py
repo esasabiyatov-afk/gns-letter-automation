@@ -65,6 +65,7 @@ def test_exact_html_lookup_sends_only_inn_and_uses_cache():
 
     assert first.status == "found"
     assert first.official_name == "ОсОО «Кыргыз Тест»"
+    assert first.director == "Руководитель"
     assert not first.from_cache
     assert second.from_cache
     assert [request.method for request in requests] == ["GET", "POST"]
@@ -113,3 +114,45 @@ def test_html_lookup_wraps_http_status_error():
 
     with pytest.raises(RegistryLookupError, match="ошибку HTTP"):
         client.lookup_by_inn("12345678901234")
+
+
+def test_name_search_returns_inn_name_and_director():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                text=HOME_HTML,
+                headers={"content-type": "text/html"},
+            )
+        form = parse_qs(request.content.decode())
+        assert form == {
+            "csrfmiddlewaretoken": ["token-1"],
+            "text": ["Кыргыз"],
+        }
+        return httpx.Response(
+            200,
+            text="""
+            <html><body><table>
+              <tr>
+                <td>ОсОО «Кыргыз Альфа»</td>
+                <td><a href="/inn/12345678901234/">12345678901234</a></td>
+                <td>Асанов Асан</td>
+              </tr>
+              <tr>
+                <td>ОсОО «Кыргыз Бета»</td>
+                <td><a href="/inn/23456789012345/">23456789012345</a></td>
+                <td>Үсөнов Үсөн</td>
+              </tr>
+            </table></body></html>
+            """,
+            headers={"content-type": "text/html"},
+        )
+
+    result = _client(handler).search_by_name("  Кыргыз  ")
+
+    assert result.status == "multiple"
+    assert [company.inn for company in result.matches] == [
+        "12345678901234",
+        "23456789012345",
+    ]
+    assert result.matches[1].director == "Үсөнов Үсөн"
