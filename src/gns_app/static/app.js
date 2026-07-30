@@ -80,15 +80,19 @@
   const letterFields = document.querySelector("#letter-fields");
   const typeRadios = document.querySelectorAll("input[name='page_type']");
   if (letterFields && typeRadios.length) {
+    const verification = document.querySelector("[data-letter-verification]");
     const update = () => {
       const selected = document.querySelector("input[name='page_type']:checked")?.value;
       letterFields.classList.toggle("is-disabled", selected !== "letter");
       letterFields.querySelectorAll("input").forEach((input) => {
         input.disabled = selected !== "letter";
       });
+      if (verification) {
+        verification.disabled = selected !== "letter";
+        verification.required = selected === "letter";
+      }
     };
     typeRadios.forEach((radio) => radio.addEventListener("change", update));
     update();
   }
 })();
-

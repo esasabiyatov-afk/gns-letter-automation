@@ -60,8 +60,10 @@
       <h2>Проверить налогоплательщиков в тестовой АБС</h2>
       <p>Логин и пароль используются только для одного запроса и не сохраняются.</p>
     {% elif case.status == 'ready_for_response' %}
-      <h2>Создать проект ответа Word</h2>
-      <p>Все налогоплательщики получили однозначный результат «не найден».</p>
+      <h2>Готово к общему ответу за сегодня</h2>
+      <p>
+        Обращение будет объединено с другими письмами тому же адресату.
+      </p>
     {% elif case.status == 'manual_period_rule' %}
       <h2>Требуется ручная обработка периода</h2>
       <p>Начало периода раньше установленного порога {{ threshold }}.</p>
@@ -79,9 +81,9 @@
         Открыть проверку АБС
       </button>
     {% elif case.status == 'ready_for_response' %}
-      <form method="post" action="/cases/{{ case.id }}/response">
-        <button class="button button-primary" type="submit">Создать Word</button>
-      </form>
+      <a class="button button-primary" href="/today">
+        Открыть общие ответы
+      </a>
     {% elif case.status == 'response_created' %}
       <a class="button button-primary" href="/cases/{{ case.id }}/response">Скачать Word</a>
     {% endif %}

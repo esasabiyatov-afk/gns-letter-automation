@@ -7,6 +7,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
+from gns_app.text_cleanup import clean_location
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
@@ -132,6 +134,43 @@ CREATE TABLE IF NOT EXISTS employee_profiles (
 
 CREATE INDEX IF NOT EXISTS idx_employee_profiles_name
 ON employee_profiles(name);
+
+CREATE TABLE IF NOT EXISTS response_groups (
+    id TEXT PRIMARY KEY,
+    business_date TEXT NOT NULL,
+    group_key TEXT NOT NULL,
+    abs_bucket TEXT NOT NULL,
+    status TEXT NOT NULL,
+    district_place TEXT NOT NULL,
+    recipient_position TEXT NOT NULL,
+    recipient_full_name TEXT NOT NULL,
+    recipient_display_name TEXT NOT NULL,
+    employee_name TEXT NOT NULL,
+    taxpayer_count INTEGER NOT NULL,
+    response_path TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_response_groups_day
+ON response_groups(business_date, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS response_group_cases (
+    response_group_id TEXT NOT NULL
+        REFERENCES response_groups(id) ON DELETE CASCADE,
+    case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE RESTRICT,
+    PRIMARY KEY(response_group_id, case_id)
+);
+
+CREATE TABLE IF NOT EXISTS response_group_taxpayers (
+    response_group_id TEXT NOT NULL
+        REFERENCES response_groups(id) ON DELETE CASCADE,
+    display_order INTEGER NOT NULL,
+    source_case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    inn TEXT NOT NULL,
+    PRIMARY KEY(response_group_id, display_order)
+);
 """
 
 
@@ -177,7 +216,52 @@ class Database:
                   AND fields_confirmed = 1
                 """
             )
+            self._clean_legacy_district_places(connection)
 
+    @staticmethod
+    def _clean_legacy_district_places(
+        connection: sqlite3.Connection,
+    ) -> None:
+        rows = connection.execute(
+            """
+            SELECT id, district_place
+            FROM cases
+            WHERE district_place IS NOT NULL
+            """
+        ).fetchall()
+        for row in rows:
+            original = row["district_place"]
+            cleaned = clean_location(original)
+            if cleaned == original:
+                continue
+            now = utc_now()
+            connection.execute(
+                """
+                UPDATE cases
+                SET district_place = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (cleaned, now, row["id"]),
+            )
+            connection.execute(
+                """
+                INSERT INTO audit_events(
+                    entity_type, entity_id, event_type,
+                    actor, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "case",
+                    row["id"],
+                    "district_place_edge_noise_removed",
+                    "system",
+                    json.dumps(
+                        {"before": original, "after": cleaned},
+                        ensure_ascii=False,
+                    ),
+                    now,
+                ),
+            )
     def execute(self, sql: str, parameters: Sequence[Any] = ()) -> None:
         with self.connect() as connection:
             connection.execute(sql, parameters)

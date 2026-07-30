@@ -37,6 +37,7 @@ async def lifespan(_: FastAPI):
     settings.ensure_directories()
     db.initialize()
     workflow.initialize_employee_profiles()
+    workflow.repair_cleaned_responses()
     yield
 
 
@@ -129,7 +130,15 @@ EVENT_LABELS = {
     "official_document_processed": "Официальная версия обработана",
     "page_manually_confirmed": "Страница подтверждена сотрудником",
     "fake_abs_checked": "Выполнена тестовая проверка АБС",
+    "fake_abs_batch_checked": "Выполнена пакетная проверка АБС",
     "response_created": "Создан ответ Word",
+    "grouped_response_created": "Создан общий ответ Word",
+    "district_place_edge_noise_removed": (
+        "Удалены лишние краевые символы в реквизите ГНС"
+    ),
+    "response_regenerated_after_cleanup": (
+        "Ответ пересоздан после очистки реквизита ГНС"
+    ),
     "employee_profile_added": "Добавлен исполнитель",
     "active_employee_selected": "Выбран активный исполнитель",
 }
@@ -139,6 +148,7 @@ ENTITY_LABELS = {
     "page": "Страница",
     "case": "Обращение",
     "settings": "Настройка",
+    "response_group": "Общий ответ",
 }
 
 
@@ -148,6 +158,14 @@ def taxpayer_word(count: int) -> str:
     if count % 10 in {2, 3, 4} and count % 100 not in {12, 13, 14}:
         return "записи"
     return "записей"
+
+
+def case_word(count: int) -> str:
+    if count % 10 == 1 and count % 100 != 11:
+        return "обращение"
+    if count % 10 in {2, 3, 4} and count % 100 not in {12, 13, 14}:
+        return "обращения"
+    return "обращений"
 
 
 def context(request: Request, **values):
@@ -163,6 +181,7 @@ def context(request: Request, **values):
         "event_labels": EVENT_LABELS,
         "entity_labels": ENTITY_LABELS,
         "taxpayer_word": taxpayer_word,
+        "case_word": case_word,
         "threshold": settings.period_threshold.isoformat(),
         "active_employee": active_employee,
         "employee_profiles": workflow.list_employee_profiles(),
@@ -181,6 +200,87 @@ def index(request: Request):
             uploads=workflow.list_uploads()[:12],
             cases=workflow.list_cases()[:8],
         ),
+    )
+
+
+@app.get("/today", response_class=HTMLResponse)
+def today(request: Request, message: str = "", error: str = ""):
+    return templates.TemplateResponse(
+        request,
+        "today.html",
+        context(
+            request,
+            overview=workflow.today_overview(),
+            message=message,
+            error=error,
+        ),
+    )
+
+
+@app.post("/today/abs")
+def abs_check_today(
+    username: str = Form(...),
+    password: str = Form(...),
+):
+    try:
+        summary = workflow.check_abs_today(username, password)
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            f"/today?error={quote(str(exc))}",
+            status_code=303,
+        )
+    return RedirectResponse(
+        (
+            "/today?message="
+            + quote(
+                "Пакетная проверка завершена. Обращений: "
+                f"{summary['case_count']}."
+            )
+        ),
+        status_code=303,
+    )
+
+
+@app.post("/today/responses/{group_key}")
+def create_grouped_response(group_key: str):
+    try:
+        group_id, _ = workflow.generate_daily_response(group_key)
+    except (WorkflowValidationError, ValueError) as exc:
+        return RedirectResponse(
+            f"/today?error={quote(str(exc))}",
+            status_code=303,
+        )
+    return RedirectResponse(
+        (
+            "/today?message="
+            + quote("Общий проект ответа Word создан.")
+            + f"#group-{group_id}"
+        ),
+        status_code=303,
+    )
+
+
+@app.get("/response-groups/{group_id}")
+def download_grouped_response(group_id: str):
+    group = workflow.get_response_group(group_id)
+    if not group or not group.get("response_path"):
+        raise HTTPException(404, "Общий ответ не найден")
+    try:
+        path = ensure_within(
+            Path(group["response_path"]),
+            settings.responses_dir,
+        )
+    except StorageError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    if not path.exists():
+        raise HTTPException(404, "Файл общего ответа отсутствует")
+    return FileResponse(
+        path,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "wordprocessingml.document"
+        ),
+        filename=path.name,
     )
 
 
@@ -348,6 +448,7 @@ def confirm_review(
     period_start: str = Form(""),
     period_end: str = Form(""),
     employee_name: str = Form(""),
+    critical_fields_verified: bool = Form(False),
     taxpayer_name: list[str] = Form(default=[]),
     taxpayer_inn: list[str] = Form(default=[]),
 ):
@@ -368,6 +469,7 @@ def confirm_review(
             period_end=period_end,
             employee_name=employee_name,
             taxpayers=taxpayers,
+            critical_fields_verified=critical_fields_verified,
         )
     except WorkflowValidationError as exc:
         return RedirectResponse(
@@ -431,17 +533,15 @@ def abs_check(
 
 @app.post("/cases/{case_id}/response")
 def create_response(case_id: str):
-    try:
-        workflow.generate_response(case_id)
-        return RedirectResponse(
-            f"/cases/{case_id}?message={quote('Проект ответа создан.')}",
-            status_code=303,
-        )
-    except (WorkflowValidationError, ValueError) as exc:
-        return RedirectResponse(
-            f"/cases/{case_id}?error={quote(str(exc))}",
-            status_code=303,
-        )
+    return RedirectResponse(
+        (
+            "/today?message="
+            + quote(
+                "Ответы теперь формируются общими письмами по адресату."
+            )
+        ),
+        status_code=303,
+    )
 
 
 @app.get("/cases/{case_id}/response")

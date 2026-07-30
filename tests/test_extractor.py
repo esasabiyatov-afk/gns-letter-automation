@@ -24,3 +24,24 @@ def test_official_district_does_not_span_two_document_pages():
     assert fields.recipient_full_name == "Торобек уулу Сталбек"
     assert fields.taxpayers[0].inn == "02312201410117"
     assert fields.confidence == 0.96
+
+
+def test_official_district_removes_only_stray_edge_quote():
+    text = """
+    Учреждение "Управление Государственной налоговой службы по городу
+    Балыкчы Ысык-Кульской области" в соответствии со статьёй 146
+    запрашивает информацию.
+    Наименование: Общество с ограниченной ответственностью "Чардж"
+    ИНН: 01608201810051
+    Период: с 01.01.2020 по 30.06.2026
+    Зам. начальника управления Омурбеков Нурлан Муратович
+    """
+
+    fields = FieldExtractor().extract_official_letter(text)
+
+    assert fields.district_place == (
+        "по городу Балыкчы Ысык-Кульской области"
+    )
+    assert fields.taxpayers[0].name == (
+        'Общество с ограниченной ответственностью "Чардж"'
+    )

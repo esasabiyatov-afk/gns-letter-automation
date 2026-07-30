@@ -129,6 +129,15 @@
         <pre>{{ page.extracted_text or 'Текстовый слой отсутствует.' }}</pre>
       </details>
 
+      <label class="verification-check">
+        <input type="checkbox" name="critical_fields_verified" value="true"
+               data-letter-verification>
+        <span>
+          Я сверил(а) с изображением страницы каждую цифру ИНН, даты периода
+          и наименования. OCR здесь является только подсказкой.
+        </span>
+      </label>
+
       <button class="button button-primary button-block" type="submit">
         Подтвердить и продолжить
       </button>

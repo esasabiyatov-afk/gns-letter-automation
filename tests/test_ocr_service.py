@@ -73,3 +73,79 @@ def test_rejected_embedded_layer_falls_back_to_local_rus_kir(monkeypatch):
     assert result.language == "rus+kir (Tesseract fast)"
     assert "Ишен кызы Саида" in result.text
     assert "Повреждённый текстовый слой PDF отклонён" in result.issue
+    assert not result.critical_fields_agree
+
+
+def test_two_local_models_must_agree_on_all_critical_fields(monkeypatch):
+    pdf_service = SimpleNamespace(
+        extract_embedded_text=lambda _path, _page: ""
+    )
+    service = OcrService(
+        pdf_service,
+        fast_data_dir=Path("fast"),
+        best_data_dir=Path("best"),
+    )
+    fast = OcrResult(
+        status=OcrStatus.COMPLETED,
+        text=(
+            "Наименование: ОсОО Тест ИНН: 12345678901234 "
+            "Период: с 01.01.2020 по 01.01.2026"
+        ),
+        confidence=0.80,
+        language="rus+kir fast",
+    )
+    best = OcrResult(
+        status=OcrStatus.COMPLETED,
+        text=(
+            "Наименование: ОсОО Тест ИНН: 12345678901235 "
+            "Период: с 01.01.2020 по 01.01.2026"
+        ),
+        confidence=0.82,
+        language="rus+kir best",
+    )
+    monkeypatch.setattr(service, "_model_available", lambda _path: True)
+    monkeypatch.setattr(
+        service,
+        "_recognize_image",
+        lambda _image, _data, model: fast if model == "fast" else best,
+    )
+
+    result = service.recognize(
+        Path("source.pdf"), 1, Path("page.jpg")
+    )
+
+    assert not result.critical_fields_agree
+    assert "не подтвердили одинаково" in result.issue
+
+
+def test_two_local_models_can_mark_exact_critical_consensus(monkeypatch):
+    pdf_service = SimpleNamespace(
+        extract_embedded_text=lambda _path, _page: ""
+    )
+    service = OcrService(
+        pdf_service,
+        fast_data_dir=Path("fast"),
+        best_data_dir=Path("best"),
+    )
+    text = (
+        "Наименование: ОсОО Тест ИНН: 12345678901234 "
+        "Период: с 01.01.2020 по 01.01.2026"
+    )
+    monkeypatch.setattr(service, "_model_available", lambda _path: True)
+    monkeypatch.setattr(
+        service,
+        "_recognize_image",
+        lambda _image, _data, model: OcrResult(
+            status=OcrStatus.COMPLETED,
+            text=text,
+            confidence=0.80 if model == "fast" else 0.82,
+            language=f"rus+kir {model}",
+        ),
+    )
+
+    result = service.recognize(
+        Path("source.pdf"), 1, Path("page.jpg")
+    )
+
+    assert result.critical_fields_agree
+    assert "всё равно нужно сверить" in result.issue

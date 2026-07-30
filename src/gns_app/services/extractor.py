@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 from gns_app.domain import ExtractedFields, ExtractedTaxpayer
+from gns_app.text_cleanup import clean_location
 
 
 class FieldExtractor:
@@ -85,7 +86,7 @@ class FieldExtractor:
 
         district_matches = list(self.DISTRICT_RE.finditer(text))
         if district_matches:
-            result.district_place = self._clean(
+            result.district_place = clean_location(
                 district_matches[-1].group("district")
             )
         else:

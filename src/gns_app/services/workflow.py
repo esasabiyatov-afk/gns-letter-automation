@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
-from datetime import date
+from datetime import UTC, date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import BinaryIO, Any
+from typing import Any, BinaryIO
 from uuid import uuid4
 
 from docx import Document
@@ -34,6 +35,7 @@ from gns_app.services.pdf_service import PdfService
 from gns_app.services.qr_service import QrService
 from gns_app.services.storage import sanitize_filename, save_pdf_stream
 from gns_app.services.word_service import WordTemplateService
+from gns_app.text_cleanup import clean_location
 
 
 class WorkflowValidationError(ValueError):
@@ -42,6 +44,7 @@ class WorkflowValidationError(ValueError):
 
 class WorkflowService:
     ACTIVE_EMPLOYEE_SETTING = "active_employee_key"
+    BUSINESS_TIMEZONE = timezone(timedelta(hours=6), "Asia/Bishkek")
 
     def __init__(self, db: Database, settings: Settings):
         self.db = db
@@ -554,7 +557,11 @@ class WorkflowService:
             extracted = self.extractor.extract_scan_letter(ocr_result.text)
             if case_id is None:
                 case_id = self._create_scan_case(upload["id"], page_id)
-            self._prefill_scan_case(case_id, extracted)
+            self._prefill_scan_case(
+                case_id,
+                extracted,
+                ocr_result.critical_fields_agree,
+            )
 
         page_status, issue_code, issue_message = self._page_outcome(
             classification.page_type,
@@ -563,6 +570,17 @@ class WorkflowService:
             official_complete,
             official_issue,
         )
+        if (
+            classification.page_type == PageType.LETTER
+            and not official_complete
+            and not ocr_result.critical_fields_agree
+        ):
+            issue_code = "ocr_critical_fields_disagree"
+            issue_message = (
+                "OCR-модели не подтвердили одинаково наименование, ИНН "
+                "и период. Критические поля нужно ввести вручную, сверяя "
+                "с изображением."
+            )
         self.db.execute(
             """
             UPDATE pages
@@ -622,16 +640,6 @@ class WorkflowService:
     ) -> tuple[PageStatus, str | None, str | None]:
         if official_complete:
             return PageStatus.COMPLETED, None, None
-        if (
-            page_type == PageType.DECISION
-            and type_confidence >= 0.65
-            and qr_status != QrStatus.INVALID_URL
-        ):
-            return (
-                PageStatus.COMPLETED,
-                "optional_decision",
-                "Решение учтено как необязательное приложение.",
-            )
         if official_issue:
             return (
                 PageStatus.NEEDS_REVIEW,
@@ -727,7 +735,12 @@ class WorkflowService:
         )
         return case_id
 
-    def _prefill_scan_case(self, case_id: str, fields) -> None:
+    def _prefill_scan_case(
+        self,
+        case_id: str,
+        fields,
+        critical_fields_agree: bool = False,
+    ) -> None:
         current = self.get_case(case_id)
         if not current:
             return
@@ -735,6 +748,16 @@ class WorkflowService:
             current.get("source_kind") == ValueSource.QR_OFFICIAL
             and current.get("fields_confirmed")
         ):
+            return
+        if not critical_fields_agree:
+            self.db.execute(
+                """
+                UPDATE cases
+                SET status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (CaseStatus.NEEDS_REVIEW, utc_now(), case_id),
+            )
             return
         self.db.execute(
             """
@@ -908,6 +931,7 @@ class WorkflowService:
         period_end: str = "",
         employee_name: str = "",
         taxpayers: list[dict[str, str]] | None = None,
+        critical_fields_verified: bool = False,
         actor: str = "Сотрудник",
     ) -> str | None:
         page = self.get_page(page_id)
@@ -922,9 +946,15 @@ class WorkflowService:
 
         case_id = page.get("case_id")
         if selected_type == PageType.LETTER:
+            if not critical_fields_verified:
+                raise WorkflowValidationError(
+                    "Подтвердите, что ИНН, наименования и период сверены "
+                    "с изображением страницы"
+                )
             employee_name = (
                 employee_name.strip() or self.get_active_employee() or ""
             )
+            district_place = clean_location(district_place)
             clean_taxpayers = self._validate_manual_fields(
                 district_place,
                 recipient_position,
@@ -958,7 +988,7 @@ class WorkflowService:
                 WHERE id = ?
                 """,
                 (
-                    district_place.strip(),
+                    district_place,
                     recipient_position.strip(),
                     recipient_full_name.strip(),
                     display_name,
@@ -1126,7 +1156,16 @@ class WorkflowService:
                 ),
             )
 
-        next_status = CaseStatus.NEEDS_REVIEW
+        next_status = (
+            CaseStatus.READY_FOR_ABS
+            if result.status
+            in {
+                AbsStatus.AUTH_ERROR,
+                AbsStatus.UNAVAILABLE,
+                AbsStatus.TECHNICAL_ERROR,
+            }
+            else CaseStatus.NEEDS_REVIEW
+        )
         if result.status == AbsStatus.NOT_FOUND:
             start = date.fromisoformat(case["period_start"])
             next_status = (
@@ -1155,6 +1194,480 @@ class WorkflowService:
             },
         )
         return result
+
+    def check_abs_today(
+        self,
+        username: str,
+        password: str,
+        business_date: date | None = None,
+    ) -> dict[str, Any]:
+        day = business_date or datetime.now(self.BUSINESS_TIMEZONE).date()
+        start_utc, end_utc = self._business_day_bounds(day)
+        cases = self.db.fetch_all(
+            """
+            SELECT cases.id
+            FROM cases
+            JOIN uploads ON uploads.id = cases.upload_id
+            WHERE uploads.created_at >= ? AND uploads.created_at < ?
+              AND cases.status = ?
+              AND cases.fields_confirmed = 1
+            ORDER BY cases.created_at, cases.id
+            """,
+            (start_utc, end_utc, CaseStatus.READY_FOR_ABS),
+        )
+        if not cases:
+            raise WorkflowValidationError(
+                "За сегодня нет подтверждённых обращений, ожидающих АБС"
+            )
+
+        counts: dict[str, int] = {}
+        for case in cases:
+            result = self.check_abs(case["id"], username, password)
+            key = str(result.status)
+            counts[key] = counts.get(key, 0) + 1
+
+        # Явно разрываем ссылки после завершения пакетного запроса.
+        username = ""
+        password = ""
+        self.db.audit(
+            "settings",
+            f"abs-batch-{day.isoformat()}",
+            "fake_abs_batch_checked",
+            {
+                "business_date": day.isoformat(),
+                "case_count": len(cases),
+                "results": counts,
+                "is_fake": True,
+            },
+        )
+        return {
+            "business_date": day.isoformat(),
+            "case_count": len(cases),
+            "results": counts,
+        }
+
+    def today_overview(
+        self,
+        business_date: date | None = None,
+    ) -> dict[str, Any]:
+        day = business_date or datetime.now(self.BUSINESS_TIMEZONE).date()
+        start_utc, end_utc = self._business_day_bounds(day)
+        counts = self.db.fetch_one(
+            """
+            SELECT
+                SUM(CASE WHEN cases.status = 'ready_for_abs'
+                    THEN 1 ELSE 0 END) AS ready_abs,
+                SUM(CASE WHEN cases.status = 'ready_for_abs'
+                          AND cases.source_kind = 'qr_official'
+                    THEN 1 ELSE 0 END) AS ready_qr,
+                SUM(CASE WHEN cases.status = 'ready_for_response'
+                    THEN 1 ELSE 0 END) AS ready_response
+            FROM cases
+            JOIN uploads ON uploads.id = cases.upload_id
+            WHERE uploads.created_at >= ? AND uploads.created_at < ?
+            """,
+            (start_utc, end_utc),
+        ) or {}
+        unresolved = self.db.fetch_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM pages
+            JOIN uploads ON uploads.id = pages.upload_id
+            WHERE uploads.created_at >= ? AND uploads.created_at < ?
+              AND pages.status IN ('needs_review', 'technical_error')
+            """,
+            (start_utc, end_utc),
+        ) or {"count": 0}
+        generated = self.db.fetch_all(
+            """
+            SELECT *
+            FROM response_groups
+            WHERE business_date = ?
+            ORDER BY created_at DESC
+            """,
+            (day.isoformat(),),
+        )
+        return {
+            "business_date": day.isoformat(),
+            "ready_abs": int(counts.get("ready_abs") or 0),
+            "ready_qr": int(counts.get("ready_qr") or 0),
+            "ready_response": int(counts.get("ready_response") or 0),
+            "unresolved_pages": int(unresolved["count"]),
+            "not_found_groups": self._daily_response_groups(
+                day, AbsStatus.NOT_FOUND
+            ),
+            "found_groups": self._daily_response_groups(
+                day, AbsStatus.FOUND
+            ),
+            "generated_groups": generated,
+        }
+
+    def _daily_response_groups(
+        self,
+        business_date: date,
+        abs_bucket: AbsStatus,
+    ) -> list[dict[str, Any]]:
+        start_utc, end_utc = self._business_day_bounds(business_date)
+        if abs_bucket == AbsStatus.NOT_FOUND:
+            extra_where = (
+                "cases.status = 'ready_for_response' "
+                "AND taxpayers.abs_result = 'not_found'"
+            )
+        else:
+            extra_where = (
+                "cases.abs_status = 'found' "
+                "AND taxpayers.abs_result = 'found'"
+            )
+        rows = self.db.fetch_all(
+            f"""
+            SELECT
+                cases.id AS case_id,
+                cases.district_place,
+                cases.recipient_position,
+                cases.recipient_full_name,
+                cases.recipient_display_name,
+                cases.employee_name,
+                cases.created_at AS case_created_at,
+                taxpayers.name AS taxpayer_name,
+                taxpayers.inn AS taxpayer_inn,
+                taxpayers.display_order
+            FROM cases
+            JOIN uploads ON uploads.id = cases.upload_id
+            JOIN taxpayers ON taxpayers.case_id = cases.id
+            WHERE uploads.created_at >= ? AND uploads.created_at < ?
+              AND {extra_where}
+            ORDER BY cases.created_at, cases.id, taxpayers.display_order
+            """,
+            (start_utc, end_utc),
+        )
+
+        grouped: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            district = clean_location(row.get("district_place"))
+            recipient = " ".join(
+                (row.get("recipient_full_name") or "").split()
+            )
+            group_key = self._response_group_key(
+                business_date,
+                abs_bucket,
+                district,
+                recipient,
+            )
+            group = grouped.setdefault(
+                group_key,
+                {
+                    "group_key": group_key,
+                    "business_date": business_date.isoformat(),
+                    "abs_bucket": str(abs_bucket),
+                    "district_place": district,
+                    "recipient_position": row.get("recipient_position") or "",
+                    "recipient_full_name": recipient,
+                    "recipient_display_name": (
+                        row.get("recipient_display_name") or ""
+                    ),
+                    "employee_name": row.get("employee_name") or "",
+                    "case_ids": [],
+                    "taxpayers": [],
+                    "issues": [],
+                    "_positions": set(),
+                    "_display_names": set(),
+                    "_employees": set(),
+                    "_taxpayers_by_inn": {},
+                },
+            )
+            if row["case_id"] not in group["case_ids"]:
+                group["case_ids"].append(row["case_id"])
+            group["_positions"].add(
+                self._normalize_group_value(row.get("recipient_position"))
+            )
+            group["_display_names"].add(
+                self._normalize_group_value(
+                    row.get("recipient_display_name")
+                )
+            )
+            group["_employees"].add(
+                self._normalize_group_value(row.get("employee_name"))
+            )
+
+            inn = re.sub(r"\D", "", row.get("taxpayer_inn") or "")
+            name = " ".join((row.get("taxpayer_name") or "").split())
+            existing = group["_taxpayers_by_inn"].get(inn)
+            if existing is None:
+                taxpayer = {
+                    "source_case_id": row["case_id"],
+                    "name": name,
+                    "inn": inn,
+                }
+                group["_taxpayers_by_inn"][inn] = taxpayer
+                group["taxpayers"].append(taxpayer)
+            elif self._normalize_group_value(existing["name"]) != (
+                self._normalize_group_value(name)
+            ):
+                issue = (
+                    f"ИНН {inn} встречается с разными наименованиями. "
+                    "Нужно проверить вручную."
+                )
+                if issue not in group["issues"]:
+                    group["issues"].append(issue)
+
+        result: list[dict[str, Any]] = []
+        for group in grouped.values():
+            if len(group["_positions"]) != 1:
+                group["issues"].append(
+                    "У одного адресата отличаются должности в письмах."
+                )
+            if len(group["_display_names"]) != 1:
+                group["issues"].append(
+                    "У одного адресата отличаются формы обращения."
+                )
+            if len(group["_employees"]) != 1 or not group["employee_name"]:
+                group["issues"].append(
+                    "Для группы не определён единый исполнитель банка."
+                )
+            if abs_bucket == AbsStatus.FOUND:
+                group["issues"].append(
+                    "Налогоплательщики найдены в АБС. Для них нужен "
+                    "отдельный утверждённый шаблон ответа."
+                )
+            group["case_count"] = len(group["case_ids"])
+            group["taxpayer_count"] = len(group["taxpayers"])
+            group["can_generate"] = bool(
+                abs_bucket == AbsStatus.NOT_FOUND
+                and group["taxpayers"]
+                and not group["issues"]
+            )
+            for private_key in (
+                "_positions",
+                "_display_names",
+                "_employees",
+                "_taxpayers_by_inn",
+            ):
+                group.pop(private_key, None)
+            result.append(group)
+
+        return sorted(
+            result,
+            key=lambda item: (
+                item["recipient_full_name"].casefold(),
+                item["district_place"].casefold(),
+            ),
+        )
+
+    def generate_daily_response(
+        self,
+        group_key: str,
+        business_date: date | None = None,
+    ) -> tuple[str, Path]:
+        day = business_date or datetime.now(self.BUSINESS_TIMEZONE).date()
+        group = next(
+            (
+                item
+                for item in self._daily_response_groups(
+                    day, AbsStatus.NOT_FOUND
+                )
+                if item["group_key"] == group_key
+            ),
+            None,
+        )
+        if not group:
+            raise WorkflowValidationError(
+                "Группа уже обработана или больше не готова к ответу"
+            )
+        if not group["can_generate"]:
+            raise WorkflowValidationError(
+                "Нельзя создать ответ: " + " ".join(group["issues"])
+            )
+
+        group_id = uuid4().hex
+        output = (
+            self.settings.responses_dir
+            / f"response-group-{day.isoformat()}-{group_id}.docx"
+        )
+        case_snapshot = {
+            "district_place": group["district_place"],
+            "recipient_position": group["recipient_position"],
+            "recipient_display_name": group["recipient_display_name"],
+            "employee_name": group["employee_name"],
+        }
+        self.word.render(output, case_snapshot, group["taxpayers"])
+
+        now = utc_now()
+        with self.db.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO response_groups(
+                    id, business_date, group_key, abs_bucket, status,
+                    district_place, recipient_position, recipient_full_name,
+                    recipient_display_name, employee_name, taxpayer_count,
+                    response_path, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    group_id,
+                    day.isoformat(),
+                    group_key,
+                    str(AbsStatus.NOT_FOUND),
+                    "created",
+                    group["district_place"],
+                    group["recipient_position"],
+                    group["recipient_full_name"],
+                    group["recipient_display_name"],
+                    group["employee_name"],
+                    group["taxpayer_count"],
+                    str(output),
+                    now,
+                    now,
+                ),
+            )
+            connection.executemany(
+                """
+                INSERT INTO response_group_cases(response_group_id, case_id)
+                VALUES (?, ?)
+                """,
+                [(group_id, case_id) for case_id in group["case_ids"]],
+            )
+            connection.executemany(
+                """
+                INSERT INTO response_group_taxpayers(
+                    response_group_id, display_order, source_case_id,
+                    name, inn
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        group_id,
+                        index,
+                        taxpayer["source_case_id"],
+                        taxpayer["name"],
+                        taxpayer["inn"],
+                    )
+                    for index, taxpayer in enumerate(
+                        group["taxpayers"], 1
+                    )
+                ],
+            )
+            connection.executemany(
+                """
+                UPDATE cases
+                SET status = ?, response_status = ?,
+                    response_path = ?, updated_at = ?
+                WHERE id = ? AND status = ?
+                """,
+                [
+                    (
+                        CaseStatus.RESPONSE_CREATED,
+                        "grouped",
+                        str(output),
+                        now,
+                        case_id,
+                        CaseStatus.READY_FOR_RESPONSE,
+                    )
+                    for case_id in group["case_ids"]
+                ],
+            )
+
+        self.db.audit(
+            "response_group",
+            group_id,
+            "grouped_response_created",
+            {
+                "business_date": day.isoformat(),
+                "case_count": group["case_count"],
+                "taxpayer_count": group["taxpayer_count"],
+                "filename": output.name,
+            },
+        )
+        return group_id, output
+
+    def get_response_group(
+        self, group_id: str
+    ) -> dict[str, Any] | None:
+        return self.db.fetch_one(
+            "SELECT * FROM response_groups WHERE id = ?",
+            (group_id,),
+        )
+
+    def repair_cleaned_responses(self) -> None:
+        cases = self.db.fetch_all(
+            """
+            SELECT cases.*
+            FROM cases
+            WHERE cases.response_path IS NOT NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM audit_events AS cleanup
+                  WHERE cleanup.entity_type = 'case'
+                    AND cleanup.entity_id = cases.id
+                    AND cleanup.event_type =
+                        'district_place_edge_noise_removed'
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM audit_events AS repaired
+                  WHERE repaired.entity_type = 'case'
+                    AND repaired.entity_id = cases.id
+                    AND repaired.event_type =
+                        'response_regenerated_after_cleanup'
+              )
+            """
+        )
+        for case in cases:
+            path = Path(case["response_path"])
+            try:
+                self.word.render(
+                    path,
+                    case,
+                    self.get_taxpayers(case["id"]),
+                )
+            except (OSError, ValueError):
+                continue
+            self.db.audit(
+                "case",
+                case["id"],
+                "response_regenerated_after_cleanup",
+                {"filename": path.name},
+            )
+
+    @classmethod
+    def _business_day_bounds(
+        cls, business_date: date
+    ) -> tuple[str, str]:
+        local_start = datetime.combine(
+            business_date,
+            time.min,
+            tzinfo=cls.BUSINESS_TIMEZONE,
+        )
+        local_end = datetime.combine(
+            business_date + timedelta(days=1),
+            time.min,
+            tzinfo=cls.BUSINESS_TIMEZONE,
+        )
+        return (
+            local_start.astimezone(UTC).isoformat(timespec="seconds"),
+            local_end.astimezone(UTC).isoformat(timespec="seconds"),
+        )
+
+    @staticmethod
+    def _normalize_group_value(value: str | None) -> str:
+        return " ".join((value or "").split()).casefold()
+
+    @classmethod
+    def _response_group_key(
+        cls,
+        business_date: date,
+        abs_bucket: AbsStatus,
+        district_place: str,
+        recipient_full_name: str,
+    ) -> str:
+        identity = "\x1f".join(
+            (
+                business_date.isoformat(),
+                str(abs_bucket),
+                cls._normalize_group_value(district_place),
+                cls._normalize_group_value(recipient_full_name),
+            )
+        )
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
 
     def generate_response(self, case_id: str) -> Path:
         case = self.get_case(case_id)

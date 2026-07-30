@@ -66,10 +66,7 @@ class OcrService:
                 fast = self._recognize_image(
                     image_path, self.fast_data_dir, "fast"
                 )
-                if (
-                    self._model_available(self.best_data_dir)
-                    and (fast.confidence < 0.55 or len(fast.text) < 200)
-                ):
+                if self._model_available(self.best_data_dir):
                     best = self._recognize_image(
                         image_path, self.best_data_dir, "best"
                     )
@@ -78,14 +75,33 @@ class OcrService:
                         if self._quality_key(best) > self._quality_key(fast)
                         else fast
                     )
+                    result.critical_fields_agree = (
+                        self._critical_field_signature(fast.text)
+                        == self._critical_field_signature(best.text)
+                        != ()
+                    )
                 else:
                     result = fast
+                issue_parts: list[str] = []
                 if embedded_text_rejected:
-                    result.issue = (
+                    issue_parts.append(
                         "Повреждённый текстовый слой PDF отклонён. "
                         "Показан результат локального OCR rus+kir без "
                         "догадок и автоматической подмены символов."
                     )
+                if result.critical_fields_agree:
+                    issue_parts.append(
+                        "Два OCR-прохода одинаково прочитали наименование, "
+                        "ИНН и период. Их всё равно нужно сверить с "
+                        "изображением."
+                    )
+                else:
+                    issue_parts.append(
+                        "Два независимых OCR-прохода не подтвердили "
+                        "одинаково наименование, ИНН и период. Критические "
+                        "поля не предзаполняются."
+                    )
+                result.issue = " ".join(issue_parts)
                 return result
             except Exception as exc:
                 return OcrResult(
@@ -144,6 +160,48 @@ class OcrService:
     @staticmethod
     def _quality_key(result: OcrResult) -> tuple[float, int]:
         return result.confidence, len(result.text)
+
+    @staticmethod
+    def _critical_field_signature(text: str) -> tuple[str, ...]:
+        normalized = unicodedata.normalize("NFC", text)
+        names = [
+            re.sub(r"\s+", " ", match.group(1)).strip().casefold()
+            for match in re.finditer(
+                r"наименование\s*[:;]\s*(.+?)(?=\s+инн\s*[:;])",
+                normalized,
+                re.IGNORECASE | re.DOTALL,
+            )
+        ]
+        inns = []
+        for match in re.finditer(
+            r"инн\s*[:;]\s*([\d\s]{14,28})",
+            normalized,
+            re.IGNORECASE,
+        ):
+            digits = re.sub(r"\D", "", match.group(1))
+            if len(digits) == 14:
+                inns.append(digits)
+        periods = [
+            (
+                match.group(1).replace("/", ".").replace("-", ".")
+                + "|"
+                + match.group(2).replace("/", ".").replace("-", ".")
+            )
+            for match in re.finditer(
+                r"период\s*[:;]?\s*с\s*"
+                r"(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{4})\s*по\s*"
+                r"(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{4})",
+                normalized,
+                re.IGNORECASE,
+            )
+        ]
+        if not names or not inns or not periods:
+            return ()
+        return (
+            *(f"name:{value}" for value in names),
+            *(f"inn:{value}" for value in inns),
+            *(f"period:{value}" for value in periods),
+        )
 
     @staticmethod
     def _recognize_image(

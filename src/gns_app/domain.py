@@ -101,6 +101,7 @@ class OcrResult:
     confidence: float
     language: str
     issue: str | None = None
+    critical_fields_agree: bool = False
 
 
 @dataclass(slots=True)

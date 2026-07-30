@@ -39,6 +39,7 @@ def test_sample_pdf_end_to_end_without_guessing(
         period_start="2019-11-14",
         period_end="2025-09-10",
         employee_name="Гапарова Э.",
+        critical_fields_verified=True,
         taxpayers=[
             {
                 "name": (

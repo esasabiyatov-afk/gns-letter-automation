@@ -1,0 +1,217 @@
+{% extends "base.html" %}
+{% block title %}Сегодня · Автоматизатор писем{% endblock %}
+{% block content %}
+<div class="page-heading">
+  <div>
+    <p class="eyebrow">РАБОТА ЗА {{ overview.business_date }}</p>
+    <h1>Проверка и общие ответы</h1>
+    <p>
+      QR-письма уже подтверждены. Одним запросом проверьте готовые обращения
+      в АБС, затем создайте общий ответ каждому адресату.
+    </p>
+  </div>
+</div>
+
+{% if message %}<div class="alert alert-success">{{ message }}</div>{% endif %}
+{% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
+
+<section class="today-summary">
+  <article>
+    <strong>{{ overview.ready_qr }}</strong>
+    <span>QR-писем ждут АБС</span>
+  </article>
+  <article>
+    <strong>{{ overview.ready_abs }}</strong>
+    <span>всего готовы к АБС</span>
+  </article>
+  <article>
+    <strong>{{ overview.ready_response }}</strong>
+    <span>обращений готовы к ответу</span>
+  </article>
+  <article class="{% if overview.unresolved_pages %}summary-problem{% endif %}">
+    <strong>{{ overview.unresolved_pages }}</strong>
+    <span>проблемных страниц</span>
+  </article>
+</section>
+
+<section class="action-panel today-action">
+  <div>
+    <p class="eyebrow">ОДНО ДЕЙСТВИЕ</p>
+    {% if overview.ready_abs %}
+      <h2>Проверить все готовые обращения в АБС</h2>
+      <p>
+        Логин и пароль вводятся один раз для текущего пакета, не сохраняются
+        и не записываются в журнал.
+      </p>
+    {% else %}
+      <h2>Все готовые обращения уже проверены</h2>
+      <p>Новые QR-письма появятся здесь автоматически после загрузки.</p>
+    {% endif %}
+  </div>
+  {% if overview.ready_abs %}
+    <button class="button button-primary" type="button"
+            data-open-dialog="today-abs-dialog">
+      Проверить {{ overview.ready_abs }} в АБС
+    </button>
+  {% endif %}
+</section>
+
+{% if overview.unresolved_pages %}
+<div class="alert alert-error today-review-alert">
+  {{ overview.unresolved_pages }} проблемных страниц не включены в ответы.
+  <a class="text-link" href="/review">Открыть ручную проверку</a>
+</div>
+{% endif %}
+
+<section class="panel today-groups">
+  <div class="panel-heading">
+    <div>
+      <p class="eyebrow">НЕ НАЙДЕНЫ В АБС</p>
+      <h2>Общие ответы по адресатам</h2>
+      <p>
+        В одной карточке собраны все лица для одного налогового органа и
+        одного сотрудника ГНС.
+      </p>
+    </div>
+  </div>
+  {% if overview.not_found_groups %}
+    <div class="response-group-grid">
+    {% for group in overview.not_found_groups %}
+      <article class="response-group-card
+                      {% if group.issues %}response-group-problem{% endif %}">
+        <div class="response-group-heading">
+          <div>
+            <h3>{{ group.recipient_display_name }}</h3>
+            <p>УГНС {{ group.district_place }}</p>
+          </div>
+          <span>{{ group.taxpayer_count }} {{ taxpayer_word(group.taxpayer_count) }}</span>
+        </div>
+        <p class="group-position">
+          {{ group.recipient_position }} ·
+          {{ group.case_count }} {{ case_word(group.case_count) }}
+        </p>
+        <ol class="group-taxpayers">
+        {% for taxpayer in group.taxpayers %}
+          <li>
+            <span>{{ taxpayer.name }}</span>
+            <strong>ИНН {{ taxpayer.inn }}</strong>
+          </li>
+        {% endfor %}
+        </ol>
+        {% if group.issues %}
+          <div class="group-issues">
+          {% for issue in group.issues %}<p>{{ issue }}</p>{% endfor %}
+          </div>
+        {% endif %}
+        <form method="post" action="/today/responses/{{ group.group_key }}">
+          <button class="button button-primary" type="submit"
+                  {% if not group.can_generate %}disabled{% endif %}>
+            Создать общий Word
+          </button>
+        </form>
+      </article>
+    {% endfor %}
+    </div>
+  {% else %}
+    <div class="empty-state">
+      После пакетной проверки здесь появятся лица, не найденные в АБС.
+    </div>
+  {% endif %}
+</section>
+
+<section class="panel today-groups found-groups">
+  <div class="panel-heading">
+    <div>
+      <p class="eyebrow">НАЙДЕНЫ В АБС</p>
+      <h2>Отдельные группы для ручного ответа</h2>
+      <p>
+        Шаблон «счетов нет» к ним не применяется. Они уже отсортированы по
+        адресату, но Word появится только после добавления утверждённого
+        шаблона для найденных клиентов.
+      </p>
+    </div>
+  </div>
+  {% if overview.found_groups %}
+    <div class="response-group-grid">
+    {% for group in overview.found_groups %}
+      <article class="response-group-card response-group-found">
+        <div class="response-group-heading">
+          <div>
+            <h3>{{ group.recipient_display_name }}</h3>
+            <p>УГНС {{ group.district_place }}</p>
+          </div>
+          <span>{{ group.taxpayer_count }} {{ taxpayer_word(group.taxpayer_count) }}</span>
+        </div>
+        <ol class="group-taxpayers">
+        {% for taxpayer in group.taxpayers %}
+          <li>
+            <span>{{ taxpayer.name }}</span>
+            <strong>ИНН {{ taxpayer.inn }}</strong>
+          </li>
+        {% endfor %}
+        </ol>
+        <div class="group-issues">
+          <p>Нужен отдельный утверждённый шаблон ответа.</p>
+        </div>
+      </article>
+    {% endfor %}
+    </div>
+  {% else %}
+    <div class="empty-state">Найденных в АБС лиц за сегодня нет.</div>
+  {% endif %}
+</section>
+
+<section class="panel today-groups">
+  <div class="panel-heading">
+    <div>
+      <p class="eyebrow">ГОТОВЫЕ ФАЙЛЫ</p>
+      <h2>Созданные сегодня общие ответы</h2>
+    </div>
+  </div>
+  {% if overview.generated_groups %}
+    <div class="generated-response-list">
+    {% for group in overview.generated_groups %}
+      <article id="group-{{ group.id }}">
+        <div>
+          <strong>{{ group.recipient_display_name }}</strong>
+          <span>УГНС {{ group.district_place }}</span>
+          <small>{{ group.taxpayer_count }} {{ taxpayer_word(group.taxpayer_count) }}</small>
+        </div>
+        <a class="button button-secondary"
+           href="/response-groups/{{ group.id }}">Скачать Word</a>
+      </article>
+    {% endfor %}
+    </div>
+  {% else %}
+    <div class="empty-state">Общие ответы за сегодня ещё не создавались.</div>
+  {% endif %}
+</section>
+
+<dialog id="today-abs-dialog" class="modal">
+  <form method="post" action="/today/abs" autocomplete="off">
+    <div class="modal-heading">
+      <div>
+        <p class="eyebrow">ТЕСТОВАЯ АБС</p>
+        <h2>Проверить пакет за сегодня</h2>
+      </div>
+      <button type="button" class="modal-close" data-close-dialog>×</button>
+    </div>
+    <p class="warning-note">
+      Учётные данные живут только во время этого запроса. Сейчас используется
+      тестовая база АБС.
+    </p>
+    <label class="field">
+      <span>Логин АБС</span>
+      <input name="username" autocomplete="off" required>
+    </label>
+    <label class="field">
+      <span>Пароль АБС</span>
+      <input name="password" type="password"
+             autocomplete="new-password" required>
+    </label>
+    <button class="button button-primary button-block" type="submit">
+      Проверить все готовые обращения
+    </button>
+  </form>
+</dialog>
+{% endblock %}
