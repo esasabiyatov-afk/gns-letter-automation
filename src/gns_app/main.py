@@ -36,6 +36,7 @@ workflow = WorkflowService(db, settings)
 async def lifespan(_: FastAPI):
     settings.ensure_directories()
     db.initialize()
+    workflow.initialize_employee_profiles()
     yield
 
 
@@ -129,12 +130,15 @@ EVENT_LABELS = {
     "page_manually_confirmed": "Страница подтверждена сотрудником",
     "fake_abs_checked": "Выполнена тестовая проверка АБС",
     "response_created": "Создан ответ Word",
+    "employee_profile_added": "Добавлен исполнитель",
+    "active_employee_selected": "Выбран активный исполнитель",
 }
 
 ENTITY_LABELS = {
     "upload": "PDF",
     "page": "Страница",
     "case": "Обращение",
+    "settings": "Настройка",
 }
 
 
@@ -147,6 +151,7 @@ def taxpayer_word(count: int) -> str:
 
 
 def context(request: Request, **values):
+    active_employee = workflow.get_active_employee()
     return {
         "request": request,
         "status_labels": STATUS_LABELS,
@@ -159,6 +164,8 @@ def context(request: Request, **values):
         "entity_labels": ENTITY_LABELS,
         "taxpayer_word": taxpayer_word,
         "threshold": settings.period_threshold.isoformat(),
+        "active_employee": active_employee,
+        "employee_profiles": workflow.list_employee_profiles(),
         **values,
     }
 
@@ -177,12 +184,46 @@ def index(request: Request):
     )
 
 
+@app.post("/employees/add")
+def add_employee(employee_name: str = Form(...)):
+    try:
+        selected = workflow.add_employee(employee_name)
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            f"/?error={quote(str(exc))}#employee-entry",
+            status_code=303,
+        )
+    return RedirectResponse(
+        f"/?message={quote(f'Исполнитель выбран: {selected}')}#employee-entry",
+        status_code=303,
+    )
+
+
+@app.post("/employees/select")
+def select_employee(employee_key: str = Form(...)):
+    try:
+        selected = workflow.select_employee(employee_key)
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            f"/?error={quote(str(exc))}#employee-entry",
+            status_code=303,
+        )
+    return RedirectResponse(
+        f"/?message={quote(f'Исполнитель выбран: {selected}')}#employee-entry",
+        status_code=303,
+    )
+
+
 @app.post("/uploads")
 def create_upload(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
 ):
     try:
+        if not workflow.get_active_employee():
+            raise WorkflowValidationError(
+                "Сначала выберите или добавьте исполнителя"
+            )
         upload_id = workflow.create_upload(file.filename or "document.pdf", file.file)
     except (StorageError, WorkflowValidationError, ValueError) as exc:
         return RedirectResponse(

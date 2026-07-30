@@ -41,6 +41,8 @@ class WorkflowValidationError(ValueError):
 
 
 class WorkflowService:
+    ACTIVE_EMPLOYEE_SETTING = "active_employee_key"
+
     def __init__(self, db: Database, settings: Settings):
         self.db = db
         self.settings = settings
@@ -63,6 +65,164 @@ class WorkflowService:
         )
         self.abs = FakeAbsGateway()
         self.word = WordTemplateService(settings.source_templates_dir)
+
+    def initialize_employee_profiles(self) -> None:
+        configured = self.settings.employee_name.strip()
+        if not configured:
+            return
+        name = self._normalize_employee_name(configured)
+        name_key = name.casefold()
+        now = utc_now()
+        self.db.execute(
+            """
+            INSERT INTO employee_profiles(
+                name, name_key, created_at, updated_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(name_key) DO NOTHING
+            """,
+            (name, name_key, now, now),
+        )
+        if not self._active_employee_from_database():
+            self._store_active_employee(name_key)
+            self._apply_employee_to_open_cases(name)
+
+    def list_employee_profiles(self) -> list[dict[str, Any]]:
+        return self.db.fetch_all(
+            """
+            SELECT id, name, name_key, created_at, updated_at
+            FROM employee_profiles
+            ORDER BY name COLLATE NOCASE
+            """
+        )
+
+    def get_active_employee(self) -> str | None:
+        active = self._active_employee_from_database()
+        if active:
+            return active
+        configured = self.settings.employee_name.strip()
+        return configured or None
+
+    def add_employee(self, employee_name: str) -> str:
+        name = self._normalize_employee_name(employee_name)
+        name_key = name.casefold()
+        existing = self.db.fetch_one(
+            "SELECT name FROM employee_profiles WHERE name_key = ?",
+            (name_key,),
+        )
+        added = existing is None
+        if added:
+            now = utc_now()
+            self.db.execute(
+                """
+                INSERT INTO employee_profiles(
+                    name, name_key, created_at, updated_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (name, name_key, now, now),
+            )
+        else:
+            name = existing["name"]
+
+        self._store_active_employee(name_key)
+        self._apply_employee_to_open_cases(name)
+        if added:
+            self.db.audit(
+                "settings",
+                "employee_profiles",
+                "employee_profile_added",
+                {"employee_name": name},
+            )
+        self.db.audit(
+            "settings",
+            "active_employee",
+            "active_employee_selected",
+            {"employee_name": name},
+        )
+        return name
+
+    def select_employee(self, employee_key: str) -> str:
+        row = self.db.fetch_one(
+            """
+            SELECT name, name_key
+            FROM employee_profiles
+            WHERE name_key = ?
+            """,
+            (employee_key.strip().casefold(),),
+        )
+        if not row:
+            raise WorkflowValidationError(
+                "Выбранный исполнитель не найден в локальном справочнике"
+            )
+        self._store_active_employee(row["name_key"])
+        self._apply_employee_to_open_cases(row["name"])
+        self.db.audit(
+            "settings",
+            "active_employee",
+            "active_employee_selected",
+            {"employee_name": row["name"]},
+        )
+        return row["name"]
+
+    def _active_employee_from_database(self) -> str | None:
+        row = self.db.fetch_one(
+            """
+            SELECT employee_profiles.name
+            FROM settings
+            JOIN employee_profiles
+              ON employee_profiles.name_key = settings.value
+            WHERE settings.key = ?
+            """,
+            (self.ACTIVE_EMPLOYEE_SETTING,),
+        )
+        return row["name"] if row else None
+
+    def _store_active_employee(self, name_key: str) -> None:
+        self.db.execute(
+            """
+            INSERT INTO settings(key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE
+            SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (self.ACTIVE_EMPLOYEE_SETTING, name_key, utc_now()),
+        )
+
+    def _apply_employee_to_open_cases(self, employee_name: str) -> None:
+        self.db.execute(
+            """
+            UPDATE cases
+            SET employee_name = ?, updated_at = ?
+            WHERE response_path IS NULL
+              AND status NOT IN (?, ?)
+            """,
+            (
+                employee_name,
+                utc_now(),
+                CaseStatus.RESPONSE_CREATED,
+                CaseStatus.COMPLETED,
+            ),
+        )
+
+    @staticmethod
+    def _normalize_employee_name(employee_name: str) -> str:
+        name = " ".join(employee_name.split())
+        if len(name) < 2:
+            raise WorkflowValidationError(
+                "Введите имя или ФИО исполнителя"
+            )
+        if len(name) > 120:
+            raise WorkflowValidationError(
+                "Имя исполнителя не должно быть длиннее 120 символов"
+            )
+        if not any(character.isalpha() for character in name):
+            raise WorkflowValidationError(
+                "Имя исполнителя должно содержать буквы"
+            )
+        if any(ord(character) < 32 for character in name):
+            raise WorkflowValidationError(
+                "Имя исполнителя содержит недопустимые символы"
+            )
+        return name
 
     def create_upload(
         self,
@@ -529,7 +689,7 @@ class WorkflowService:
                 CaseStatus.COLLECTING,
                 ValueSource.QR_LINK,
                 payload_hash,
-                self.settings.employee_name or None,
+                self.get_active_employee(),
                 now,
                 now,
             ),
@@ -551,7 +711,7 @@ class WorkflowService:
                 upload_id,
                 CaseStatus.NEEDS_REVIEW,
                 ValueSource.OCR_SCAN,
-                self.settings.employee_name or None,
+                self.get_active_employee(),
                 now,
                 now,
             ),
@@ -641,7 +801,7 @@ class WorkflowService:
             and fields.period_end
             and fields.taxpayers
         )
-        employee = self.settings.employee_name or None
+        employee = self.get_active_employee()
         self.db.execute(
             """
             UPDATE cases
@@ -759,6 +919,9 @@ class WorkflowService:
 
         case_id = page.get("case_id")
         if selected_type == PageType.LETTER:
+            employee_name = (
+                employee_name.strip() or self.get_active_employee() or ""
+            )
             clean_taxpayers = self._validate_manual_fields(
                 district_place,
                 recipient_position,
@@ -798,7 +961,7 @@ class WorkflowService:
                     display_name,
                     period_start,
                     period_end,
-                    employee_name.strip(),
+                    employee_name,
                     ValueSource.MANUAL,
                     CaseStatus.READY_FOR_ABS,
                     utc_now(),

@@ -22,11 +22,18 @@
       <a href="/cases">Обращения</a>
       <a href="/journal">Журнал</a>
     </nav>
+    <a class="active-employee-chip" href="/#employee-entry">
+      <small>Исполнитель</small>
+      <strong>{{ active_employee or 'не выбран' }}</strong>
+    </a>
   </header>
 
   <main class="page-shell">
     {% if request.query_params.get('error') %}
       <div class="alert alert-error">{{ request.query_params.get('error') }}</div>
+    {% endif %}
+    {% if request.query_params.get('message') %}
+      <div class="alert alert-success">{{ request.query_params.get('message') }}</div>
     {% endif %}
     {% block content %}{% endblock %}
   </main>
@@ -39,4 +46,3 @@
   {% block scripts %}{% endblock %}
 </body>
 </html>
-

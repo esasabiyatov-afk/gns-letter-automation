@@ -1,6 +1,55 @@
 {% extends "base.html" %}
 {% block title %}Главная · Обработка писем ГНС{% endblock %}
 {% block content %}
+<section id="employee-entry"
+         class="employee-entry {% if not active_employee %}employee-entry-required{% endif %}">
+  <div class="employee-entry-heading">
+    <div>
+      <p class="eyebrow">ИСПОЛНИТЕЛЬ ТЕКУЩЕЙ СМЕНЫ</p>
+      {% if active_employee %}
+        <h2>{{ active_employee }}</h2>
+        <p>Имя будет автоматически подставлено в новые ответы.</p>
+      {% else %}
+        <h2>Перед началом выберите исполнителя</h2>
+        <p>Без исполнителя загрузка новых PDF временно заблокирована.</p>
+      {% endif %}
+    </div>
+    {% if active_employee %}
+      <span class="employee-ready-mark">Выбран</span>
+    {% endif %}
+  </div>
+
+  <div class="employee-entry-actions">
+    {% if employee_profiles %}
+      <form action="/employees/select" method="post" class="employee-select-form">
+        <label class="field">
+          <span>Выбрать из справочника</span>
+          <select name="employee_key" required>
+            {% for employee in employee_profiles %}
+              <option value="{{ employee.name_key }}"
+                      {% if employee.name == active_employee %}selected{% endif %}>
+                {{ employee.name }}
+              </option>
+            {% endfor %}
+          </select>
+        </label>
+        <button class="button button-secondary" type="submit">Выбрать</button>
+      </form>
+    {% endif %}
+
+    <form action="/employees/add" method="post" class="employee-add-form">
+      <label class="field">
+        <span>Добавить нового исполнителя</span>
+        <input name="employee_name" maxlength="120"
+               placeholder="Например: Гапарова Э." required>
+      </label>
+      <button class="button button-primary" type="submit">
+        Добавить и выбрать
+      </button>
+    </form>
+  </div>
+</section>
+
 <section class="hero">
   <div>
     <p class="eyebrow">БЕЗОПАСНЫЙ КОНВЕЙЕР</p>
@@ -17,11 +66,16 @@
       <strong>Выберите отсканированный PDF</strong>
       <span>Один файл может содержать много писем</span>
       <input id="pdf-file" name="file" type="file"
-             accept="application/pdf,.pdf" required>
+             accept="application/pdf,.pdf" required
+             {% if not active_employee %}disabled{% endif %}>
     </label>
-    <button class="button button-primary" type="submit">
+    <button class="button button-primary" type="submit"
+            {% if not active_employee %}disabled{% endif %}>
       Загрузить и обработать
     </button>
+    {% if not active_employee %}
+      <p class="form-note">Сначала выберите исполнителя выше.</p>
+    {% endif %}
   </form>
 </section>
 
@@ -79,4 +133,3 @@
   </aside>
 </div>
 {% endblock %}
-

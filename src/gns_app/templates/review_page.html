@@ -108,11 +108,13 @@
         {% endfor %}
         </div>
 
-        <label class="field">
+        <div class="profile-field">
           <span>Исполнитель банка</span>
-          <input name="employee_name" value="{{ case.get('employee_name') or '' }}"
-                 placeholder="Гапарова Э.">
-        </label>
+          <strong>{{ case.get('employee_name') or active_employee or 'Не выбран' }}</strong>
+          <small>Выбирается на главной странице приложения.</small>
+          <input type="hidden" name="employee_name"
+                 value="{{ case.get('employee_name') or active_employee or '' }}">
+        </div>
 
         <div class="kyrgyz-keyboard" aria-label="Кыргызские буквы">
           <span>Кыргызские буквы:</span>
