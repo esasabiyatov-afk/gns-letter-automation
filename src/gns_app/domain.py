@@ -44,6 +44,7 @@ class QrStatus(StrEnum):
 
 class OcrStatus(StrEnum):
     NOT_STARTED = "not_started"
+    SKIPPED_OFFICIAL = "skipped_official"
     EMBEDDED_TEXT = "embedded_text"
     REQUIRES_ENGINE = "requires_engine"
     COMPLETED = "completed"

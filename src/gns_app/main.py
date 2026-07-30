@@ -80,6 +80,24 @@ PAGE_TYPE_LABELS = {
     "unknown": "Не определено",
 }
 
+QR_STATUS_LABELS = {
+    "not_started": "ещё не проверен",
+    "found": "найден",
+    "invalid_url": "посторонний адрес",
+    "not_found": "не прочитан",
+    "decode_error": "неоднозначный результат",
+}
+
+OCR_STATUS_LABELS = {
+    "not_started": "ещё не запускался",
+    "skipped_official": "не нужен: использован QR",
+    "embedded_text": "текстовый слой PDF",
+    "requires_engine": "модель не установлена",
+    "completed": "распознан локально",
+    "low_confidence": "низкая уверенность",
+    "error": "ошибка OCR",
+}
+
 SOURCE_LABELS = {
     "qr_link": "QR найден, официальная версия ещё не получена",
     "qr_official": "Официальная версия по QR",
@@ -102,6 +120,8 @@ ABS_STATUS_LABELS = {
 
 EVENT_LABELS = {
     "upload_registered": "PDF зарегистрирован",
+    "upload_reprocess_requested": "Запрошена повторная обработка",
+    "orphan_cases_removed": "Удалены устаревшие черновики обращений",
     "page_processed": "Страница обработана",
     "page_processing_error": "Ошибка обработки страницы",
     "scan_case_created": "Создано обращение по скану",
@@ -131,6 +151,8 @@ def context(request: Request, **values):
         "request": request,
         "status_labels": STATUS_LABELS,
         "page_type_labels": PAGE_TYPE_LABELS,
+        "qr_status_labels": QR_STATUS_LABELS,
+        "ocr_status_labels": OCR_STATUS_LABELS,
         "source_labels": SOURCE_LABELS,
         "abs_status_labels": ABS_STATUS_LABELS,
         "event_labels": EVENT_LABELS,
@@ -174,7 +196,12 @@ def create_upload(
 
 
 @app.get("/uploads/{upload_id}", response_class=HTMLResponse)
-def upload_detail(request: Request, upload_id: str):
+def upload_detail(
+    request: Request,
+    upload_id: str,
+    message: str = "",
+    error: str = "",
+):
     upload = workflow.get_upload(upload_id)
     if not upload:
         raise HTTPException(404, "PDF не найден")
@@ -182,7 +209,39 @@ def upload_detail(request: Request, upload_id: str):
     return templates.TemplateResponse(
         request,
         "upload_detail.html",
-        context(request, upload=upload, pages=pages),
+        context(
+            request,
+            upload=upload,
+            pages=pages,
+            message=message,
+            error=error,
+        ),
+    )
+
+
+@app.post("/uploads/{upload_id}/reprocess")
+def reprocess_upload(
+    background_tasks: BackgroundTasks,
+    upload_id: str,
+):
+    try:
+        count = workflow.request_problem_reprocess(upload_id)
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            f"/uploads/{upload_id}?error={quote(str(exc))}",
+            status_code=303,
+        )
+    background_tasks.add_task(
+        workflow.process_upload,
+        upload_id,
+        True,
+    )
+    return RedirectResponse(
+        (
+            f"/uploads/{upload_id}?message="
+            f"{quote(f'Повторно обрабатывается страниц: {count}')}"
+        ),
+        status_code=303,
     )
 
 

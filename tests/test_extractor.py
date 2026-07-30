@@ -1,0 +1,26 @@
+from gns_app.services.extractor import FieldExtractor
+
+
+def test_official_district_does_not_span_two_document_pages():
+    text = """
+    Управление Государственной налоговой службы по Кара-Суйскому району
+    Ошской области
+    РЕШЕНИЕ
+    Длинный текст решения без вводной фразы.
+
+    Управление Государственной налоговой службы по Кара-Суйскому району
+    Ошской области в соответствии со статьёй 146 запрашивает информацию.
+    Наименование: Общество с ограниченной ответственностью "Хе Син"
+    ИНН: 02312201410117
+    Период: с 01.01.2022 по 30.06.2026
+    Зам. начальника управления Торобек уулу Сталбек
+    """
+
+    fields = FieldExtractor().extract_official_letter(text)
+
+    assert fields.district_place == (
+        "по Кара-Суйскому району Ошской области"
+    )
+    assert fields.recipient_full_name == "Торобек уулу Сталбек"
+    assert fields.taxpayers[0].inn == "02312201410117"
+    assert fields.confidence == 0.96

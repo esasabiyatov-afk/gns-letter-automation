@@ -22,12 +22,23 @@ class Settings:
     allowed_qr_paths: frozenset[str]
     auto_download_official: bool
     employee_name: str
+    ocr_fast_data_dir: Path | None = None
+    ocr_best_data_dir: Path | None = None
 
     @classmethod
     def load(cls) -> "Settings":
         project_root = Path(__file__).resolve().parents[2]
         runtime_dir = Path(
             os.environ.get("GNS_RUNTIME_DIR", project_root / "runtime")
+        ).resolve()
+        local_app_data = Path(
+            os.environ.get("LOCALAPPDATA", runtime_dir)
+        ).resolve()
+        ocr_model_root = Path(
+            os.environ.get(
+                "GNS_OCR_MODEL_DIR",
+                local_app_data / "GNSLetterAutomation" / "models",
+            )
         ).resolve()
         threshold_text = os.environ.get("GNS_PERIOD_THRESHOLD", "2019-01-01")
 
@@ -47,10 +58,12 @@ class Settings:
             allowed_qr_hosts=frozenset({"qr.salyk.kg"}),
             allowed_qr_paths=frozenset({"/getsti010decission"}),
             auto_download_official=(
-                os.environ.get("GNS_AUTO_DOWNLOAD_OFFICIAL", "false").lower()
+                os.environ.get("GNS_AUTO_DOWNLOAD_OFFICIAL", "true").lower()
                 == "true"
             ),
             employee_name=os.environ.get("GNS_EMPLOYEE_NAME", "").strip(),
+            ocr_fast_data_dir=ocr_model_root / "tessdata_fast",
+            ocr_best_data_dir=ocr_model_root / "tessdata_best",
         )
 
     def ensure_directories(self) -> None:

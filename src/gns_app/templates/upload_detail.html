@@ -18,11 +18,20 @@
   </span>
 </div>
 
+{% if message %}<div class="alert alert-success">{{ message }}</div>{% endif %}
+{% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
+
 {% if upload.status in ['registered', 'processing'] %}
 <div class="progress-note">
   <span class="spinner"></span>
   Обработка идёт в фоне. Страница обновляется автоматически.
 </div>
+{% else %}
+<form method="post" action="/uploads/{{ upload.id }}/reprocess" class="reprocess-form">
+  <button class="button button-secondary" type="submit">
+    Повторно обработать проблемные страницы
+  </button>
+</form>
 {% endif %}
 
 <section class="page-grid">
@@ -44,7 +53,8 @@
         </span>
       </div>
       <dl>
-        <div><dt>QR</dt><dd>{{ page.qr_status }}</dd></div>
+        <div><dt>QR</dt><dd>{{ qr_status_labels.get(page.qr_status, page.qr_status) }}</dd></div>
+        <div><dt>OCR</dt><dd>{{ ocr_status_labels.get(page.ocr_status, page.ocr_status) }}</dd></div>
         <div><dt>Качество</dt><dd>{% if page.quality_score is not none %}{{ (page.quality_score * 100)|round|int }}%{% else %}—{% endif %}</dd></div>
       </dl>
       {% if page.issue_message %}
@@ -64,4 +74,3 @@
 {% endfor %}
 </section>
 {% endblock %}
-

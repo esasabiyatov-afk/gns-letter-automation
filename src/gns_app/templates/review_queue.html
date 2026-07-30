@@ -27,7 +27,7 @@
       <p>{{ page.issue_message or 'Нужна ручная проверка.' }}</p>
       <div class="tag-row">
         <span class="tag">{{ page_type_labels.get(page.page_type, page.page_type) }}</span>
-        <span class="tag">QR: {{ page.qr_status }}</span>
+        <span class="tag">QR: {{ qr_status_labels.get(page.qr_status, page.qr_status) }}</span>
         <span class="tag">OCR: {{ (page.ocr_confidence * 100)|round|int }}%</span>
       </div>
     </div>
@@ -42,4 +42,3 @@
 </div>
 {% endif %}
 {% endblock %}
-

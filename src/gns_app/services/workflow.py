@@ -49,7 +49,11 @@ class WorkflowService:
             settings.allowed_qr_hosts,
             settings.allowed_qr_paths,
         )
-        self.ocr = OcrService(self.pdf)
+        self.ocr = OcrService(
+            self.pdf,
+            settings.ocr_fast_data_dir,
+            settings.ocr_best_data_dir,
+        )
         self.classifier = PageClassifier()
         self.extractor = FieldExtractor()
         self.names = NameService()
@@ -135,7 +139,9 @@ class WorkflowService:
         )
         return upload_id
 
-    def process_upload(self, upload_id: str) -> None:
+    def process_upload(
+        self, upload_id: str, only_registered_pages: bool = False
+    ) -> None:
         upload = self.get_upload(upload_id)
         if not upload:
             return
@@ -143,10 +149,20 @@ class WorkflowService:
             "UPDATE uploads SET status = ? WHERE id = ?",
             (UploadStatus.PROCESSING, upload_id),
         )
-        pages = self.db.fetch_all(
-            "SELECT * FROM pages WHERE upload_id = ? ORDER BY page_number",
-            (upload_id,),
-        )
+        if only_registered_pages:
+            pages = self.db.fetch_all(
+                """
+                SELECT * FROM pages
+                WHERE upload_id = ? AND status = ? AND manual_confirmed = 0
+                ORDER BY page_number
+                """,
+                (upload_id, PageStatus.REGISTERED),
+            )
+        else:
+            pages = self.db.fetch_all(
+                "SELECT * FROM pages WHERE upload_id = ? ORDER BY page_number",
+                (upload_id,),
+            )
         for page in pages:
             try:
                 self._process_page(upload, page)
@@ -172,7 +188,126 @@ class WorkflowService:
                     "page_processing_error",
                     {"message": str(exc)[:800]},
                 )
+        self._complete_qr_companions(upload_id)
+        self._remove_orphan_cases(upload_id)
         self._refresh_upload_status(upload_id)
+
+    def _complete_qr_companions(self, upload_id: str) -> None:
+        self.db.execute(
+            """
+            UPDATE pages
+            SET status = ?, issue_code = ?, issue_message = ?, updated_at = ?
+            WHERE upload_id = ? AND page_type = ? AND qr_status = ?
+              AND qr_payload_hash IS NOT NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM pages AS letter
+                  WHERE letter.upload_id = pages.upload_id
+                    AND letter.qr_payload_hash = pages.qr_payload_hash
+                    AND letter.page_type = ?
+              )
+            """,
+            (
+                PageStatus.COMPLETED,
+                "qr_group_accounted",
+                (
+                    "Страница учтена по тому же проверенному QR, "
+                    "что и распознанное письмо."
+                ),
+                utc_now(),
+                upload_id,
+                PageType.UNKNOWN,
+                QrStatus.FOUND,
+                PageType.LETTER,
+            ),
+        )
+
+    def _remove_orphan_cases(self, upload_id: str) -> None:
+        row = self.db.fetch_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM cases
+            WHERE upload_id = ? AND official_document_path IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM pages WHERE pages.case_id = cases.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM taxpayers WHERE taxpayers.case_id = cases.id
+              )
+            """,
+            (upload_id,),
+        )
+        count = int(row["count"] if row else 0)
+        if not count:
+            return
+        self.db.execute(
+            """
+            DELETE FROM cases
+            WHERE upload_id = ? AND official_document_path IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM pages WHERE pages.case_id = cases.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM taxpayers WHERE taxpayers.case_id = cases.id
+              )
+            """,
+            (upload_id,),
+        )
+        self.db.audit(
+            "upload",
+            upload_id,
+            "orphan_cases_removed",
+            {"case_count": count},
+        )
+
+    def request_problem_reprocess(self, upload_id: str) -> int:
+        if not self.get_upload(upload_id):
+            raise WorkflowValidationError("PDF не найден")
+        row = self.db.fetch_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM pages
+            WHERE upload_id = ? AND manual_confirmed = 0
+              AND status IN (?, ?)
+            """,
+            (
+                upload_id,
+                PageStatus.NEEDS_REVIEW,
+                PageStatus.TECHNICAL_ERROR,
+            ),
+        )
+        count = int(row["count"] if row else 0)
+        if count == 0:
+            raise WorkflowValidationError(
+                "Нет неподтверждённых проблемных страниц для повторной обработки"
+            )
+        self.db.execute(
+            """
+            UPDATE pages
+            SET status = ?, issue_code = NULL, issue_message = NULL,
+                updated_at = ?
+            WHERE upload_id = ? AND manual_confirmed = 0
+              AND status IN (?, ?)
+            """,
+            (
+                PageStatus.REGISTERED,
+                utc_now(),
+                upload_id,
+                PageStatus.NEEDS_REVIEW,
+                PageStatus.TECHNICAL_ERROR,
+            ),
+        )
+        self.db.execute(
+            "UPDATE uploads SET status = ?, completed_at = NULL WHERE id = ?",
+            (UploadStatus.PROCESSING, upload_id),
+        )
+        self.db.audit(
+            "upload",
+            upload_id,
+            "upload_reprocess_requested",
+            {"page_count": count},
+        )
+        return count
 
     def _process_page(
         self, upload: dict[str, Any], page: dict[str, Any]
@@ -198,6 +333,7 @@ class WorkflowService:
         ocr_result = self.ocr.recognize(
             Path(upload["stored_path"]),
             page_number,
+            rendered.preview_path,
         )
         classification = self.classifier.classify(
             ocr_result.text,
@@ -208,12 +344,12 @@ class WorkflowService:
         official_complete = False
         official_issue: str | None = None
         if qr_result.status == QrStatus.FOUND:
-            case_id, created = self._ensure_qr_case(
+            case_id, needs_official = self._ensure_qr_case(
                 upload["id"], qr_result.payload_hash or ""
             )
             if (
                 self.settings.auto_download_official
-                and created
+                and needs_official
                 and qr_result.payload
             ):
                 try:
@@ -224,8 +360,26 @@ class WorkflowService:
                     official_complete = self._apply_official_document(
                         case_id, official_path
                     )
+                    if not official_complete:
+                        official_issue = (
+                            "Официальная версия получена по QR. "
+                            "Подтвердите обязательные поля и исполнителя."
+                        )
                 except (OfficialDocumentError, OSError, ValueError) as exc:
                     official_issue = str(exc)
+            elif self.settings.auto_download_official and not needs_official:
+                existing_case = self.get_case(case_id)
+                if existing_case and existing_case.get(
+                    "official_document_path"
+                ):
+                    official_complete = bool(
+                        existing_case.get("fields_confirmed")
+                    )
+                    if not official_complete:
+                        official_issue = (
+                            "Официальная версия уже получена по QR. "
+                            "Подтвердите обязательные поля и исполнителя."
+                        )
 
         extracted = None
         if classification.page_type == PageType.LETTER:
@@ -300,12 +454,6 @@ class WorkflowService:
     ) -> tuple[PageStatus, str | None, str | None]:
         if official_complete:
             return PageStatus.COMPLETED, None, None
-        if official_issue:
-            return (
-                PageStatus.NEEDS_REVIEW,
-                "official_download_error",
-                official_issue,
-            )
         if (
             page_type == PageType.DECISION
             and type_confidence >= 0.65
@@ -315,6 +463,12 @@ class WorkflowService:
                 PageStatus.COMPLETED,
                 "optional_decision",
                 "Решение учтено как необязательное приложение.",
+            )
+        if official_issue:
+            return (
+                PageStatus.NEEDS_REVIEW,
+                "official_confirmation_required",
+                official_issue,
             )
         if page_type == PageType.UNKNOWN:
             return (
@@ -326,10 +480,7 @@ class WorkflowService:
             return (
                 PageStatus.NEEDS_REVIEW,
                 "official_pending",
-                (
-                    "QR прочитан. Автоматическое получение официальной версии "
-                    "отключено в режиме разработки."
-                ),
+                "QR прочитан, но обязательные данные ещё не подтверждены.",
             )
         if page_type == PageType.LETTER:
             return (
@@ -354,7 +505,9 @@ class WorkflowService:
             (upload_id, payload_hash),
         )
         if existing:
-            return existing["id"], False
+            return existing["id"], not bool(
+                existing.get("official_document_path")
+            )
 
         case_id = uuid4().hex
         now = utc_now()

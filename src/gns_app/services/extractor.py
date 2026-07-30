@@ -19,7 +19,7 @@ class FieldExtractor:
     INN_RE = re.compile(r"инн\s*[:;]\s*(?P<inn>[\d\s]{14,28})", re.IGNORECASE)
     DISTRICT_RE = re.compile(
         r"управление\s+государственной\s+налоговой\s+службы\s+"
-        r"(?P<district>по\s+.+?)\s+"
+        r"(?P<district>по\s+.{5,180}?)\s+"
         r"(?:в\s+соответствии|на\s+основании)",
         re.IGNORECASE | re.DOTALL,
     )

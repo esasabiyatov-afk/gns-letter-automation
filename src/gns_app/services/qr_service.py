@@ -21,6 +21,7 @@ class QrService:
 
     def decode(self, image_path: Path) -> QrDecodeResult:
         image = Image.open(image_path).convert("L")
+        deferred_result: QrDecodeResult | None = None
 
         attempts: list[tuple[str, Image.Image, zxingcpp.Binarizer]] = [
             ("original", image, zxingcpp.Binarizer.LocalAverage),
@@ -34,7 +35,10 @@ class QrService:
         for method, candidate, binarizer in attempts:
             result = self._try_decode(candidate, method, binarizer)
             if result:
-                return self._validate(result[0], result[1])
+                validated = self._validate(result[0], result[1])
+                if validated.status == QrStatus.FOUND:
+                    return validated
+                deferred_result = deferred_result or validated
 
         width, height = image.size
         crop = image.crop(
@@ -69,7 +73,10 @@ class QrService:
                     method = f"{name}-x{scale}-{binarizer.name}"
                     result = self._try_decode(scaled, method, binarizer)
                     if result:
-                        return self._validate(result[0], result[1])
+                        validated = self._validate(result[0], result[1])
+                        if validated.status == QrStatus.FOUND:
+                            return validated
+                        deferred_result = deferred_result or validated
 
             for threshold in (110, 140, 170, 200, 220):
                 binary = variant.point(
@@ -84,7 +91,10 @@ class QrService:
                     zxingcpp.Binarizer.BoolCast,
                 )
                 if result:
-                    return self._validate(result[0], result[1])
+                    validated = self._validate(result[0], result[1])
+                    if validated.status == QrStatus.FOUND:
+                        return validated
+                    deferred_result = deferred_result or validated
 
             for angle in (-3, -2, -1, 1, 2, 3):
                 rotated = variant.rotate(
@@ -99,9 +109,59 @@ class QrService:
                     zxingcpp.Binarizer.GlobalHistogram,
                 )
                 if result:
-                    return self._validate(result[0], result[1])
+                    validated = self._validate(result[0], result[1])
+                    if validated.status == QrStatus.FOUND:
+                        return validated
+                    deferred_result = deferred_result or validated
 
-        return QrDecodeResult(
+        recovery_profiles = (
+            (
+                "bottom-right",
+                (0.62, 0.62, 0.99, 0.96),
+                (
+                    (5.95, zxingcpp.Binarizer.LocalAverage),
+                    (5.00, zxingcpp.Binarizer.FixedThreshold),
+                    (3.95, zxingcpp.Binarizer.FixedThreshold),
+                ),
+            ),
+            (
+                "middle-right",
+                (0.76, 0.58, 0.98, 0.84),
+                (
+                    (3.05, zxingcpp.Binarizer.FixedThreshold),
+                    (6.05, zxingcpp.Binarizer.GlobalHistogram),
+                ),
+            ),
+        )
+        for profile_name, bounds, variants in recovery_profiles:
+            x1, y1, x2, y2 = bounds
+            focused = image.crop(
+                (
+                    int(width * x1),
+                    int(height * y1),
+                    int(width * x2),
+                    int(height * y2),
+                )
+            )
+            for factor, binarizer in variants:
+                scaled = focused.resize(
+                    (
+                        int(focused.width * factor),
+                        int(focused.height * factor),
+                    ),
+                    Image.Resampling.LANCZOS,
+                )
+                method = (
+                    f"recovery-{profile_name}-x{factor:g}-{binarizer.name}"
+                )
+                result = self._try_decode(scaled, method, binarizer)
+                if result:
+                    validated = self._validate(result[0], result[1])
+                    if validated.status == QrStatus.FOUND:
+                        return validated
+                    deferred_result = deferred_result or validated
+
+        return deferred_result or QrDecodeResult(
             status=QrStatus.NOT_FOUND,
             issue="QR не найден или повреждён. Требуется OCR/ручная проверка.",
         )
@@ -119,9 +179,13 @@ class QrService:
             try_downscale=True,
             try_invert=True,
             binarizer=binarizer,
-            return_errors=False,
+            return_errors=True,
         )
-        payloads = {item.text for item in results if item.text}
+        payloads = {
+            item.text.strip()
+            for item in results
+            if item.text and item.valid and item.error is None
+        }
         if len(payloads) == 1:
             return payloads.pop(), method
         if len(payloads) > 1:
@@ -159,4 +223,3 @@ class QrService:
             safe_url=safe_url,
             method=method,
         )
-
