@@ -38,6 +38,7 @@ async def lifespan(_: FastAPI):
     settings.ensure_directories()
     db.initialize()
     workflow.initialize_employee_profiles()
+    workflow.reconcile_official_qr_pages()
     workflow.repair_cleaned_responses()
     yield
 
@@ -125,6 +126,11 @@ EVENT_LABELS = {
     "upload_registered": "PDF зарегистрирован",
     "upload_reprocess_requested": "Запрошена повторная обработка",
     "page_reprocess_requested": "Запрошена повторная обработка страницы",
+    "official_qr_auto_completed": "Страница подтверждена официальным QR",
+    "official_qr_manual_confirmation_removed": (
+        "Лишнее ручное подтверждение страницы отменено"
+    ),
+    "official_qr_source_restored": "Восстановлен официальный источник QR",
     "orphan_cases_removed": "Удалены устаревшие черновики обращений",
     "page_processed": "Страница обработана",
     "page_processing_error": "Ошибка обработки страницы",
@@ -483,6 +489,16 @@ def review_page(request: Request, page_id: str, error: str = ""):
     page = workflow.get_page(page_id)
     if not page:
         raise HTTPException(404, "Страница не найдена")
+    if page["status"] not in {"needs_review", "technical_error"}:
+        if page.get("case_id"):
+            return RedirectResponse(
+                f"/cases/{page['case_id']}",
+                status_code=303,
+            )
+        return RedirectResponse(
+            f"/uploads/{page['upload_id']}",
+            status_code=303,
+        )
     case = workflow.get_case(page["case_id"]) if page.get("case_id") else None
     taxpayers = (
         workflow.get_taxpayers(case["id"]) if case else []

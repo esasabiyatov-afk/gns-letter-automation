@@ -1,14 +1,19 @@
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from gns_app.database import Database
 from gns_app.domain import (
     CaseStatus,
     ExtractedFields,
     ExtractedTaxpayer,
+    PageStatus,
+    QrStatus,
     ValueSource,
 )
 from gns_app.services.workflow import WorkflowService
+from gns_app.services.workflow import WorkflowValidationError
 
 
 def test_complete_official_qr_needs_no_manual_confirmation(
@@ -76,3 +81,60 @@ def test_complete_official_qr_needs_no_manual_confirmation(
     assert taxpayers[0]["name"] == "ИП Ишен кызы Саида"
     assert taxpayers[0]["inn"] == "10207200101109"
     assert taxpayers[0]["manually_confirmed"] == 1
+
+
+def test_stale_review_page_is_completed_when_official_qr_is_complete(
+    workflow,
+    project_root: Path,
+):
+    workflow.initialize_employee_profiles()
+    sample = project_root / "УГНС" / "пример письма.pdf"
+    with sample.open("rb") as stream:
+        upload_id = workflow.create_upload(sample.name, stream)
+    page = workflow.get_upload_pages(upload_id)[0]
+    case_id, _ = workflow._ensure_qr_case(upload_id, "complete-official-qr")
+
+    workflow.db.execute(
+        """
+        UPDATE cases
+        SET source_kind = ?, fields_confirmed = 1,
+            official_document_path = ?, status = ?
+        WHERE id = ?
+        """,
+        (
+            ValueSource.QR_OFFICIAL,
+            str(sample),
+            CaseStatus.READY_FOR_ABS,
+            case_id,
+        ),
+    )
+    workflow.db.execute(
+        """
+        UPDATE pages
+        SET case_id = ?, qr_status = ?, status = ?,
+            issue_code = ?, issue_message = ?
+        WHERE id = ?
+        """,
+        (
+            case_id,
+            QrStatus.FOUND,
+            PageStatus.NEEDS_REVIEW,
+            "official_pending",
+            "Устаревшее требование подтверждения",
+            page["id"],
+        ),
+    )
+
+    repaired = workflow.reconcile_official_qr_pages(upload_id)
+    refreshed = workflow.get_page(page["id"])
+
+    assert repaired == 1
+    assert refreshed["status"] == PageStatus.COMPLETED
+    assert refreshed["issue_code"] is None
+    assert refreshed["issue_message"] is None
+
+    with pytest.raises(
+        WorkflowValidationError,
+        match="уже обработана",
+    ):
+        workflow.confirm_page(page["id"], page_type="letter")

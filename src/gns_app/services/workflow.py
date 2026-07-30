@@ -216,6 +216,7 @@ class WorkflowService:
                 CaseStatus.COMPLETED,
             ),
         )
+        self.reconcile_official_qr_pages()
 
     @staticmethod
     def _normalize_employee_name(employee_name: str) -> str:
@@ -362,9 +363,68 @@ class WorkflowService:
                     "page_processing_error",
                     {"message": str(exc)[:800]},
                 )
+        self.reconcile_official_qr_pages(upload_id)
         self._complete_qr_companions(upload_id)
         self._remove_orphan_cases(upload_id)
         self._refresh_upload_status(upload_id)
+
+    def reconcile_official_qr_pages(
+        self, upload_id: str | None = None
+    ) -> int:
+        parameters: list[Any] = [
+            PageStatus.NEEDS_REVIEW,
+            QrStatus.FOUND,
+            ValueSource.QR_OFFICIAL,
+        ]
+        upload_filter = ""
+        if upload_id:
+            upload_filter = "AND pages.upload_id = ?"
+            parameters.append(upload_id)
+        pages = self.db.fetch_all(
+            f"""
+            SELECT pages.id, pages.upload_id, pages.page_number
+            FROM pages
+            JOIN cases ON cases.id = pages.case_id
+            WHERE pages.status = ?
+              AND pages.manual_confirmed = 0
+              AND pages.qr_status = ?
+              AND cases.source_kind = ?
+              AND cases.fields_confirmed = 1
+              AND cases.official_document_path IS NOT NULL
+              {upload_filter}
+            ORDER BY pages.upload_id, pages.page_number
+            """,
+            parameters,
+        )
+        if not pages:
+            return 0
+
+        now = utc_now()
+        for page in pages:
+            self.db.execute(
+                """
+                UPDATE pages
+                SET status = ?, issue_code = NULL, issue_message = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (PageStatus.COMPLETED, now, page["id"]),
+            )
+            self.db.audit(
+                "page",
+                page["id"],
+                "official_qr_auto_completed",
+                {
+                    "page_number": page["page_number"],
+                    "reason": "official_fields_already_confirmed",
+                },
+            )
+
+        for affected_upload_id in {
+            page["upload_id"] for page in pages
+        }:
+            self._refresh_upload_status(affected_upload_id)
+        return len(pages)
 
     def _complete_qr_companions(self, upload_id: str) -> None:
         self.db.execute(
@@ -618,6 +678,20 @@ class WorkflowService:
                             "Официальная версия уже получена по QR. "
                             "Не удалось надёжно извлечь все обязательные поля."
                         )
+            # Решение и письмо часто имеют один QR. Перед итоговым статусом
+            # повторно читаем карточку из БД: если соседняя страница уже
+            # получила и полностью разобрала официальный документ, никакое
+            # ручное подтверждение этой страницы больше не требуется.
+            refreshed_case = self.get_case(case_id)
+            if (
+                refreshed_case
+                and refreshed_case.get("source_kind")
+                == ValueSource.QR_OFFICIAL
+                and refreshed_case.get("fields_confirmed")
+                and refreshed_case.get("official_document_path")
+            ):
+                official_complete = True
+                official_issue = None
 
         extracted = None
         if classification.page_type == PageType.LETTER:
@@ -1004,6 +1078,13 @@ class WorkflowService:
         page = self.get_page(page_id)
         if not page:
             raise WorkflowValidationError("Страница не найдена")
+        if page["status"] not in {
+            PageStatus.NEEDS_REVIEW,
+            PageStatus.TECHNICAL_ERROR,
+        }:
+            raise WorkflowValidationError(
+                "Страница уже обработана и не требует подтверждения"
+            )
         try:
             selected_type = PageType(page_type)
         except ValueError as exc:
