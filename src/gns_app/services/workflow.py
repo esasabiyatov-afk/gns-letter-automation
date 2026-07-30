@@ -363,7 +363,7 @@ class WorkflowService:
                     if not official_complete:
                         official_issue = (
                             "Официальная версия получена по QR. "
-                            "Подтвердите обязательные поля и исполнителя."
+                            "Не удалось надёжно извлечь все обязательные поля."
                         )
                 except (OfficialDocumentError, OSError, ValueError) as exc:
                     official_issue = str(exc)
@@ -376,9 +376,14 @@ class WorkflowService:
                         existing_case.get("fields_confirmed")
                     )
                     if not official_complete:
+                        official_complete = self._apply_official_document(
+                            case_id,
+                            Path(existing_case["official_document_path"]),
+                        )
+                    if not official_complete:
                         official_issue = (
                             "Официальная версия уже получена по QR. "
-                            "Подтвердите обязательные поля и исполнителя."
+                            "Не удалось надёжно извлечь все обязательные поля."
                         )
 
         extracted = None
@@ -563,6 +568,11 @@ class WorkflowService:
         current = self.get_case(case_id)
         if not current:
             return
+        if (
+            current.get("source_kind") == ValueSource.QR_OFFICIAL
+            and current.get("fields_confirmed")
+        ):
+            return
         self.db.execute(
             """
             UPDATE cases
@@ -632,7 +642,6 @@ class WorkflowService:
             and fields.taxpayers
         )
         employee = self.settings.employee_name or None
-        ready = complete and bool(employee)
         self.db.execute(
             """
             UPDATE cases
@@ -654,8 +663,12 @@ class WorkflowService:
                 fields.period_start,
                 fields.period_end,
                 employee,
-                1 if ready else 0,
-                CaseStatus.READY_FOR_ABS if ready else CaseStatus.NEEDS_REVIEW,
+                1 if complete else 0,
+                (
+                    CaseStatus.READY_FOR_ABS
+                    if complete
+                    else CaseStatus.NEEDS_REVIEW
+                ),
                 utc_now(),
                 case_id,
             ),
@@ -701,7 +714,7 @@ class WorkflowService:
                 "issues": fields.issues,
             },
         )
-        return ready
+        return complete
 
     @staticmethod
     def _official_text(path: Path) -> str:

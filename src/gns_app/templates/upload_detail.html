@@ -26,7 +26,7 @@
   <span class="spinner"></span>
   Обработка идёт в фоне. Страница обновляется автоматически.
 </div>
-{% else %}
+{% elif upload.status == 'needs_review' %}
 <form method="post" action="/uploads/{{ upload.id }}/reprocess" class="reprocess-form">
   <button class="button button-secondary" type="submit">
     Повторно обработать проблемные страницы

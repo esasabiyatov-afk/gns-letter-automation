@@ -39,7 +39,10 @@ class OcrService:
             self.pdf_service.extract_embedded_text(pdf_path, page_number),
         )
         cleaned = "\n".join(line.rstrip() for line in text.splitlines()).strip()
-        if cleaned:
+        embedded_text_rejected = bool(
+            cleaned and not self._embedded_text_is_reliable(cleaned)
+        )
+        if cleaned and not embedded_text_rejected:
             replacement_count = cleaned.count("\ufffd")
             non_space = max(1, len(re.sub(r"\s", "", cleaned)))
             replacement_ratio = replacement_count / non_space
@@ -70,9 +73,20 @@ class OcrService:
                     best = self._recognize_image(
                         image_path, self.best_data_dir, "best"
                     )
-                    if self._quality_key(best) > self._quality_key(fast):
-                        return best
-                return fast
+                    result = (
+                        best
+                        if self._quality_key(best) > self._quality_key(fast)
+                        else fast
+                    )
+                else:
+                    result = fast
+                if embedded_text_rejected:
+                    result.issue = (
+                        "Повреждённый текстовый слой PDF отклонён. "
+                        "Показан результат локального OCR rus+kir без "
+                        "догадок и автоматической подмены символов."
+                    )
+                return result
             except Exception as exc:
                 return OcrResult(
                     status=OcrStatus.ERROR,
@@ -88,10 +102,35 @@ class OcrService:
             confidence=0.0,
             language="rus+kir",
             issue=(
-                "В PDF нет текстового слоя. Локальная модель rus+kir "
-                "не установлена или недоступна."
+                (
+                    "Встроенный текстовый слой PDF выглядит повреждённым. "
+                    if embedded_text_rejected
+                    else "В PDF нет текстового слоя. "
+                )
+                + "Локальная модель rus+kir не установлена или недоступна."
             ),
         )
+
+    @staticmethod
+    def _embedded_text_is_reliable(text: str) -> bool:
+        """Отбрасывает ложный OCR-слой, записанный латиницей вместо кириллицы."""
+        letters = [character for character in text if character.isalpha()]
+        if len(letters) < 40:
+            return True
+
+        cyrillic = sum(
+            "\u0400" <= character <= "\u052f" for character in letters
+        )
+        latin = sum(
+            "a" <= character.casefold() <= "z" for character in letters
+        )
+        replacement_ratio = text.count("\ufffd") / max(1, len(text))
+        cyrillic_ratio = cyrillic / len(letters)
+        latin_ratio = latin / len(letters)
+
+        if replacement_ratio > 0.005:
+            return False
+        return not (cyrillic_ratio < 0.45 and latin_ratio > 0.35)
 
     @staticmethod
     def _model_available(path: Path | None) -> bool:

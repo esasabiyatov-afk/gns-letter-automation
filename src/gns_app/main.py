@@ -67,7 +67,7 @@ STATUS_LABELS = {
     "manual_period_rule": "Ручная проверка периода",
     "ready_for_response": "Можно создать ответ",
     "response_created": "Ответ создан",
-    "completed": "Завершено",
+    "completed": "Успешно",
     "technical_error": "Техническая ошибка",
     "collecting": "Формируется",
 }

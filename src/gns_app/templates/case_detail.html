@@ -17,7 +17,13 @@
 <div class="case-grid">
   <section class="panel">
     <p class="eyebrow">ПИСЬМО</p>
-    <h2>Подтверждённые данные</h2>
+    <h2>
+      {% if case.source_kind == 'qr_official' %}
+        Данные официального документа
+      {% else %}
+        Подтверждённые данные
+      {% endif %}
+    </h2>
     <dl class="detail-list">
       <div><dt>Район и место</dt><dd>{{ case.district_place or '—' }}</dd></div>
       <div><dt>Должность</dt><dd>{{ case.recipient_position or '—' }}</dd></div>
