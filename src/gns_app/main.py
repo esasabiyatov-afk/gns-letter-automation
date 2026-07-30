@@ -400,6 +400,9 @@ def case_detail(request: Request, case_id: str, message: str = "", error: str = 
             request,
             case=case,
             taxpayers=workflow.get_taxpayers(case_id),
+            recipient_position_display=workflow.names.position_display(
+                case.get("recipient_position") or ""
+            ),
             message=message,
             error=error,
         ),

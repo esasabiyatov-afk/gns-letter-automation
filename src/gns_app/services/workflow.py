@@ -64,7 +64,10 @@ class WorkflowService:
             settings.allowed_qr_paths,
         )
         self.abs = FakeAbsGateway()
-        self.word = WordTemplateService(settings.source_templates_dir)
+        self.word = WordTemplateService(
+            settings.source_templates_dir,
+            self.names,
+        )
 
     def initialize_employee_profiles(self) -> None:
         configured = self.settings.employee_name.strip()

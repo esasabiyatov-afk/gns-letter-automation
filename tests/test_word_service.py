@@ -38,6 +38,8 @@ def test_renders_single_response_without_placeholders(
     assert output.exists()
     assert "12345678901234" in text
     assert 'ОсОО "Тест"' in text
+    assert "Заместителю начальника управления" in text
+    assert "Зам. начальника управления" not in text
     assert "[Дата.Сегодня]" not in text
     assert "[ФИО.Исп]" not in text
 
@@ -64,6 +66,6 @@ def test_renders_multiple_taxpayers_on_separate_lines(
     assert output.exists()
     assert "12345678901234" in text
     assert "23456789012345" in text
+    assert "Заместителю начальника управления" in text
     assert "[Перечисления.Субьект]" not in text
     assert "[ИНН.Субьект]" not in text
-

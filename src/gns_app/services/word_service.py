@@ -12,6 +12,8 @@ from docx import Document
 from docx.text.paragraph import Paragraph
 from lxml import etree
 
+from gns_app.services.name_service import NameService
+
 
 class WordTemplateError(ValueError):
     pass
@@ -45,8 +47,13 @@ class WordTemplateService:
         "employee": "[ФИО.Исп]",
     }
 
-    def __init__(self, templates_dir: Path):
+    def __init__(
+        self,
+        templates_dir: Path,
+        name_service: NameService | None = None,
+    ):
         self.templates_dir = templates_dir
+        self.names = name_service or NameService()
 
     def render(
         self,
@@ -71,7 +78,9 @@ class WordTemplateService:
         replacements = {
             self.TOKENS["today"]: self._format_date(date.today()),
             self.TOKENS["district"]: case["district_place"].strip(),
-            self.TOKENS["position"]: case["recipient_position"].strip(),
+            self.TOKENS["position"]: self.names.position_display(
+                case["recipient_position"]
+            ),
             self.TOKENS["recipient"]: case["recipient_display_name"].strip(),
             self.TOKENS["employee"]: case["employee_name"].strip(),
         }

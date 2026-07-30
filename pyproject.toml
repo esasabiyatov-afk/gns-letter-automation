@@ -17,6 +17,7 @@ dependencies = [
     "pydantic>=2.11,<3",
     "pypdf>=6,<7",
     "pypdfium2>=5,<6",
+    "pymorphy3>=2.0.6,<3",
     "python-docx>=1.2,<2",
     "zxing-cpp>=3.0,<4",
 ]
