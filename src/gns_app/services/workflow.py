@@ -33,6 +33,10 @@ from gns_app.services.official_document import (
 )
 from gns_app.services.pdf_service import PdfService
 from gns_app.services.qr_service import QrService
+from gns_app.services.registry_service import (
+    OsooRegistryClient,
+    RegistryLookupResult,
+)
 from gns_app.services.storage import sanitize_filename, save_pdf_stream
 from gns_app.services.word_service import WordTemplateService
 from gns_app.text_cleanup import clean_location
@@ -67,10 +71,14 @@ class WorkflowService:
             settings.allowed_qr_paths,
         )
         self.abs = FakeAbsGateway()
+        self.registry = OsooRegistryClient()
         self.word = WordTemplateService(
             settings.source_templates_dir,
             self.names,
         )
+
+    def lookup_registry(self, inn: str) -> RegistryLookupResult:
+        return self.registry.lookup_by_inn(inn)
 
     def initialize_employee_profiles(self) -> None:
         configured = self.settings.employee_name.strip()
@@ -475,6 +483,46 @@ class WorkflowService:
         )
         return count
 
+    def request_page_reprocess(self, page_id: str) -> str:
+        page = self.get_page(page_id)
+        if not page:
+            raise WorkflowValidationError("Страница не найдена")
+        if page["manual_confirmed"]:
+            raise WorkflowValidationError(
+                "Подтверждённую сотрудником страницу нельзя перезапускать"
+            )
+        if page["status"] not in {
+            PageStatus.NEEDS_REVIEW,
+            PageStatus.TECHNICAL_ERROR,
+        }:
+            raise WorkflowValidationError(
+                "Эта страница не требует повторной обработки"
+            )
+        self.db.execute(
+            """
+            UPDATE pages
+            SET status = ?, issue_code = NULL, issue_message = NULL,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (PageStatus.REGISTERED, utc_now(), page_id),
+        )
+        self.db.execute(
+            """
+            UPDATE uploads
+            SET status = ?, completed_at = NULL
+            WHERE id = ?
+            """,
+            (UploadStatus.PROCESSING, page["upload_id"]),
+        )
+        self.db.audit(
+            "page",
+            page_id,
+            "page_reprocess_requested",
+            {"page_number": page["page_number"]},
+        )
+        return page["upload_id"]
+
     def _process_page(
         self, upload: dict[str, Any], page: dict[str, Any]
     ) -> None:
@@ -493,6 +541,25 @@ class WorkflowService:
             page_number,
             preview_path,
             enhanced_path,
+        )
+        # Превью является самостоятельным результатом этапа. Сохраняем пути
+        # до QR и сетевой загрузки, чтобы таймаут официального сервера не
+        # оставлял сотрудника без изображения проблемной страницы.
+        self.db.execute(
+            """
+            UPDATE pages
+            SET preview_path = ?, enhanced_preview_path = ?,
+                quality_score = ?, status = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                str(rendered.preview_path),
+                str(rendered.enhanced_preview_path),
+                rendered.quality_score,
+                PageStatus.PREVIEW_READY,
+                utc_now(),
+                page_id,
+            ),
         )
 
         qr_result = self.qr.decode(preview_path)

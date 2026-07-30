@@ -21,6 +21,7 @@ from fastapi.templating import Jinja2Templates
 from gns_app.config import settings
 from gns_app.database import Database
 from gns_app.services.storage import StorageError, ensure_within
+from gns_app.services.registry_service import RegistryLookupError
 from gns_app.services.workflow import (
     WorkflowService,
     WorkflowValidationError,
@@ -123,6 +124,7 @@ ABS_STATUS_LABELS = {
 EVENT_LABELS = {
     "upload_registered": "PDF зарегистрирован",
     "upload_reprocess_requested": "Запрошена повторная обработка",
+    "page_reprocess_requested": "Запрошена повторная обработка страницы",
     "orphan_cases_removed": "Удалены устаревшие черновики обращений",
     "page_processed": "Страница обработана",
     "page_processing_error": "Ошибка обработки страницы",
@@ -212,6 +214,43 @@ def today(request: Request, message: str = "", error: str = ""):
             request,
             overview=workflow.today_overview(),
             message=message,
+            error=error,
+        ),
+    )
+
+
+@app.get("/registry", response_class=HTMLResponse)
+def registry_lookup_page(request: Request):
+    return templates.TemplateResponse(
+        request,
+        "registry.html",
+        context(
+            request,
+            lookup=None,
+            lookup_inn="",
+            error="",
+        ),
+    )
+
+
+@app.post("/registry", response_class=HTMLResponse)
+def registry_lookup(
+    request: Request,
+    inn: str = Form(...),
+):
+    try:
+        result = workflow.lookup_registry(inn)
+        error = ""
+    except RegistryLookupError as exc:
+        result = None
+        error = str(exc)
+    return templates.TemplateResponse(
+        request,
+        "registry.html",
+        context(
+            request,
+            lookup=result,
+            lookup_inn=inn,
             error=error,
         ),
     )
@@ -402,6 +441,32 @@ def page_image(page_id: str, variant: str = "original"):
     if not path.exists():
         raise HTTPException(404, "Файл превью отсутствует")
     return FileResponse(path, media_type="image/jpeg")
+
+
+@app.post("/pages/{page_id}/reprocess")
+def reprocess_page(
+    background_tasks: BackgroundTasks,
+    page_id: str,
+):
+    try:
+        upload_id = workflow.request_page_reprocess(page_id)
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            f"/review/{page_id}?error={quote(str(exc))}",
+            status_code=303,
+        )
+    background_tasks.add_task(
+        workflow.process_upload,
+        upload_id,
+        True,
+    )
+    return RedirectResponse(
+        (
+            f"/uploads/{upload_id}?message="
+            f"{quote('Страница поставлена на повторную обработку.')}"
+        ),
+        status_code=303,
+    )
 
 
 @app.get("/review", response_class=HTMLResponse)

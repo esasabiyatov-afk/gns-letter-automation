@@ -31,7 +31,13 @@
         <span class="tag">OCR: {{ (page.ocr_confidence * 100)|round|int }}%</span>
       </div>
     </div>
-    <a class="button button-danger" href="/review/{{ page.id }}">Открыть</a>
+    {% if page.status == 'technical_error' %}
+      <form method="post" action="/pages/{{ page.id }}/reprocess">
+        <button class="button button-danger" type="submit">Повторить</button>
+      </form>
+    {% else %}
+      <a class="button button-danger" href="/review/{{ page.id }}">Открыть</a>
+    {% endif %}
   </article>
 {% endfor %}
 </section>

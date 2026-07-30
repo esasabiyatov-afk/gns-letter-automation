@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}Сверка ИНН · Автоматизатор писем{% endblock %}
+{% block content %}
+<div class="page-heading">
+  <div>
+    <p class="eyebrow">РУЧНАЯ СВЕРКА</p>
+    <h1>Проверить ИНН в ОсОО.KG</h1>
+    <p>
+      Внешнему сайту передаются только 14 цифр ИНН. PDF, OCR-текст,
+      наименование из письма и банковские данные не отправляются.
+    </p>
+  </div>
+</div>
+
+{% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
+
+<div class="registry-layout">
+  <section class="panel">
+    <p class="eyebrow">HTML-ЗАПРОС</p>
+    <h2>Введите ИНН вручную</h2>
+    <form method="post" action="/registry" class="registry-form">
+      <label class="field">
+        <span>ИНН юридического лица</span>
+        <input name="inn" inputmode="numeric" maxlength="14"
+               pattern="[0-9]{14}" value="{{ lookup_inn }}"
+               placeholder="14 цифр" required>
+      </label>
+      <p class="warning-note">
+        ОсОО.KG требует паузу между HTML-запросами. Первая проверка может
+        занять около 10 секунд. Массовая автоматическая сверка отключена.
+      </p>
+      <button class="button button-primary" type="submit">
+        Проверить один ИНН
+      </button>
+    </form>
+  </section>
+
+  <section class="panel registry-result">
+    <p class="eyebrow">РЕЗУЛЬТАТ</p>
+    {% if lookup %}
+      {% if lookup.status == 'found' %}
+        <span class="status status-completed">Найдено точное совпадение</span>
+        <h2>{{ lookup.official_name }}</h2>
+        <p class="registry-inn">ИНН {{ lookup.inn }}</p>
+        {% if lookup.from_cache %}
+          <small>Показан результат недавней проверки без нового запроса.</small>
+        {% endif %}
+        <div class="warning-note">
+          Это дополнительная сверка, а не замена официального документа по
+          QR. Название нужно перенести в карточку только после проверки
+          сотрудником.
+        </div>
+      {% elif lookup.status == 'multiple' %}
+        <span class="status status-needs_review">Несколько совпадений</span>
+        <h2>Нужна ручная проверка</h2>
+        <p>Сайт вернул несколько названий для одного ИНН.</p>
+      {% else %}
+        <span class="status status-needs_review">Не найдено</span>
+        <h2>Совпадение отсутствует</h2>
+        <p>
+          Это не доказывает, что юридического лица не существует: внешний
+          реестр может быть временно неполным или неактуальным.
+        </p>
+      {% endif %}
+    {% else %}
+      <div class="empty-state">
+        Результат появится здесь после проверки.
+      </div>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

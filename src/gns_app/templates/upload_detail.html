@@ -60,7 +60,19 @@
       {% if page.issue_message %}
         <p class="issue-text">{{ page.issue_message }}</p>
       {% endif %}
-      {% if page.status in ['needs_review', 'technical_error'] %}
+      {% if page.status == 'technical_error' %}
+        <form method="post" action="/pages/{{ page.id }}/reprocess">
+          <button class="button button-danger button-block" type="submit">
+            Повторить обработку
+          </button>
+        </form>
+        {% if page.preview_path %}
+          <a class="text-link page-preview-link"
+             href="/pages/{{ page.id }}/image" target="_blank">
+            Открыть сохранённое превью
+          </a>
+        {% endif %}
+      {% elif page.status == 'needs_review' %}
         <a class="button button-danger button-block" href="/review/{{ page.id }}">
           Проверить страницу
         </a>

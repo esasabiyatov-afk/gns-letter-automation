@@ -88,7 +88,14 @@
 
         <div class="section-title">
           <h2>Налогоплательщики</h2>
-          <button type="button" class="text-button" id="add-taxpayer">+ Добавить</button>
+          <div class="section-title-actions">
+            <a class="text-link" href="/registry" target="_blank">
+              Сверить ИНН
+            </a>
+            <button type="button" class="text-button" id="add-taxpayer">
+              + Добавить
+            </button>
+          </div>
         </div>
         <div id="taxpayer-list">
         {% for taxpayer in taxpayers %}

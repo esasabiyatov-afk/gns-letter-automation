@@ -18,10 +18,12 @@ class OfficialDocumentClient:
         allowed_hosts: frozenset[str],
         allowed_paths: frozenset[str],
         max_bytes: int = 30 * 1024 * 1024,
+        transport: httpx.BaseTransport | None = None,
     ):
         self.allowed_hosts = allowed_hosts
         self.allowed_paths = allowed_paths
         self.max_bytes = max_bytes
+        self.transport = transport
 
     def download(self, url: str, destination_dir: Path) -> Path:
         self._validate_url(url)
@@ -33,6 +35,7 @@ class OfficialDocumentClient:
                 follow_redirects=True,
                 timeout=httpx.Timeout(25.0, connect=10.0),
                 headers={"User-Agent": "GNS-Letter-Automation/0.1"},
+                transport=self.transport,
             ) as client:
                 with client.stream("GET", url) as response:
                     response.raise_for_status()
@@ -51,6 +54,18 @@ class OfficialDocumentClient:
             final_path = destination_dir / f"official{extension}"
             os.replace(temporary, final_path)
             return final_path
+        except httpx.TimeoutException as exc:
+            temporary.unlink(missing_ok=True)
+            raise OfficialDocumentError(
+                "Официальный сервер ГНС не ответил вовремя. "
+                "Превью страницы сохранено; загрузку можно повторить."
+            ) from exc
+        except httpx.HTTPError as exc:
+            temporary.unlink(missing_ok=True)
+            raise OfficialDocumentError(
+                "Не удалось получить официальный документ с сервера ГНС. "
+                "Превью страницы сохранено; загрузку можно повторить."
+            ) from exc
         except Exception:
             temporary.unlink(missing_ok=True)
             raise
@@ -86,4 +101,3 @@ class OfficialDocumentClient:
         raise OfficialDocumentError(
             "Официальный сервер вернул неподдерживаемый тип файла"
         )
-
