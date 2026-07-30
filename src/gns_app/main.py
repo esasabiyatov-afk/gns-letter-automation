@@ -41,7 +41,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="Обработка писем ГНС",
+    title="Автоматизатор писем",
     docs_url=None,
     redoc_url=None,
     lifespan=lifespan,

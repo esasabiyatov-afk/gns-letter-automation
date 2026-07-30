@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Главная · Обработка писем ГНС{% endblock %}
+{% block title %}Главная · Автоматизатор писем{% endblock %}
 {% block content %}
 <section id="employee-entry"
          class="employee-entry {% if not active_employee %}employee-entry-required{% endif %}">
@@ -52,11 +52,10 @@
 
 <section class="hero">
   <div>
-    <p class="eyebrow">БЕЗОПАСНЫЙ КОНВЕЙЕР</p>
-    <h1>Письма ГНС без пропущенных страниц</h1>
+    <h1>Автоматизатор писем</h1>
     <p class="lead">
-      QR имеет приоритет. Сомнительные сканы не угадываются, а попадают
-      сотруднику с удобным превью и полями для исправления.
+      Загрузите PDF-письма ГНС. Приложение обработает документы и покажет
+      страницы, которые требуют проверки.
     </p>
   </div>
   <form class="upload-card" action="/uploads" method="post"
