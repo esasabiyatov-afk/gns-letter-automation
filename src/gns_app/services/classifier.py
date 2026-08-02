@@ -9,6 +9,15 @@ def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.casefold())
 
 
+def _contains_marker(normalized: str, marker: str) -> bool:
+    return bool(
+        re.search(
+            rf"(?<!\w){re.escape(marker)}(?!\w)",
+            normalized,
+        )
+    )
+
+
 class PageClassifier:
     DECISION_MARKERS = {
         "решение": 3,
@@ -17,6 +26,10 @@ class PageClassifier:
         "раздел i": 2,
         "информация о проверяемом налогоплательщике": 3,
         "номер принятого решения": 2,
+        "о предоставлении информации об операциях": 3,
+        "основание запроса": 2,
+        "оформлено органом налоговой службы": 2,
+        "принято решение о предоставлении": 2,
         "102": 1,
         "103": 1,
         "104": 1,
@@ -40,6 +53,16 @@ class PageClassifier:
         "раздел i",
         "информация о проверяемом налогоплательщике",
         "номер принятого решения",
+        "о предоставлении информации об операциях",
+        "основание запроса",
+        "оформлено органом налоговой службы",
+        "принято решение о предоставлении",
+    }
+    DECISION_FORM_CODE_MARKERS = {
+        "102",
+        "103",
+        "104",
+        "900",
     }
 
     def classify(
@@ -71,19 +94,40 @@ class PageClassifier:
         reasons = (
             decision_reasons if page_type == PageType.DECISION else letter_reasons
         )
+        has_identity = any(
+            _contains_marker(normalized, marker)
+            for marker in self.DECISION_IDENTITY_MARKERS
+        )
+        structure_count = sum(
+            _contains_marker(normalized, marker)
+            for marker in self.DECISION_STRUCTURE_MARKERS
+        )
+        supporting_structure_count = sum(
+            _contains_marker(normalized, marker)
+            for marker in self.DECISION_STRUCTURE_MARKERS
+            if marker != "решение"
+        )
+        form_code_count = sum(
+            _contains_marker(normalized, marker)
+            for marker in self.DECISION_FORM_CODE_MARKERS
+        )
+        has_decision_title = _contains_marker(normalized, "решение")
+        has_strong_form_structure = bool(
+            has_decision_title
+            and structure_count >= 2
+            and form_code_count >= 3
+            and decision_score >= 8
+            and difference >= 5
+        )
         automatic_terminal = bool(
             page_type == PageType.DECISION
             and quality_score >= 0.35
             and decision_score >= 8
             and difference >= 4
             and len(decision_reasons) >= 3
-            and any(
-                marker in normalized
-                for marker in self.DECISION_IDENTITY_MARKERS
-            )
-            and any(
-                marker in normalized
-                for marker in self.DECISION_STRUCTURE_MARKERS
+            and (
+                (has_identity and supporting_structure_count >= 1)
+                or has_strong_form_structure
             )
         )
         return ClassificationResult(
@@ -100,7 +144,7 @@ class PageClassifier:
         score = 0
         reasons: list[str] = []
         for marker, weight in markers.items():
-            if marker in normalized:
+            if _contains_marker(normalized, marker):
                 score += weight
                 reasons.append(f"Найден признак: {marker}")
         return score, reasons

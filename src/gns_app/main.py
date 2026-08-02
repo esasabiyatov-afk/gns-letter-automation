@@ -39,6 +39,7 @@ async def lifespan(_: FastAPI):
     db.initialize()
     workflow.initialize_employee_profiles()
     workflow.reconcile_official_qr_pages()
+    workflow.reconcile_confident_scan_decisions()
     workflow.repair_cleaned_responses()
     yield
 
@@ -55,6 +56,13 @@ app.mount(
     name="static",
 )
 templates = Jinja2Templates(directory=PACKAGE_DIR / "templates")
+ASSET_VERSION = str(
+    max(
+        (PACKAGE_DIR / "static" / "styles.css").stat().st_mtime_ns,
+        (PACKAGE_DIR / "static" / "app.js").stat().st_mtime_ns,
+    )
+)
+templates.env.globals["asset_version"] = ASSET_VERSION
 
 
 STATUS_LABELS = {
@@ -161,6 +169,12 @@ EVENT_LABELS = {
     "gns_office_suggested": "Предложен налоговый орган по OCR",
     "decision_without_letter_review_required": (
         "Решение остановлено: письмо не найдено"
+    ),
+    "confident_decision_reconciled": (
+        "Уверенное решение снято с ручной проверки"
+    ),
+    "decision_confidence_review_required": (
+        "Недостаточно признаков решения"
     ),
     "response_created": "Создан ответ Word",
     "grouped_response_created": "Создан общий ответ Word",

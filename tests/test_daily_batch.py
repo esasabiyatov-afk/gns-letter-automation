@@ -129,7 +129,7 @@ def test_ocr_only_decision_stays_in_manual_review(workflow):
     )
 
     assert status == PageStatus.NEEDS_REVIEW
-    assert issue_code == "manual_review_required"
+    assert issue_code == "decision_type_not_confident"
 
 
 def test_confident_ocr_decision_can_finish_without_manual_fields(workflow):

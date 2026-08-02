@@ -249,16 +249,17 @@ td small { display: block; margin-top: 4px; color: var(--muted); }
 
 .review-workspace { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(420px, .85fr); gap: 18px; height: calc(100vh - 150px); }
 .document-viewer, .review-form-panel { background: white; border: 1px solid var(--line); border-radius: 18px; overflow: hidden; }
-.document-viewer { display: grid; grid-template-rows: auto 1fr; }
-.viewer-toolbar { padding: 12px 16px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.document-viewer { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); min-width: 0; }
+.viewer-toolbar { grid-column: 1; grid-row: 1; min-width: 0; padding: 12px 16px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 14px; }
 .viewer-actions { display: flex; gap: 6px; }
 .viewer-actions button { border: 1px solid var(--line); background: white; border-radius: 8px; padding: 7px 10px; cursor: pointer; }
 .viewer-actions button.active { color: white; border-color: var(--green); background: var(--green); }
+.viewer-panel { grid-column: 1; grid-row: 2; width: 100%; min-width: 0; min-height: 0; }
 .viewer-panel[hidden] { display: none; }
 .viewer-pdf { min-height: 0; background: #cfd4d0; }
-.viewer-pdf iframe { display: block; width: 100%; height: 100%; min-height: 720px; border: 0; background: white; }
+.viewer-pdf iframe { display: block; width: 100%; height: 100%; min-height: 0; border: 0; background: white; }
 .viewer-canvas { overflow: auto; background: #cfd4d0; padding: 24px; text-align: center; }
-.viewer-canvas img { width: 100%; max-width: none; box-shadow: 0 10px 30px rgba(0,0,0,.18); }
+.viewer-canvas img { display: block; width: 100%; height: auto; max-width: none; margin: 0 auto; box-shadow: 0 10px 30px rgba(0,0,0,.18); }
 .viewer-ocr { min-height: 0; padding: 22px; overflow: auto; background: #f4f6f3; }
 .ocr-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 14px; }
 .ocr-toolbar div { display: grid; gap: 4px; text-align: left; }
@@ -306,6 +307,7 @@ pre { white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow
   border: 1px solid #e3bd72; border-radius: 12px;
   background: var(--amber-soft); color: #654508; line-height: 1.45;
 }
+.verification-check[hidden] { display: none; }
 .verification-check input { margin-top: 3px; width: 18px; height: 18px; }
 .is-disabled { display: none; }
 

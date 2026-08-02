@@ -627,6 +627,121 @@ class WorkflowService:
             )
         return len(decisions)
 
+    def reconcile_confident_scan_decisions(
+        self,
+        upload_id: str | None = None,
+    ) -> int:
+        """Safely re-evaluate legacy decision pages after rule updates."""
+        params: list[Any] = [
+            PageType.DECISION,
+            PageStatus.NEEDS_REVIEW,
+            QrStatus.FOUND,
+        ]
+        upload_filter = ""
+        if upload_id:
+            upload_filter = " AND upload_id = ?"
+            params.append(upload_id)
+        pages = self.db.fetch_all(
+            f"""
+            SELECT * FROM pages
+            WHERE page_type = ?
+              AND status = ?
+              AND qr_status != ?
+              AND manual_confirmed = 0
+              AND COALESCE(extracted_text, '') != ''
+              {upload_filter}
+            ORDER BY upload_id, page_number
+            """,
+            tuple(params),
+        )
+        changed = 0
+        affected_uploads: set[str] = set()
+        letter_cache: dict[str, bool] = {}
+        for page in pages:
+            classification = self.classifier.classify(
+                page.get("extracted_text") or "",
+                float(page.get("quality_score") or 0.0),
+            )
+            current_upload_id = page["upload_id"]
+            if current_upload_id not in letter_cache:
+                letter_cache[current_upload_id] = bool(
+                    self.db.fetch_one(
+                        """
+                        SELECT id FROM pages
+                        WHERE upload_id = ? AND page_type = ?
+                        LIMIT 1
+                        """,
+                        (current_upload_id, PageType.LETTER),
+                    )
+                )
+
+            if classification.automatic_terminal and letter_cache[
+                current_upload_id
+            ]:
+                status = PageStatus.COMPLETED
+                issue_code = None
+                issue_message = None
+                event_type = "confident_decision_reconciled"
+            elif not letter_cache[current_upload_id]:
+                status = PageStatus.NEEDS_REVIEW
+                issue_code = "confirmed_letter_missing"
+                issue_message = (
+                    "Это решение распознано уверенно, но во всём PDF не "
+                    "найдено письмо. Проверьте, чтобы основной документ не "
+                    "был пропущен."
+                )
+                event_type = "decision_without_letter_review_required"
+            else:
+                status = PageStatus.NEEDS_REVIEW
+                issue_code = "decision_type_not_confident"
+                issue_message = (
+                    "Страница похожа на решение, но для автоматического "
+                    "завершения не хватило независимых признаков формы. "
+                    "Проверьте тип страницы."
+                )
+                event_type = "decision_confidence_review_required"
+
+            if (
+                page.get("status") == status
+                and page.get("issue_code") == issue_code
+                and page.get("issue_message") == issue_message
+            ):
+                continue
+            self.db.execute(
+                """
+                UPDATE pages
+                SET status = ?, issue_code = ?, issue_message = ?,
+                    type_confidence = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    issue_code,
+                    issue_message,
+                    classification.confidence,
+                    utc_now(),
+                    page["id"],
+                ),
+            )
+            self.db.audit(
+                "page",
+                page["id"],
+                event_type,
+                {
+                    "page_number": page["page_number"],
+                    "automatic_terminal": (
+                        classification.automatic_terminal
+                    ),
+                    "reasons": classification.reasons,
+                },
+            )
+            changed += 1
+            affected_uploads.add(current_upload_id)
+
+        for affected_upload_id in affected_uploads:
+            self._refresh_upload_status(affected_upload_id)
+        return changed
+
     def reconcile_official_qr_pages(
         self, upload_id: str | None = None
     ) -> int:
@@ -1071,6 +1186,16 @@ class WorkflowService:
             )
         if page_type == PageType.DECISION and automatic_terminal:
             return PageStatus.COMPLETED, None, None
+        if page_type == PageType.DECISION:
+            return (
+                PageStatus.NEEDS_REVIEW,
+                "decision_type_not_confident",
+                (
+                    "Страница похожа на решение, но для автоматического "
+                    "завершения не хватило независимых признаков формы. "
+                    "Проверьте тип страницы."
+                ),
+            )
         return (
             PageStatus.NEEDS_REVIEW,
             "manual_review_required",

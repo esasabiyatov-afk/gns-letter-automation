@@ -92,6 +92,9 @@
   const typeRadios = document.querySelectorAll("input[name='page_type']");
   if (letterFields && typeRadios.length) {
     const verification = document.querySelector("[data-letter-verification]");
+    const verificationWrapper = document.querySelector(
+      "[data-letter-verification-wrapper]"
+    );
     const update = () => {
       const selected = document.querySelector("input[name='page_type']:checked")?.value;
       letterFields.classList.toggle("is-disabled", selected !== "letter");
@@ -101,6 +104,9 @@
       if (verification) {
         verification.disabled = selected !== "letter";
         verification.required = selected === "letter";
+      }
+      if (verificationWrapper) {
+        verificationWrapper.hidden = selected !== "letter";
       }
     };
     typeRadios.forEach((radio) => radio.addEventListener("change", update));

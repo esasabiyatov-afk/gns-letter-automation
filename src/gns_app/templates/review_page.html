@@ -45,8 +45,12 @@
 
   <aside class="review-form-panel">
     <div class="review-form-header">
-      <p class="eyebrow">РУЧНОЕ ПОДТВЕРЖДЕНИЕ</p>
-      <h1>Обозначьте страницу</h1>
+      <p class="eyebrow">
+        {% if page.page_type == 'decision' %}ПРОВЕРКА ТИПА СТРАНИЦЫ{% else %}РУЧНАЯ ПРОВЕРКА{% endif %}
+      </p>
+      <h1>
+        {% if page.page_type == 'decision' %}Проверьте тип страницы{% else %}Обозначьте страницу{% endif %}
+      </h1>
       <p class="issue-box">{{ page.issue_message or 'Проверьте данные.' }}</p>
     </div>
     {% if error %}
@@ -181,7 +185,9 @@
         </div>
       </div>
 
-      <label class="verification-check">
+      <label class="verification-check"
+             data-letter-verification-wrapper
+             {% if page.page_type != 'letter' %}hidden{% endif %}>
         <input type="checkbox" name="critical_fields_verified" value="true"
                data-letter-verification>
         <span>
