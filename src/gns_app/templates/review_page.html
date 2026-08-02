@@ -5,23 +5,41 @@
   <section class="document-viewer">
     <div class="viewer-toolbar">
       <a class="back-link" href="/review">← К очереди</a>
-      <strong>Страница {{ page.page_number }}</strong>
+      <strong>
+        {{ upload.get('original_filename') or 'Исходный PDF' }} ·
+        страница {{ page.page_number }}
+      </strong>
       <div class="viewer-actions">
-        <button type="button" data-zoom="-0.15">−</button>
-        <button type="button" data-zoom="0">100%</button>
-        <button type="button" data-zoom="0.15">+</button>
-        <button type="button" id="toggle-image">Улучшенная</button>
+        <button type="button" class="active" data-viewer-tab="pdf">PDF</button>
+        <button type="button" data-viewer-tab="enhanced">Улучшенная</button>
+        <button type="button" data-viewer-tab="ocr">Текст OCR</button>
       </div>
     </div>
-    <div class="viewer-canvas">
-      {% if page.preview_path %}
-        <img id="review-image" src="/pages/{{ page.id }}/image"
-             data-original="/pages/{{ page.id }}/image"
-             data-enhanced="/pages/{{ page.id }}/image?variant=enhanced"
-             alt="Проблемная страница {{ page.page_number }}">
+    <div class="viewer-panel viewer-pdf" data-viewer-panel="pdf">
+      <iframe
+        src="/pages/{{ page.id }}/pdf#page=1&zoom=page-width"
+        title="PDF, исходная страница {{ page.page_number }}">
+      </iframe>
+    </div>
+    <div class="viewer-panel viewer-canvas" data-viewer-panel="enhanced" hidden>
+      {% if page.enhanced_preview_path %}
+        <img src="/pages/{{ page.id }}/image?variant=enhanced"
+             alt="Улучшенное изображение страницы {{ page.page_number }}">
       {% else %}
-        <div class="empty-state">Превью не создано.</div>
+        <div class="empty-state">Улучшенное изображение не создано.</div>
       {% endif %}
+    </div>
+    <div class="viewer-panel viewer-ocr" data-viewer-panel="ocr" hidden>
+      <div class="ocr-toolbar">
+        <div>
+          <strong>Распознанный текст</strong>
+          <small>Можно выделять и копировать. Это подсказка, а не подтверждённый источник.</small>
+        </div>
+        <button type="button" class="button button-secondary" id="copy-ocr">
+          Копировать текст
+        </button>
+      </div>
+      <pre id="ocr-selectable" tabindex="0">{{ page.extracted_text or 'Текст OCR отсутствует.' }}</pre>
     </div>
   </section>
 
@@ -58,7 +76,23 @@
         <label class="field">
           <span>Район и место</span>
           <input name="district_place" value="{{ case.get('district_place') or '' }}"
-                 placeholder="по Ленинскому району города Бишкек">
+                 list="gns-office-options"
+                 autocomplete="off"
+                 placeholder="Начните вводить район или налоговый орган">
+          <datalist id="gns-office-options">
+          {% for office in gns_offices %}
+            <option value="{{ office.district_place }}">
+              {{ office.office_name }}{% if office.postal_address %} · {{ office.postal_address }}{% endif %}
+            </option>
+          {% endfor %}
+          </datalist>
+          <small class="field-hint">
+            {% if gns_offices %}
+              Предложения загружены из локального справочника ГНС.
+            {% else %}
+              Справочник адресов пока пуст. После загрузки адресов здесь появятся предложения.
+            {% endif %}
+          </small>
         </label>
         <label class="field">
           <span>Должность адресата</span>
@@ -146,11 +180,6 @@
           {% endfor %}
         </div>
       </div>
-
-      <details class="ocr-details">
-        <summary>Показать распознанный текст OCR</summary>
-        <pre>{{ page.extracted_text or 'Текстовый слой отсутствует.' }}</pre>
-      </details>
 
       <label class="verification-check">
         <input type="checkbox" name="critical_fields_verified" value="true"

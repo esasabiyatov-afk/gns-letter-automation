@@ -31,6 +31,16 @@ class PageClassifier:
         "с уважением": 1,
         "зам. начальника управления": 2,
     }
+    DECISION_IDENTITY_MARKERS = {
+        "audit sti-010",
+        "sti-010",
+    }
+    DECISION_STRUCTURE_MARKERS = {
+        "решение",
+        "раздел i",
+        "информация о проверяемом налогоплательщике",
+        "номер принятого решения",
+    }
 
     def classify(
         self, text: str, quality_score: float
@@ -61,10 +71,26 @@ class PageClassifier:
         reasons = (
             decision_reasons if page_type == PageType.DECISION else letter_reasons
         )
+        automatic_terminal = bool(
+            page_type == PageType.DECISION
+            and quality_score >= 0.35
+            and decision_score >= 8
+            and difference >= 4
+            and len(decision_reasons) >= 3
+            and any(
+                marker in normalized
+                for marker in self.DECISION_IDENTITY_MARKERS
+            )
+            and any(
+                marker in normalized
+                for marker in self.DECISION_STRUCTURE_MARKERS
+            )
+        )
         return ClassificationResult(
             page_type=page_type,
             confidence=round(confidence, 3),
             reasons=reasons,
+            automatic_terminal=automatic_terminal,
         )
 
     @staticmethod
@@ -78,4 +104,3 @@ class PageClassifier:
                 score += weight
                 reasons.append(f"Найден признак: {marker}")
         return score, reasons
-

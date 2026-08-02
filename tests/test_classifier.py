@@ -11,6 +11,7 @@ def test_classifies_decision_by_structural_markers():
     """
     result = PageClassifier().classify(text, quality_score=0.8)
     assert result.page_type == PageType.DECISION
+    assert result.automatic_terminal
 
 
 def test_classifies_letter_by_letter_markers():
@@ -31,4 +32,25 @@ def test_does_not_guess_blurred_or_conflicting_page():
     result = PageClassifier().classify(text, quality_score=0.05)
     assert result.page_type == PageType.UNKNOWN
     assert result.confidence == 0
+    assert not result.automatic_terminal
 
+
+def test_decision_title_without_structure_is_not_automatic_terminal():
+    text = "РЕШЕНИЕ STI-010"
+
+    result = PageClassifier().classify(text, quality_score=0.8)
+
+    assert result.page_type == PageType.DECISION
+    assert not result.automatic_terminal
+
+
+def test_low_quality_decision_is_not_automatic_terminal():
+    text = """
+    AUDIT STI-010 РЕШЕНИЕ РАЗДЕЛ I
+    ИНФОРМАЦИЯ О ПРОВЕРЯЕМОМ НАЛОГОПЛАТЕЛЬЩИКЕ 102 103 104 900
+    """
+
+    result = PageClassifier().classify(text, quality_score=0.2)
+
+    assert result.page_type == PageType.DECISION
+    assert not result.automatic_terminal

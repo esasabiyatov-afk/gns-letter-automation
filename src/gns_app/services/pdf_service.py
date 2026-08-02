@@ -3,10 +3,11 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 import pypdfium2 as pdfium
 from PIL import Image, ImageFilter, ImageOps, ImageStat
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 
 
 class PdfProcessingError(ValueError):
@@ -76,6 +77,41 @@ class PdfService:
         except Exception:
             return ""
 
+    def extract_page_pdf(
+        self,
+        pdf_path: Path,
+        page_number: int,
+        output_path: Path,
+    ) -> Path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output_path.with_name(
+            f".{output_path.name}.{uuid4().hex}.part"
+        )
+        try:
+            reader = PdfReader(str(pdf_path))
+            if reader.is_encrypted:
+                raise PdfProcessingError(
+                    "Зашифрованные PDF пока не поддерживаются"
+                )
+            if page_number < 1 or page_number > len(reader.pages):
+                raise PdfProcessingError(
+                    f"Страница {page_number} отсутствует в PDF"
+                )
+            writer = PdfWriter()
+            writer.add_page(reader.pages[page_number - 1])
+            with temporary.open("wb") as stream:
+                writer.write(stream)
+            temporary.replace(output_path)
+            return output_path
+        except PdfProcessingError:
+            temporary.unlink(missing_ok=True)
+            raise
+        except Exception as exc:
+            temporary.unlink(missing_ok=True)
+            raise PdfProcessingError(
+                f"Не удалось подготовить PDF страницы {page_number}: {exc}"
+            ) from exc
+
     @staticmethod
     def _enhance_for_review(image: Image.Image) -> Image.Image:
         # Только классические операции. Никакого генеративного восстановления.
@@ -95,4 +131,3 @@ class PdfService:
         if math.isnan(raw):
             return 0.0
         return round(max(0.0, min(1.0, raw)), 3)
-

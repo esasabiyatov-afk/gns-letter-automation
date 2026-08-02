@@ -253,8 +253,17 @@ td small { display: block; margin-top: 4px; color: var(--muted); }
 .viewer-toolbar { padding: 12px 16px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 14px; }
 .viewer-actions { display: flex; gap: 6px; }
 .viewer-actions button { border: 1px solid var(--line); background: white; border-radius: 8px; padding: 7px 10px; cursor: pointer; }
+.viewer-actions button.active { color: white; border-color: var(--green); background: var(--green); }
+.viewer-panel[hidden] { display: none; }
+.viewer-pdf { min-height: 0; background: #cfd4d0; }
+.viewer-pdf iframe { display: block; width: 100%; height: 100%; min-height: 720px; border: 0; background: white; }
 .viewer-canvas { overflow: auto; background: #cfd4d0; padding: 24px; text-align: center; }
-.viewer-canvas img { width: 100%; max-width: none; box-shadow: 0 10px 30px rgba(0,0,0,.18); transition: width .15s ease; }
+.viewer-canvas img { width: 100%; max-width: none; box-shadow: 0 10px 30px rgba(0,0,0,.18); }
+.viewer-ocr { min-height: 0; padding: 22px; overflow: auto; background: #f4f6f3; }
+.ocr-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 14px; }
+.ocr-toolbar div { display: grid; gap: 4px; text-align: left; }
+.ocr-toolbar small { color: var(--muted); }
+.viewer-ocr pre { min-height: 610px; max-height: none; margin: 0; user-select: text; cursor: text; }
 .review-form-panel { overflow-y: auto; padding: 26px; }
 .review-form-header h1 { font-size: 34px; }
 .issue-box { padding: 12px 14px; border-radius: 12px; background: var(--red-soft); color: var(--red); line-height: 1.45; }
@@ -273,6 +282,7 @@ legend { font-weight: 800; margin-bottom: 10px; }
 .field > span { color: #465047; font-size: 13px; font-weight: 700; }
 .field input, .field select { width: 100%; border: 1px solid #cdd4ce; border-radius: 10px; padding: 11px 12px; background: white; }
 .field input:focus, .field select:focus { outline: 3px solid rgba(31,107,79,.12); border-color: var(--green); }
+.field-hint { color: var(--muted); font-size: 12px; line-height: 1.4; }
 .profile-field {
   display: grid; gap: 4px; margin: 16px 0; padding: 12px 14px;
   border-radius: 12px; background: var(--green-soft);

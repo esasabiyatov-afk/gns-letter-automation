@@ -115,6 +115,7 @@ class ClassificationResult:
     page_type: PageType
     confidence: float
     reasons: list[str] = field(default_factory=list)
+    automatic_terminal: bool = False
 
 
 @dataclass(slots=True)

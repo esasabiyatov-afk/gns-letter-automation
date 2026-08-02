@@ -20,25 +20,36 @@
     button.addEventListener("click", () => button.closest("dialog")?.close());
   });
 
-  const reviewImage = document.querySelector("#review-image");
-  if (reviewImage) {
-    let zoom = 1;
-    let enhanced = false;
-    document.querySelectorAll("[data-zoom]").forEach((button) => {
+  const viewerTabs = document.querySelectorAll("[data-viewer-tab]");
+  const viewerPanels = document.querySelectorAll("[data-viewer-panel]");
+  if (viewerTabs.length && viewerPanels.length) {
+    viewerTabs.forEach((button) => {
       button.addEventListener("click", () => {
-        const delta = Number(button.dataset.zoom);
-        zoom = delta === 0 ? 1 : Math.min(2.5, Math.max(0.55, zoom + delta));
-        reviewImage.style.width = `${zoom * 100}%`;
+        const selected = button.dataset.viewerTab;
+        viewerTabs.forEach((tab) => {
+          tab.classList.toggle("active", tab === button);
+        });
+        viewerPanels.forEach((panel) => {
+          panel.hidden = panel.dataset.viewerPanel !== selected;
+        });
       });
     });
-    document.querySelector("#toggle-image")?.addEventListener("click", (event) => {
-      enhanced = !enhanced;
-      reviewImage.src = enhanced
-        ? reviewImage.dataset.enhanced
-        : reviewImage.dataset.original;
-      event.currentTarget.textContent = enhanced ? "Оригинал" : "Улучшенная";
-    });
   }
+
+  document.querySelector("#copy-ocr")?.addEventListener("click", async (event) => {
+    const text = document.querySelector("#ocr-selectable")?.textContent || "";
+    try {
+      await navigator.clipboard.writeText(text);
+      event.currentTarget.textContent = "Скопировано";
+      window.setTimeout(() => { event.currentTarget.textContent = "Копировать текст"; }, 1600);
+    } catch (_) {
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(document.querySelector("#ocr-selectable"));
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+  });
 
   const taxpayerList = document.querySelector("#taxpayer-list");
   const addTaxpayer = document.querySelector("#add-taxpayer");

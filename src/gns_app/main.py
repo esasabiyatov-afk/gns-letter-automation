@@ -157,6 +157,11 @@ EVENT_LABELS = {
     "registry_checked": "Выполнена сверка с ОсОО.KG",
     "registry_variance_accepted": "Подтверждены расхождения ОсОО.KG",
     "inbox_scanned": "Просканирована папка входящих",
+    "gns_offices_replaced": "Обновлён справочник налоговых органов",
+    "gns_office_suggested": "Предложен налоговый орган по OCR",
+    "decision_without_letter_review_required": (
+        "Решение остановлено: письмо не найдено"
+    ),
     "response_created": "Создан ответ Word",
     "grouped_response_created": "Создан общий ответ Word",
     "district_place_edge_noise_removed": (
@@ -502,6 +507,24 @@ def page_image(page_id: str, variant: str = "original"):
     return FileResponse(path, media_type="image/jpeg")
 
 
+@app.get("/pages/{page_id}/pdf")
+def page_pdf(page_id: str):
+    page = workflow.get_page(page_id)
+    if not page:
+        raise HTTPException(404, "Страница не найдена")
+    try:
+        path = workflow.get_page_pdf_path(page_id)
+    except WorkflowValidationError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return FileResponse(
+        path,
+        media_type="application/pdf",
+        filename=f"page-{int(page['page_number']):04d}.pdf",
+        content_disposition_type="inline",
+        headers={"X-Content-Type-Options": "nosniff"},
+    )
+
+
 @app.post("/pages/{page_id}/reprocess")
 def reprocess_page(
     background_tasks: BackgroundTasks,
@@ -558,6 +581,7 @@ def review_page(request: Request, page_id: str, error: str = ""):
     )
     if not taxpayers:
         taxpayers = [{"name": "", "inn": ""}]
+    upload = workflow.get_upload(page["upload_id"])
     return templates.TemplateResponse(
         request,
         "review_page.html",
@@ -566,6 +590,8 @@ def review_page(request: Request, page_id: str, error: str = ""):
             page=page,
             case=case or {},
             taxpayers=taxpayers,
+            upload=upload or {},
+            gns_offices=workflow.list_gns_offices(),
             error=error,
         ),
     )

@@ -32,7 +32,7 @@ from gns_app.services.official_document import (
     OfficialDocumentClient,
     OfficialDocumentError,
 )
-from gns_app.services.pdf_service import PdfService
+from gns_app.services.pdf_service import PdfProcessingError, PdfService
 from gns_app.services.qr_service import QrService
 from gns_app.services.registry_service import (
     OsooRegistryClient,
@@ -114,6 +114,119 @@ class WorkflowService:
         if not self._active_employee_from_database():
             self._store_active_employee(name_key)
             self._apply_employee_to_open_cases(name)
+
+    @staticmethod
+    def _normalize_office_text(value: str) -> str:
+        normalized = value.casefold().replace("ё", "е")
+        normalized = re.sub(r"[^\w\s-]", " ", normalized)
+        return " ".join(normalized.split())
+
+    def replace_gns_offices(
+        self,
+        records: list[dict[str, Any]],
+        actor: str = "Сотрудник",
+    ) -> int:
+        prepared: list[tuple[str, str, str, str, str, str, str]] = []
+        seen: set[str] = set()
+        now = utc_now()
+        for record in records:
+            office_name = " ".join(
+                str(record.get("office_name") or "").split()
+            )
+            district_place = clean_location(
+                str(record.get("district_place") or "")
+            )
+            postal_address = " ".join(
+                str(record.get("postal_address") or "").split()
+            )
+            raw_aliases = record.get("aliases") or []
+            if isinstance(raw_aliases, str):
+                raw_aliases = [raw_aliases]
+            aliases = [
+                " ".join(str(alias).split())
+                for alias in raw_aliases
+                if " ".join(str(alias).split())
+            ]
+            if not office_name or not district_place:
+                raise WorkflowValidationError(
+                    "У каждого налогового органа нужны название и район/место"
+                )
+            office_key = self._normalize_office_text(
+                f"{office_name} {district_place}"
+            )
+            if office_key in seen:
+                raise WorkflowValidationError(
+                    "В справочнике повторяется один налоговый орган"
+                )
+            seen.add(office_key)
+            prepared.append(
+                (
+                    office_key,
+                    office_name,
+                    district_place,
+                    postal_address,
+                    json.dumps(aliases, ensure_ascii=False),
+                    now,
+                    now,
+                )
+            )
+        with self.db.connect() as connection:
+            connection.execute("DELETE FROM gns_offices")
+            connection.executemany(
+                """
+                INSERT INTO gns_offices(
+                    office_key, office_name, district_place,
+                    postal_address, aliases_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                prepared,
+            )
+        self.db.audit(
+            "settings",
+            "gns_offices",
+            "gns_offices_replaced",
+            {"office_count": len(prepared)},
+            actor=actor,
+        )
+        return len(prepared)
+
+    def list_gns_offices(self) -> list[dict[str, Any]]:
+        rows = self.db.fetch_all(
+            """
+            SELECT * FROM gns_offices
+            WHERE active = 1
+            ORDER BY district_place, office_name
+            """
+        )
+        for row in rows:
+            try:
+                row["aliases"] = json.loads(
+                    row.get("aliases_json") or "[]"
+                )
+            except json.JSONDecodeError:
+                row["aliases"] = []
+        return rows
+
+    def match_gns_office(self, text: str) -> dict[str, Any] | None:
+        normalized_text = self._normalize_office_text(text)
+        if not normalized_text:
+            return None
+        matches: list[dict[str, Any]] = []
+        for office in self.list_gns_offices():
+            raw_terms = [
+                office.get("office_name") or "",
+                office.get("district_place") or "",
+                office.get("postal_address") or "",
+                *(office.get("aliases") or []),
+            ]
+            normalized_terms = {
+                normalized
+                for term in raw_terms
+                if len(normalized := self._normalize_office_text(term)) >= 8
+            }
+            if any(term in normalized_text for term in normalized_terms):
+                matches.append(office)
+        return matches[0] if len(matches) == 1 else None
 
     def list_employee_profiles(self) -> list[dict[str, Any]]:
         return self.db.fetch_all(
@@ -451,8 +564,68 @@ class WorkflowService:
                 )
         self.reconcile_official_qr_pages(upload_id)
         self._complete_qr_companions(upload_id)
+        self._require_letter_for_scan_only_decisions(upload_id)
         self._remove_orphan_cases(upload_id)
         self._refresh_upload_status(upload_id)
+
+    def _require_letter_for_scan_only_decisions(self, upload_id: str) -> int:
+        letter = self.db.fetch_one(
+            """
+            SELECT id FROM pages
+            WHERE upload_id = ? AND page_type = ?
+            LIMIT 1
+            """,
+            (upload_id, PageType.LETTER),
+        )
+        if letter:
+            return 0
+        decisions = self.db.fetch_all(
+            """
+            SELECT id, page_number FROM pages
+            WHERE upload_id = ?
+              AND page_type = ?
+              AND status = ?
+              AND qr_status != ?
+              AND manual_confirmed = 0
+            ORDER BY page_number
+            """,
+            (
+                upload_id,
+                PageType.DECISION,
+                PageStatus.COMPLETED,
+                QrStatus.FOUND,
+            ),
+        )
+        if not decisions:
+            return 0
+        now = utc_now()
+        for decision in decisions:
+            self.db.execute(
+                """
+                UPDATE pages
+                SET status = ?, issue_code = ?, issue_message = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    PageStatus.NEEDS_REVIEW,
+                    "confirmed_letter_missing",
+                    (
+                        "Страница уверенно похожа на решение, но в PDF не "
+                        "найдено ни одного письма. Проверьте тип, чтобы письмо "
+                        "не было пропущено."
+                    ),
+                    now,
+                    decision["id"],
+                ),
+            )
+            self.db.audit(
+                "page",
+                decision["id"],
+                "decision_without_letter_review_required",
+                {"page_number": decision["page_number"]},
+            )
+        return len(decisions)
 
     def reconcile_official_qr_pages(
         self, upload_id: str | None = None
@@ -782,12 +955,14 @@ class WorkflowService:
         extracted = None
         if classification.page_type == PageType.LETTER:
             extracted = self.extractor.extract_scan_letter(ocr_result.text)
+            office_suggestion = self.match_gns_office(ocr_result.text)
             if case_id is None:
                 case_id = self._create_scan_case(upload["id"], page_id)
             self._prefill_scan_case(
                 case_id,
                 extracted,
                 ocr_result.critical_fields_agree,
+                office_suggestion,
             )
 
         page_status, issue_code, issue_message = self._page_outcome(
@@ -796,6 +971,7 @@ class WorkflowService:
             qr_result.status,
             official_complete,
             official_issue,
+            classification.automatic_terminal,
         )
         if (
             classification.page_type == PageType.LETTER
@@ -853,6 +1029,7 @@ class WorkflowService:
                 "qr_method": qr_result.method,
                 "ocr_status": ocr_result.status,
                 "ocr_confidence": ocr_result.confidence,
+                "automatic_terminal": classification.automatic_terminal,
                 "status": page_status,
             },
         )
@@ -864,6 +1041,7 @@ class WorkflowService:
         qr_status: QrStatus,
         official_complete: bool,
         official_issue: str | None,
+        automatic_terminal: bool = False,
     ) -> tuple[PageStatus, str | None, str | None]:
         if official_complete:
             return PageStatus.COMPLETED, None, None
@@ -891,6 +1069,8 @@ class WorkflowService:
                 "scan_confirmation_required",
                 "Письмо распознано по скану и требует подтверждения полей.",
             )
+        if page_type == PageType.DECISION and automatic_terminal:
+            return PageStatus.COMPLETED, None, None
         return (
             PageStatus.NEEDS_REVIEW,
             "manual_review_required",
@@ -967,6 +1147,7 @@ class WorkflowService:
         case_id: str,
         fields,
         critical_fields_agree: bool = False,
+        office_suggestion: dict[str, Any] | None = None,
     ) -> None:
         current = self.get_case(case_id)
         if not current:
@@ -976,6 +1157,30 @@ class WorkflowService:
             and current.get("fields_confirmed")
         ):
             return
+        if office_suggestion and not current.get("district_place"):
+            self.db.execute(
+                """
+                UPDATE cases
+                SET district_place = COALESCE(district_place, ?),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    office_suggestion["district_place"],
+                    utc_now(),
+                    case_id,
+                ),
+            )
+            self.db.audit(
+                "case",
+                case_id,
+                "gns_office_suggested",
+                {
+                    "office_id": office_suggestion["id"],
+                    "district_place": office_suggestion["district_place"],
+                    "source": "ocr_exact_directory_match",
+                },
+            )
         if not critical_fields_agree:
             self.db.execute(
                 """
@@ -2242,6 +2447,36 @@ class WorkflowService:
 
     def get_page(self, page_id: str) -> dict[str, Any] | None:
         return self.db.fetch_one("SELECT * FROM pages WHERE id = ?", (page_id,))
+
+    def get_page_pdf_path(self, page_id: str) -> Path:
+        page = self.get_page(page_id)
+        if not page:
+            raise WorkflowValidationError("Страница не найдена")
+        upload = self.get_upload(page["upload_id"])
+        if not upload:
+            raise WorkflowValidationError("Исходный PDF не найден")
+        try:
+            source = ensure_within(
+                Path(upload["stored_path"]),
+                self.settings.uploads_dir,
+            )
+            output = ensure_within(
+                self.settings.previews_dir
+                / upload["id"]
+                / f"page-{int(page['page_number']):04d}.pdf",
+                self.settings.previews_dir,
+            )
+            if not output.exists() or (
+                source.stat().st_mtime_ns > output.stat().st_mtime_ns
+            ):
+                self.pdf.extract_page_pdf(
+                    source,
+                    int(page["page_number"]),
+                    output,
+                )
+            return output
+        except (OSError, PdfProcessingError, ValueError) as exc:
+            raise WorkflowValidationError(str(exc)) from exc
 
     def list_review_pages(self) -> list[dict[str, Any]]:
         return self.db.fetch_all(

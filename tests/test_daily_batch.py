@@ -132,6 +132,21 @@ def test_ocr_only_decision_stays_in_manual_review(workflow):
     assert issue_code == "manual_review_required"
 
 
+def test_confident_ocr_decision_can_finish_without_manual_fields(workflow):
+    status, issue_code, issue_message = workflow._page_outcome(
+        PageType.DECISION,
+        0.78,
+        QrStatus.NOT_FOUND,
+        False,
+        None,
+        True,
+    )
+
+    assert status == PageStatus.COMPLETED
+    assert issue_code is None
+    assert issue_message is None
+
+
 def test_ocr_disagreement_does_not_prefill_critical_fields(workflow):
     upload_id = uuid4().hex
     now = utc_now()

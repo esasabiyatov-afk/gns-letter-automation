@@ -140,6 +140,21 @@ CREATE TABLE IF NOT EXISTS employee_profiles (
 CREATE INDEX IF NOT EXISTS idx_employee_profiles_name
 ON employee_profiles(name);
 
+CREATE TABLE IF NOT EXISTS gns_offices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    office_key TEXT NOT NULL UNIQUE,
+    office_name TEXT NOT NULL,
+    district_place TEXT NOT NULL,
+    postal_address TEXT,
+    aliases_json TEXT NOT NULL DEFAULT '[]',
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_gns_offices_district
+ON gns_offices(district_place);
+
 CREATE TABLE IF NOT EXISTS response_groups (
     id TEXT PRIMARY KEY,
     business_date TEXT NOT NULL,
