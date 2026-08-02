@@ -157,3 +157,36 @@ def test_legacy_uncertain_decision_gets_explanatory_reason(workflow):
     assert changed == 1
     assert page["status"] == PageStatus.NEEDS_REVIEW
     assert page["issue_code"] == "decision_type_not_confident"
+
+
+def test_completed_scan_decision_is_reopened_if_rule_is_not_safe(workflow):
+    _insert_upload(workflow, "unsafe-completed-packet")
+    _insert_page(
+        workflow,
+        "safe-letter",
+        "unsafe-completed-packet",
+        1,
+        "letter",
+        "completed",
+    )
+    _insert_page(
+        workflow,
+        "unsafe-completed-decision",
+        "unsafe-completed-packet",
+        2,
+        "decision",
+        "completed",
+        text=(
+            "STI-010 РЕШЕНИЕ "
+            "О ПРЕДОСТАВЛЕНИИ ИНФОРМАЦИИ ОБ ОПЕРАЦИЯХ"
+        ),
+    )
+
+    changed = workflow.reconcile_confident_scan_decisions(
+        "unsafe-completed-packet"
+    )
+    page = workflow.get_page("unsafe-completed-decision")
+
+    assert changed == 1
+    assert page["status"] == PageStatus.NEEDS_REVIEW
+    assert page["issue_code"] == "decision_type_not_confident"

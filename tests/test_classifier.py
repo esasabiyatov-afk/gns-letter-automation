@@ -86,6 +86,33 @@ def test_audit_title_without_form_structure_is_not_automatic_terminal():
     assert not result.automatic_terminal
 
 
+def test_letter_reference_to_sti_decision_stays_letter():
+    text = """
+    На основании Решения STI-010 № 008-2026-010-5845
+    запрашивает информацию об операциях на счетах.
+    О налогоплательщике:
+    Наименование: ОсОО Тест
+    ИНН: 12345678901234
+    Период: с 01.01.2024 по 01.01.2025
+    """
+
+    result = PageClassifier().classify(text, quality_score=0.8)
+
+    assert result.page_type == PageType.LETTER
+    assert not result.automatic_terminal
+
+
+def test_damaged_letter_reference_cannot_auto_complete_as_decision():
+    text = """
+    STI-010 РЕШЕНИЕ
+    О ПРЕДОСТАВЛЕНИИ ИНФОРМАЦИИ ОБ ОПЕРАЦИЯХ
+    """
+
+    result = PageClassifier().classify(text, quality_score=0.8)
+
+    assert not result.automatic_terminal
+
+
 def test_low_quality_decision_is_not_automatic_terminal():
     text = """
     AUDIT STI-010 РЕШЕНИЕ РАЗДЕЛ I

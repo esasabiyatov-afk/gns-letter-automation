@@ -634,8 +634,9 @@ class WorkflowService:
         """Safely re-evaluate legacy decision pages after rule updates."""
         params: list[Any] = [
             PageType.DECISION,
-            PageStatus.NEEDS_REVIEW,
             QrStatus.FOUND,
+            PageStatus.NEEDS_REVIEW,
+            PageStatus.COMPLETED,
         ]
         upload_filter = ""
         if upload_id:
@@ -645,10 +646,9 @@ class WorkflowService:
             f"""
             SELECT * FROM pages
             WHERE page_type = ?
-              AND status = ?
               AND qr_status != ?
+              AND status IN (?, ?)
               AND manual_confirmed = 0
-              AND COALESCE(extracted_text, '') != ''
               {upload_filter}
             ORDER BY upload_id, page_number
             """,

@@ -58,6 +58,14 @@ class PageClassifier:
         "оформлено органом налоговой службы",
         "принято решение о предоставлении",
     }
+    DECISION_EXCLUSIVE_STRUCTURE_MARKERS = {
+        "раздел i",
+        "информация о проверяемом налогоплательщике",
+        "номер принятого решения",
+        "основание запроса",
+        "оформлено органом налоговой службы",
+        "принято решение о предоставлении",
+    }
     DECISION_FORM_CODE_MARKERS = {
         "102",
         "103",
@@ -102,10 +110,9 @@ class PageClassifier:
             _contains_marker(normalized, marker)
             for marker in self.DECISION_STRUCTURE_MARKERS
         )
-        supporting_structure_count = sum(
+        exclusive_structure_count = sum(
             _contains_marker(normalized, marker)
-            for marker in self.DECISION_STRUCTURE_MARKERS
-            if marker != "решение"
+            for marker in self.DECISION_EXCLUSIVE_STRUCTURE_MARKERS
         )
         form_code_count = sum(
             _contains_marker(normalized, marker)
@@ -114,7 +121,7 @@ class PageClassifier:
         has_decision_title = _contains_marker(normalized, "решение")
         has_strong_form_structure = bool(
             has_decision_title
-            and structure_count >= 2
+            and exclusive_structure_count >= 1
             and form_code_count >= 3
             and decision_score >= 8
             and difference >= 5
@@ -126,7 +133,11 @@ class PageClassifier:
             and difference >= 4
             and len(decision_reasons) >= 3
             and (
-                (has_identity and supporting_structure_count >= 1)
+                (
+                    has_identity
+                    and exclusive_structure_count >= 1
+                    and form_code_count >= 2
+                )
                 or has_strong_form_structure
             )
         )
