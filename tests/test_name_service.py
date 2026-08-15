@@ -23,6 +23,16 @@ def test_keeps_uulu_and_kyzy_constructions():
     assert service.recipient_display("Айжан кызы Нурия") == "Айжан кызы Н."
 
 
+def test_declines_male_surname_when_patronymic_is_only_initial():
+    service = NameService()
+    assert service.recipient_display("Мураканов Улан М.") == "Мураканову У. М."
+
+
+def test_declines_female_surname_when_patronymic_is_only_initial():
+    service = NameService()
+    assert service.recipient_display("Ормонова Г. Э.") == "Ормоновой Г. Э."
+
+
 def test_preserves_kyrgyz_unicode_letters():
     service = NameService()
     result = service.recipient_display("Өмүрбек уулу Үсөн")

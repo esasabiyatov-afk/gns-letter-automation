@@ -45,3 +45,172 @@ def test_official_district_removes_only_stray_edge_quote():
     assert fields.taxpayers[0].name == (
         'Общество с ограниченной ответственностью "Чардж"'
     )
+
+
+def test_official_recipient_can_have_two_name_parts():
+    text = """
+    Учреждение "Управление государственной налоговой службы по Ноокатскому
+    району Ошской области" в соответствии со статьёй 146 запрашивает информацию.
+    Наименование: Косимжонов Зухриддин Абдилрузалиевич
+    ИНН: 20111200100492
+    Период: с 01.10.2024 по 21.08.2025
+    Зам. начальника управления Жоробеков Тынчтыкбек
+    """
+
+    fields = FieldExtractor().extract_official_letter(text)
+
+    assert fields.recipient_position == "Зам. начальника управления"
+    assert fields.recipient_full_name == "Жоробеков Тынчтыкбек"
+    assert fields.confidence == 0.96
+
+
+def test_scan_recipient_can_be_prefilled_from_full_page_ocr():
+    text = """
+    === Текстовый слой PDF ===
+    Наименование: Общество с ограниченной ответственностью "Жер Компаниясы"
+    ИНН: 01412201510188
+    Период: с 14.12.2015 по 09.09.2025
+
+    === OCR изображения всей страницы ===
+    Зам. начальника управления
+    Омошев Максат Тологонович
+    """
+
+    fields = FieldExtractor().extract_scan_letter(text)
+
+    assert fields.recipient_position == "Зам. начальника управления"
+    assert fields.recipient_full_name == "Омошев Максат Тологонович"
+
+
+def test_scan_prefers_name_inn_pair_followed_by_period():
+    text = """
+    === OCR изображения всей страницы ===
+    Наименование: Ткачев Владимир Александрович
+    ИНН: 21303198400213
+    Период: с 29.04.2023 по 18.09.2025
+
+    === Дополнительная OCR-область 1 ===
+    Наименование: Ткачев Владимир Александрович
+    ИНН: 42209199214499
+
+    === Дополнительная OCR-область 2 ===
+    Наименование: Ткачев Владимир Александрович
+    ИНН: 21303198400213
+    Период: с 29.04.2023 по 18.09.2025
+    """
+
+    fields = FieldExtractor().extract_scan_letter(text)
+
+    assert [(item.name, item.inn) for item in fields.taxpayers] == [
+        ("Ткачев Владимир Александрович", "21303198400213")
+    ]
+
+
+def test_scan_does_not_use_bank_stamp_label_as_recipient_name():
+    text = """
+    Зам. начальника управления
+    Количество листов
+    """
+
+    fields = FieldExtractor().extract_scan_letter(text)
+
+    assert fields.recipient_position == "Зам. начальника управления"
+    assert fields.recipient_full_name is None
+
+
+def test_scan_uses_visible_14_digits_when_inn_label_is_damaged():
+    text = """
+    === OCR изображения всей страницы ===
+    Наименование: Общественный фонд "Бакай-Ата"
+    ПИ: 02801202010240
+    Период: с 28.01.2020 по 08.09.2025
+    """
+
+    fields = FieldExtractor().extract_scan_letter(text)
+
+    assert [(item.name, item.inn) for item in fields.taxpayers] == [
+        ('Общественный фонд "Бакай-Ата"', "02801202010240")
+    ]
+
+
+def test_scan_associates_period_before_name_with_visible_inn():
+    text = """
+    === OCR изображения всей страницы ===
+    Период: с 28.01.2020 по 08.09.2025
+    Наименование: Общественный фонд "Бакай-Ата"
+    ПИ: 02801202010240
+    """
+
+    fields = FieldExtractor().extract_scan_letter(text)
+
+    assert [(item.name, item.inn) for item in fields.taxpayers] == [
+        ('Общественный фонд "Бакай-Ата"', "02801202010240")
+    ]
+
+
+def test_scan_uses_same_visible_inn_repeated_by_independent_ocr_passes():
+    text = """
+    === Текстовый слой PDF ===
+    ИНН: 02801202010240
+    Период: с 28.01.2020 по 08.09.2025
+
+    === OCR изображения всей страницы ===
+    ПИ: 02801202010240
+    сриод: с 28.01.2020 по 08.09.2025
+    Наименование: Общественный фонд "Бакай-Ата"
+    """
+
+    fields = FieldExtractor().extract_scan_letter(text)
+
+    assert [(item.name, item.inn) for item in fields.taxpayers] == [
+        ('Общественный фонд "Бакай-Ата"', "02801202010240")
+    ]
+
+
+def test_scan_uses_damaged_inn_label_with_spaces_between_digits():
+    text = """
+    Наименование: Общественный фонд "Бакай-Ата"
+    АГИ: 0280120201 0240
+    Период: с 28.01.2020 по 08.09.2025
+    """
+
+    fields = FieldExtractor().extract_scan_letter(text)
+
+    assert fields.taxpayers[0].inn == "02801202010240"
+
+
+def test_scan_prefills_position_even_when_stamp_hides_recipient_surname():
+    text = """
+    Зам. начальника управления
+    мканов Улан Маратович
+    """
+
+    fields = FieldExtractor().extract_scan_letter(text)
+
+    assert fields.recipient_position == "Зам. начальника управления"
+    assert fields.recipient_full_name is None
+
+
+def test_scan_recovers_recipient_after_short_stamp_noise_lines():
+    text = """
+    === Дополнительная OCR-область 1 ===
+    Зам. начальника управления.
+    КО.
+    ии
+    Омурбеков Нурлан Муратович
+    """
+
+    fields = FieldExtractor().extract_scan_letter(text)
+
+    assert fields.recipient_full_name == "Омурбеков Нурлан Муратович"
+
+
+def test_scan_does_not_use_unlabelled_number_without_period_boundary():
+    text = """
+    Наименование: Общественный фонд "Бакай-Ата"
+    Служебный номер: 02801202010240
+    """
+
+    fields = FieldExtractor().extract_scan_letter(text)
+
+    assert fields.taxpayers == []

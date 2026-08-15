@@ -74,12 +74,14 @@ def test_complete_official_qr_needs_no_manual_confirmation(
     assert complete
     assert case["source_kind"] == ValueSource.QR_OFFICIAL
     assert case["fields_confirmed"] == 1
-    assert case["status"] == CaseStatus.READY_FOR_ABS
+    assert case["status"] == CaseStatus.READY_FOR_RESPONSE
+    assert case["abs_status"] == "not_found"
     assert case["employee_name"] is None
     assert case["period_start"] == "2023-04-28"
     assert case["period_end"] == "2026-07-22"
     assert taxpayers[0]["name"] == "ИП Ишен кызы Саида"
     assert taxpayers[0]["inn"] == "10207200101109"
+    assert taxpayers[0]["abs_result"] == "not_found"
     assert taxpayers[0]["manually_confirmed"] == 1
 
 
@@ -138,3 +140,73 @@ def test_stale_review_page_is_completed_when_official_qr_is_complete(
         match="уже обработана",
     ):
         workflow.confirm_page(page["id"], page_type="letter")
+
+
+def test_incomplete_official_document_is_reparsed_after_parser_update(
+    workflow, monkeypatch
+):
+    workflow.initialize_employee_profiles()
+    upload_id = "official-reparse-upload"
+    now = "2026-08-02T00:00:00+00:00"
+    official_path = workflow.settings.official_dir / "case-reparse" / "official.pdf"
+    official_path.parent.mkdir(parents=True, exist_ok=True)
+    official_path.write_bytes(b"%PDF-test")
+    workflow.db.execute(
+        """
+        INSERT INTO uploads(
+            id, original_filename, stored_path, sha256,
+            page_count, status, created_at
+        ) VALUES (?, 'packet.pdf', 'packet.pdf', ?, 1, 'needs_review', ?)
+        """,
+        (upload_id, "hash-reparse", now),
+    )
+    case_id, _ = workflow._ensure_qr_case(upload_id, "reparse-hash")
+    page_id = "official-reparse-page"
+    workflow.db.execute(
+        """
+        INSERT INTO pages(
+            id, upload_id, case_id, page_number, page_type,
+            qr_status, status, created_at, updated_at
+        ) VALUES (?, ?, ?, 1, 'letter', 'found', 'needs_review', ?, ?)
+        """,
+        (page_id, upload_id, case_id, now, now),
+    )
+    workflow.db.execute(
+        """
+        UPDATE cases
+        SET source_kind = ?, official_document_path = ?,
+            fields_confirmed = 0, official_parse_version = 0
+        WHERE id = ?
+        """,
+        (ValueSource.QR_OFFICIAL, str(official_path), case_id),
+    )
+    fields = ExtractedFields(
+        district_place="по Ноокатскому району Ошской области",
+        recipient_position="Зам. начальника управления",
+        recipient_full_name="Жоробеков Тынчтыкбек",
+        period_start="2024-10-01",
+        period_end="2025-08-21",
+        taxpayers=[
+            ExtractedTaxpayer(
+                name="Косимжонов Зухриддин Абдилрузалиевич",
+                inn="20111200100492",
+                confidence=0.96,
+            )
+        ],
+        confidence=0.96,
+    )
+    monkeypatch.setattr(workflow, "_official_text", lambda path: "official")
+    monkeypatch.setattr(
+        workflow.extractor,
+        "extract_official_letter",
+        lambda text: fields,
+    )
+
+    completed = workflow.reprocess_incomplete_official_documents()
+
+    case = workflow.get_case(case_id)
+    page = workflow.get_page(page_id)
+    assert completed == 1
+    assert case["fields_confirmed"] == 1
+    assert case["official_parse_version"] == workflow.OFFICIAL_PARSER_VERSION
+    assert page["status"] == PageStatus.COMPLETED

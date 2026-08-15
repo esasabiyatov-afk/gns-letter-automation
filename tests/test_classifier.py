@@ -1,4 +1,4 @@
-from gns_app.domain import PageType
+from gns_app.domain import PageType, VisualPageEvidence
 from gns_app.services.classifier import PageClassifier
 
 
@@ -122,4 +122,59 @@ def test_low_quality_decision_is_not_automatic_terminal():
     result = PageClassifier().classify(text, quality_score=0.2)
 
     assert result.page_type == PageType.DECISION
+    assert not result.automatic_terminal
+
+
+def test_visual_form_structure_rescues_damaged_decision_ocr():
+    text = """
+    РЕШЕНИЕ
+    О ПРЕДОСТАВЛЕНИИ ИНФОРМАЦИИ ОБ ОПЕРАЦИЯХ
+    ПРИНЯТО РЕШЕНИЕ О ПРЕДОСТАВЛЕНИИ
+    Период:
+    """
+    visual = VisualPageEvidence(
+        decision_layout=True,
+        confidence=0.95,
+        horizontal_line_groups=24,
+        vertical_line_groups=16,
+    )
+
+    result = PageClassifier().classify(text, 0.8, visual)
+
+    assert result.page_type == PageType.DECISION
+    assert result.automatic_terminal
+
+
+def test_visual_grid_alone_cannot_turn_sti_reference_into_decision():
+    visual = VisualPageEvidence(
+        decision_layout=True,
+        confidence=0.95,
+        horizontal_line_groups=24,
+        vertical_line_groups=16,
+    )
+    text = "На основании решения STI-010 запрашивает информацию"
+
+    result = PageClassifier().classify(text, 0.8, visual)
+
+    assert not result.automatic_terminal
+
+
+def test_scanner_streaks_cannot_turn_letter_into_decision():
+    visual = VisualPageEvidence(
+        decision_layout=True,
+        confidence=0.95,
+        horizontal_line_groups=11,
+        vertical_line_groups=9,
+    )
+    text = """
+    На основании Решения STI-010 запрашивает информацию.
+    О налогоплательщике:
+    Наименование: ОсОО Тест
+    ИНН: 12345678901234
+    Период: с 01.01.2024 по 01.01.2025
+    """
+
+    result = PageClassifier().classify(text, 0.8, visual)
+
+    assert result.page_type == PageType.LETTER
     assert not result.automatic_terminal

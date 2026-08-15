@@ -20,3 +20,17 @@ def test_inbox_imports_new_pdf_and_skips_duplicate(
     assert not first["errors"]
     assert not second["imported"]
     assert second["skipped"] == ["Новое письмо.PDF"]
+
+    old_response = workflow.settings.responses_dir / "old-response.docx"
+    old_response.write_bytes(b"old")
+    reset = workflow.reset_processing_data()
+
+    assert reset["uploads"] == 1
+    assert not reset["cleanup_errors"]
+    assert inbox_file.exists()
+    assert not old_response.exists()
+    assert not workflow.list_uploads()
+
+    third = workflow.import_inbox()
+    assert len(third["imported"]) == 1
+    assert not third["skipped"]

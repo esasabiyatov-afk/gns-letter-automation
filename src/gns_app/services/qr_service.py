@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 
 import zxingcpp
 from PIL import Image, ImageEnhance, ImageOps
+from pyzbar.pyzbar import ZBarSymbol, decode as zbar_decode
 
 from gns_app.domain import QrDecodeResult, QrStatus
 
@@ -22,6 +23,7 @@ class QrService:
     def decode(self, image_path: Path) -> QrDecodeResult:
         image = Image.open(image_path).convert("L")
         deferred_result: QrDecodeResult | None = None
+        zxing_candidate: tuple[str, str] | None = None
 
         attempts: list[tuple[str, Image.Image, zxingcpp.Binarizer]] = [
             ("original", image, zxingcpp.Binarizer.LocalAverage),
@@ -35,10 +37,21 @@ class QrService:
         for method, candidate, binarizer in attempts:
             result = self._try_decode(candidate, method, binarizer)
             if result:
-                validated = self._validate(result[0], result[1])
-                if validated.status == QrStatus.FOUND:
-                    return validated
-                deferred_result = deferred_result or validated
+                zxing_candidate = result
+                break
+
+        # ZBar uses a different grid sampler and is materially more tolerant of
+        # low-resolution scan jitter.  It receives the untouched grayscale
+        # image: no reconstructed or generated pixels are introduced.
+        zbar_candidate = self._try_decode_zbar(image, "zbar-original")
+        validated = self._validate_decoder_candidates(
+            zxing_candidate,
+            zbar_candidate,
+        )
+        if validated:
+            if validated.status in {QrStatus.FOUND, QrStatus.DECODE_ERROR}:
+                return validated
+            deferred_result = validated
 
         width, height = image.size
         crop = image.crop(
@@ -166,6 +179,83 @@ class QrService:
             issue="QR не найден или повреждён. Требуется OCR/ручная проверка.",
         )
 
+    def decode_high_resolution(self, image_path: Path) -> QrDecodeResult:
+        """A bounded retry for a genuine high-resolution PDF render."""
+        image = Image.open(image_path).convert("L")
+        deferred_result: QrDecodeResult | None = None
+        zxing_candidate = self._try_decode(
+            image,
+            "highres-original",
+            zxingcpp.Binarizer.LocalAverage,
+        )
+        zbar_candidate = self._try_decode_zbar(
+            image,
+            "zbar-highres-original",
+        )
+        validated = self._validate_decoder_candidates(
+            zxing_candidate,
+            zbar_candidate,
+        )
+        if validated:
+            if validated.status in {QrStatus.FOUND, QrStatus.DECODE_ERROR}:
+                return validated
+            deferred_result = validated
+        width, height = image.size
+        crop = image.crop(
+            (
+                int(width * 0.60),
+                int(height * 0.52),
+                width,
+                int(height * 0.98),
+            )
+        )
+        variants = (
+            ("highres-crop", crop),
+            (
+                "highres-crop-autocontrast",
+                ImageOps.autocontrast(crop, cutoff=1),
+            ),
+            (
+                "highres-crop-contrast",
+                ImageEnhance.Contrast(crop).enhance(1.8),
+            ),
+        )
+        for name, variant in variants:
+            for binarizer in (
+                zxingcpp.Binarizer.LocalAverage,
+                zxingcpp.Binarizer.GlobalHistogram,
+                zxingcpp.Binarizer.FixedThreshold,
+            ):
+                result = self._try_decode(variant, name, binarizer)
+                if result:
+                    validated = self._validate(result[0], result[1])
+                    if validated.status == QrStatus.FOUND:
+                        return validated
+                    deferred_result = deferred_result or validated
+            for threshold in (110, 140, 170, 200, 220):
+                binary = variant.point(
+                    lambda pixel, limit=threshold: (
+                        255 if pixel > limit else 0
+                    )
+                ).resize(
+                    (variant.width * 2, variant.height * 2),
+                    Image.Resampling.NEAREST,
+                )
+                result = self._try_decode(
+                    binary,
+                    f"{name}-threshold-{threshold}",
+                    zxingcpp.Binarizer.BoolCast,
+                )
+                if result:
+                    validated = self._validate(result[0], result[1])
+                    if validated.status == QrStatus.FOUND:
+                        return validated
+                    deferred_result = deferred_result or validated
+        return deferred_result or QrDecodeResult(
+            status=QrStatus.NOT_FOUND,
+            issue="QR не найден и на повышенном разрешении.",
+        )
+
     @staticmethod
     def _try_decode(
         image: Image.Image,
@@ -191,6 +281,53 @@ class QrService:
         if len(payloads) > 1:
             # Несколько разных QR нельзя выбирать по догадке.
             return "", "multiple-values"
+        return None
+
+    def _validate_decoder_candidates(
+        self,
+        zxing_candidate: tuple[str, str] | None,
+        zbar_candidate: tuple[str, str] | None,
+    ) -> QrDecodeResult | None:
+        if zxing_candidate and zbar_candidate:
+            if (
+                not zxing_candidate[0]
+                or not zbar_candidate[0]
+                or zxing_candidate[0] != zbar_candidate[0]
+            ):
+                return QrDecodeResult(
+                    status=QrStatus.DECODE_ERROR,
+                    method="zxing-zbar-conflict",
+                    issue=(
+                        "QR-декодеры получили разные значения. "
+                        "Требуется ручная проверка."
+                    ),
+                )
+            return self._validate(
+                zxing_candidate[0],
+                f"{zxing_candidate[1]}+{zbar_candidate[1]}",
+            )
+        candidate = zxing_candidate or zbar_candidate
+        if candidate:
+            return self._validate(candidate[0], candidate[1])
+        return None
+
+    @staticmethod
+    def _try_decode_zbar(
+        image: Image.Image,
+        method: str,
+    ) -> tuple[str, str] | None:
+        payloads: set[str] = set()
+        for symbol in zbar_decode(image, symbols=[ZBarSymbol.QRCODE]):
+            try:
+                payload = symbol.data.decode("utf-8", errors="strict").strip()
+            except UnicodeDecodeError:
+                continue
+            if payload:
+                payloads.add(payload)
+        if len(payloads) == 1:
+            return payloads.pop(), method
+        if len(payloads) > 1:
+            return "", "multiple-values-zbar"
         return None
 
     def _validate(self, payload: str, method: str) -> QrDecodeResult:

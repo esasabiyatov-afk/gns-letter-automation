@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
+from datetime import date
 from pathlib import Path
 from urllib.parse import quote
 
@@ -14,7 +16,12 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -22,10 +29,12 @@ from gns_app.config import settings
 from gns_app.database import Database
 from gns_app.services.storage import StorageError, ensure_within
 from gns_app.services.registry_service import RegistryLookupError
+from gns_app.services.taxpayer_service import TaxpayerKind, classify_taxpayer
 from gns_app.services.workflow import (
     WorkflowService,
     WorkflowValidationError,
 )
+from gns_app.text_cleanup import clean_taxpayer_name
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -33,14 +42,31 @@ db = Database(settings.database_path)
 workflow = WorkflowService(db, settings)
 
 
+async def _resume_interrupted_uploads(upload_ids: list[str]) -> None:
+    for upload_id in upload_ids:
+        await asyncio.to_thread(
+            workflow.process_upload,
+            upload_id,
+            True,
+        )
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     settings.ensure_directories()
     db.initialize()
     workflow.initialize_employee_profiles()
+    workflow.initialize_gns_offices()
+    workflow.reconcile_gns_office_hints()
+    workflow.reconcile_structured_ocr_hints()
+    workflow.reconcile_recipient_display_names()
+    workflow.reprocess_incomplete_official_documents()
     workflow.reconcile_official_qr_pages()
     workflow.reconcile_confident_scan_decisions()
     workflow.repair_cleaned_responses()
+    resume_ids = workflow.interrupted_upload_ids()
+    if resume_ids:
+        asyncio.create_task(_resume_interrupted_uploads(resume_ids))
     yield
 
 
@@ -142,6 +168,8 @@ REGISTRY_STATUS_LABELS = {
     "not_found": "ИНН не найден",
     "multiple": "несколько совпадений",
     "error": "сверка недоступна",
+    "not_applicable": "не применяется к ИП/физлицу",
+    "classification_uncertain": "нужно уточнить вид налогоплательщика",
 }
 
 EVENT_LABELS = {
@@ -160,13 +188,23 @@ EVENT_LABELS = {
     "official_document_processed": "Официальная версия обработана",
     "page_manually_confirmed": "Страница подтверждена сотрудником",
     "fake_abs_checked": "Выполнена тестовая проверка АБС",
+    "fake_abs_startup_rolled_back": "Отменена массовая автопроверка АБС",
     "fake_abs_batch_checked": "Выполнена пакетная проверка АБС",
     "odb_checked": "Записана ручная проверка ОДБ",
+    "processing_data_reset": "Сброшены данные обработки",
     "registry_checked": "Выполнена сверка с ОсОО.KG",
     "registry_variance_accepted": "Подтверждены расхождения ОсОО.KG",
     "inbox_scanned": "Просканирована папка входящих",
     "gns_offices_replaced": "Обновлён справочник налоговых органов",
+    "gns_office_location_expanded": "Район дополнен областью или городом",
     "gns_office_suggested": "Предложен налоговый орган по OCR",
+    "ocr_recipient_suggested": "Предложены должность и ФИО по OCR",
+    "ocr_period_suggested": "Предложен период по OCR",
+    "ocr_taxpayers_suggested": "Предложены налогоплательщики по OCR",
+    "ocr_taxpayer_name_conflict": "OCR расходится в наименовании по одному ИНН",
+    "ocr_high_resolution_render_failed": (
+        "Не удалось подготовить высокое разрешение для OCR"
+    ),
     "decision_without_letter_review_required": (
         "Решение остановлено: письмо не найдено"
     ),
@@ -186,6 +224,7 @@ EVENT_LABELS = {
     ),
     "employee_profile_added": "Добавлен исполнитель",
     "active_employee_selected": "Выбран активный исполнитель",
+    "review_interface_settings_updated": "Обновлены настройки ручной проверки",
 }
 
 ENTITY_LABELS = {
@@ -230,10 +269,31 @@ def context(request: Request, **values):
         "entity_labels": ENTITY_LABELS,
         "taxpayer_word": taxpayer_word,
         "case_word": case_word,
-        "threshold": settings.period_threshold.isoformat(),
+        "threshold": workflow.get_period_threshold().isoformat(),
         "active_employee": active_employee,
         "employee_profiles": workflow.list_employee_profiles(),
+        "ui_preferences": workflow.get_ui_preferences(),
+        "abs_session_active": workflow.abs_session_active(),
         **values,
+    }
+
+
+def period_review_status(case: dict) -> dict[str, object]:
+    route = str(case.get("period_route") or "")
+    if route in {"odb", "no_odb"}:
+        return {"complete": True, "requires_odb": route == "odb"}
+    start_text = str(case.get("period_start") or "")
+    end_text = str(case.get("period_end") or "")
+    if not start_text or not end_text:
+        return {"complete": False, "requires_odb": None}
+    try:
+        start = date.fromisoformat(start_text)
+        date.fromisoformat(end_text)
+    except ValueError:
+        return {"complete": False, "requires_odb": None}
+    return {
+        "complete": True,
+        "requires_odb": start < workflow.get_period_threshold(),
     }
 
 
@@ -247,7 +307,7 @@ def index(request: Request, message: str = "", error: str = ""):
             stats=workflow.dashboard_stats(),
             uploads=workflow.list_uploads()[:12],
             cases=workflow.list_cases()[:8],
-            inbox_dir=str(settings.inbox_dir),
+            inbox_dir=str(workflow.get_inbox_dir()),
             message=message,
             error=error,
         ),
@@ -312,10 +372,155 @@ def registry_lookup(
     )
 
 
+@app.get("/api/registry/suggestion")
+def registry_suggestion(inn: str = "", name: str = ""):
+    """Return a local, non-destructive ОсОО.KG hint for one entered INN."""
+    digits = "".join(character for character in inn if character.isdigit())
+    if len(digits) != 14:
+        return {
+            "status": "invalid",
+            "message": "Для сверки нужно ввести ровно 14 цифр ИНН.",
+        }
+
+    taxpayer_kind = classify_taxpayer(name, digits)
+    if taxpayer_kind == TaxpayerKind.INDIVIDUAL:
+        return {
+            "status": "not_applicable",
+            "message": "",
+        }
+    if taxpayer_kind == TaxpayerKind.UNKNOWN:
+        message = "Вид налогоплательщика нельзя определить без догадки."
+        if digits.startswith("4"):
+            message = (
+                "ИНН на 4 неоднозначен. Укажите наименование и форму "
+                "организации, если это филиал или представительство."
+            )
+        return {"status": "classification_uncertain", "message": message}
+
+    try:
+        result = workflow.lookup_registry(digits)
+    except RegistryLookupError as exc:
+        return {"status": "error", "message": str(exc)}
+
+    if result.status == "found" and result.official_name:
+        return {
+            "status": "found",
+            "official_name": clean_taxpayer_name(result.official_name),
+            "director": result.director or "",
+            "message": "Найдена запись в ОсОО.KG.",
+        }
+    if result.status == "multiple":
+        return {
+            "status": "multiple",
+            "message": "ОсОО.KG вернул несколько записей; нужна проверка.",
+        }
+    return {
+        "status": "not_found",
+        "message": "ОсОО.KG не нашёл запись по этому ИНН.",
+    }
+
+
+@app.get("/api/recipient-display")
+def recipient_display_suggestion(full_name: str = ""):
+    return {"display_name": workflow.names.recipient_display(full_name)}
+
+
+@app.get("/api/recipient-suggestions")
+def recipient_suggestions(query: str = ""):
+    return {"items": workflow.recipient_suggestions(query)}
+
+
+@app.get("/settings", response_class=HTMLResponse)
+def settings_page(request: Request, message: str = "", error: str = ""):
+    return templates.TemplateResponse(
+        request,
+        "settings.html",
+        context(
+            request,
+            inbox_dir=str(workflow.get_inbox_dir()),
+            message=message,
+            error=error,
+        ),
+    )
+
+
+@app.post("/settings")
+def update_settings(
+    allow_multiple_taxpayers: bool = Form(False),
+    require_review_checkbox: bool = Form(False),
+    period_threshold: str = Form(...),
+    inbox_dir: str = Form(...),
+):
+    try:
+        workflow.update_ui_preferences(
+            allow_multiple_taxpayers=allow_multiple_taxpayers,
+            show_recipient_salutation=True,
+            require_review_checkbox=require_review_checkbox,
+        )
+        workflow.update_operational_settings(
+            period_threshold=period_threshold,
+            inbox_dir=inbox_dir,
+        )
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            "/settings?error=" + quote(str(exc)),
+            status_code=303,
+        )
+    return RedirectResponse(
+        "/settings?message=" + quote("Настройки сохранены."),
+        status_code=303,
+    )
+
+
+@app.post("/settings/reset-processing")
+def reset_processing_data(
+    background_tasks: BackgroundTasks,
+    action: str = Form(...),
+):
+    if action not in {"clear", "rescan"}:
+        return RedirectResponse(
+            "/settings?error=" + quote("Неизвестный вариант сброса."),
+            status_code=303,
+        )
+    try:
+        summary = workflow.reset_processing_data()
+        imported: list[str] = []
+        errors: list[dict[str, str]] = []
+        if action == "rescan":
+            inbox_summary = workflow.import_inbox(max_files=10_000)
+            imported = inbox_summary["imported"]
+            errors = inbox_summary["errors"]
+            for upload_id in imported:
+                background_tasks.add_task(workflow.process_upload, upload_id)
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            "/settings?error=" + quote(str(exc)),
+            status_code=303,
+        )
+
+    if action == "rescan":
+        message = (
+            f"Обработка сброшена. Заново загружено PDF: {len(imported)}; "
+            f"ошибок: {len(errors)}."
+        )
+        destination = "/"
+    else:
+        message = (
+            "Данные обработки очищены. Исходные PDF в папке входящих сохранены."
+        )
+        destination = "/settings"
+    if summary["cleanup_errors"]:
+        message += " Некоторые старые служебные файлы заняты другой программой."
+    return RedirectResponse(
+        f"{destination}?message={quote(message)}",
+        status_code=303,
+    )
+
+
 @app.post("/today/abs")
 def abs_check_today(
-    username: str = Form(...),
-    password: str = Form(...),
+    username: str = Form(""),
+    password: str = Form(""),
 ):
     try:
         summary = workflow.check_abs_today(username, password)
@@ -337,9 +542,15 @@ def abs_check_today(
 
 
 @app.post("/today/responses/{group_key}")
-def create_grouped_response(group_key: str):
+def create_grouped_response(
+    group_key: str,
+    taxpayers_per_page: int = Form(0),
+):
     try:
-        group_id, _ = workflow.generate_daily_response(group_key)
+        group_id, _ = workflow.generate_daily_response(
+            group_key,
+            taxpayers_per_page=taxpayers_per_page or None,
+        )
     except (WorkflowValidationError, ValueError) as exc:
         return RedirectResponse(
             f"/today?error={quote(str(exc))}",
@@ -566,11 +777,16 @@ def reprocess_page(
 
 
 @app.get("/review", response_class=HTMLResponse)
-def review_queue(request: Request):
+def review_queue(request: Request, message: str = "", error: str = ""):
     return templates.TemplateResponse(
         request,
         "review_queue.html",
-        context(request, pages=workflow.list_review_pages()),
+        context(
+            request,
+            pages=workflow.list_review_pages(),
+            message=message,
+            error=error,
+        ),
     )
 
 
@@ -606,6 +822,7 @@ def review_page(request: Request, page_id: str, error: str = ""):
             taxpayers=taxpayers,
             upload=upload or {},
             gns_offices=workflow.list_gns_offices(),
+            period_status=period_review_status(case or {}),
             error=error,
         ),
     )
@@ -621,11 +838,13 @@ def confirm_review(
     recipient_display_name: str = Form(""),
     period_start: str = Form(""),
     period_end: str = Form(""),
+    period_route: str = Form(""),
     employee_name: str = Form(""),
     critical_fields_verified: bool = Form(False),
     taxpayer_name: list[str] = Form(default=[]),
     taxpayer_inn: list[str] = Form(default=[]),
 ):
+    preferences = workflow.get_ui_preferences()
     taxpayers = [
         {"name": name, "inn": inn}
         for name, inn in zip(taxpayer_name, taxpayer_inn, strict=False)
@@ -641,9 +860,13 @@ def confirm_review(
             recipient_display_name=recipient_display_name,
             period_start=period_start,
             period_end=period_end,
+            period_route=period_route,
             employee_name=employee_name,
             taxpayers=taxpayers,
-            critical_fields_verified=critical_fields_verified,
+            critical_fields_verified=(
+                critical_fields_verified
+                or not preferences["require_review_checkbox"]
+            ),
         )
     except WorkflowValidationError as exc:
         return RedirectResponse(
@@ -653,6 +876,26 @@ def confirm_review(
     if case_id:
         return RedirectResponse(f"/cases/{case_id}", status_code=303)
     return RedirectResponse("/review", status_code=303)
+
+
+@app.post("/review/{page_id}/type")
+def mark_review_page_type(
+    page_id: str,
+    page_type: str = Form(...),
+):
+    try:
+        removed = workflow.mark_page_type_from_queue(page_id, page_type)
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            "/review?error=" + quote(str(exc)),
+            status_code=303,
+        )
+    if removed:
+        return RedirectResponse(
+            "/review?message=" + quote("Тип страницы подтверждён."),
+            status_code=303,
+        )
+    return RedirectResponse(f"/review/{page_id}", status_code=303)
 
 
 @app.get("/cases", response_class=HTMLResponse)
@@ -690,7 +933,8 @@ def case_detail(request: Request, case_id: str, message: str = "", error: str = 
                 case["source_kind"] != "qr_official"
                 and any(
                     item.get("registry_status")
-                    and item.get("registry_status") != "match"
+                    and item.get("registry_status")
+                    not in {"match", "not_applicable"}
                     for item in taxpayers
                 )
             ),
@@ -706,8 +950,8 @@ def case_detail(request: Request, case_id: str, message: str = "", error: str = 
 @app.post("/cases/{case_id}/abs")
 def abs_check(
     case_id: str,
-    username: str = Form(...),
-    password: str = Form(...),
+    username: str = Form(""),
+    password: str = Form(""),
 ):
     try:
         result = workflow.check_abs(case_id, username, password)
@@ -746,6 +990,7 @@ def odb_check(
     case_id: str,
     taxpayer_inn: list[str] = Form(default=[]),
     odb_result: list[str] = Form(default=[]),
+    return_to: str = Form(default=""),
 ):
     results = [
         {"inn": inn, "result": result}
@@ -758,8 +1003,9 @@ def odb_check(
     try:
         next_status = workflow.confirm_odb(case_id, results)
     except WorkflowValidationError as exc:
+        destination = "/today" if return_to == "ready" else f"/cases/{case_id}"
         return RedirectResponse(
-            f"/cases/{case_id}?error={quote(str(exc))}",
+            f"{destination}?error={quote(str(exc))}",
             status_code=303,
         )
     message = (
@@ -767,10 +1013,37 @@ def odb_check(
         if next_status == "ready_for_response"
         else "ОДБ проверена. Найденные записи оставлены для ручной обработки."
     )
+    destination = "/today" if return_to == "ready" else f"/cases/{case_id}"
     return RedirectResponse(
-        f"/cases/{case_id}?message={quote(message)}",
+        f"{destination}?message={quote(message)}",
         status_code=303,
     )
+
+
+@app.post("/cases/{case_id}/odb/taxpayer")
+def odb_check_taxpayer(
+    case_id: str,
+    taxpayer_inn: str = Form(...),
+    odb_result: str = Form(...),
+):
+    try:
+        result = workflow.confirm_odb_taxpayer(
+            case_id,
+            taxpayer_inn,
+            odb_result,
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+    except WorkflowValidationError as exc:
+        return JSONResponse(
+            {"ok": False, "error": str(exc)},
+            status_code=422,
+        )
+    message = (
+        "Найден в ОДБ — передан в ручной ответ."
+        if result["result"] == "found"
+        else "Не найден в ОДБ — проверка сохранена."
+    )
+    return {"ok": True, **result, "message": message}
 
 
 @app.post("/cases/{case_id}/response")

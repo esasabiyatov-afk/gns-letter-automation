@@ -1,5 +1,5 @@
 from gns_app.database import utc_now
-from gns_app.domain import PageStatus
+from gns_app.domain import PageStatus, VisualPageEvidence
 
 
 def _insert_upload(workflow, upload_id: str):
@@ -66,6 +66,43 @@ def test_confident_decision_without_any_letter_requires_review(workflow):
     assert changed == 1
     assert page["status"] == PageStatus.NEEDS_REVIEW
     assert page["issue_code"] == "confirmed_letter_missing"
+
+
+def test_decision_can_be_removed_directly_from_review_queue(workflow):
+    _insert_upload(workflow, "queue-decision")
+    _insert_page(
+        workflow,
+        "queue-decision-page",
+        "queue-decision",
+        1,
+        "unknown",
+        "needs_review",
+    )
+    now = utc_now()
+    workflow.db.execute(
+        """
+        INSERT INTO cases(id, upload_id, status, source_kind,
+                          fields_confirmed, created_at, updated_at)
+        VALUES ('queue-draft-case', 'queue-decision', 'needs_review',
+                'ocr_scan', 0, ?, ?)
+        """,
+        (now, now),
+    )
+    workflow.db.execute(
+        "UPDATE pages SET case_id = 'queue-draft-case' "
+        "WHERE id = 'queue-decision-page'"
+    )
+
+    removed = workflow.mark_page_type_from_queue(
+        "queue-decision-page", "decision"
+    )
+
+    assert removed
+    page = workflow.get_page("queue-decision-page")
+    assert page["page_type"] == "decision"
+    assert page["status"] == PageStatus.MANUALLY_CONFIRMED
+    assert page["case_id"] is None
+    assert workflow.get_case("queue-draft-case") is None
 
 
 def test_confident_decision_does_not_block_packet_with_letter(workflow):
@@ -190,3 +227,106 @@ def test_completed_scan_decision_is_reopened_if_rule_is_not_safe(workflow):
     assert changed == 1
     assert page["status"] == PageStatus.NEEDS_REVIEW
     assert page["issue_code"] == "decision_type_not_confident"
+
+
+def test_unknown_visual_decision_is_removed_from_review(
+    workflow, monkeypatch
+):
+    decision_text = """
+    РЕШЕНИЕ
+    О ПРЕДОСТАВЛЕНИИ ИНФОРМАЦИИ ОБ ОПЕРАЦИЯХ
+    ПРИНЯТО РЕШЕНИЕ О ПРЕДОСТАВЛЕНИИ
+    Период:
+    """
+    _insert_upload(workflow, "visual-packet")
+    _insert_page(
+        workflow,
+        "visual-letter",
+        "visual-packet",
+        1,
+        "letter",
+        "completed",
+    )
+    _insert_page(
+        workflow,
+        "visual-decision",
+        "visual-packet",
+        2,
+        "unknown",
+        "needs_review",
+        text=decision_text,
+    )
+    monkeypatch.setattr(
+        workflow,
+        "_visual_evidence_for_page",
+        lambda page: VisualPageEvidence(
+            decision_layout=True,
+            confidence=0.95,
+            horizontal_line_groups=24,
+            vertical_line_groups=16,
+        ),
+    )
+
+    changed = workflow.reconcile_confident_scan_decisions("visual-packet")
+    page = workflow.get_page("visual-decision")
+
+    assert changed == 1
+    assert page["page_type"] == "decision"
+    assert page["status"] == PageStatus.COMPLETED
+    assert page["issue_code"] is None
+
+
+def test_header_ocr_evidence_is_persisted_for_rotated_decision(
+    workflow, monkeypatch, tmp_path
+):
+    _insert_upload(workflow, "rotated-packet")
+    _insert_page(
+        workflow,
+        "rotated-letter",
+        "rotated-packet",
+        1,
+        "letter",
+        "completed",
+    )
+    _insert_page(
+        workflow,
+        "rotated-decision",
+        "rotated-packet",
+        2,
+        "unknown",
+        "needs_review",
+        text="",
+    )
+    preview = tmp_path / "rotated.jpg"
+    preview.write_bytes(b"preview")
+    monkeypatch.setattr(
+        workflow,
+        "_visual_evidence_for_page",
+        lambda page: VisualPageEvidence(
+            decision_layout=True,
+            confidence=0.95,
+            horizontal_line_groups=20,
+            vertical_line_groups=8,
+        ),
+    )
+    monkeypatch.setattr(
+        workflow,
+        "_preview_path_for_page",
+        lambda page: preview,
+    )
+    monkeypatch.setattr(
+        workflow.ocr,
+        "recognize_type_markers",
+        lambda path: (
+            "РЕШЕНИЕ. Проводимых на счетах организаций"
+        ),
+    )
+
+    changed = workflow.reconcile_confident_scan_decisions("rotated-packet")
+    page = workflow.get_page("rotated-decision")
+
+    assert changed == 1
+    assert page["page_type"] == "decision"
+    assert page["status"] == PageStatus.COMPLETED
+    assert page["type_evidence_method"] == "local_header_ocr"
+    assert "РЕШЕНИЕ" in page["type_evidence_text"]

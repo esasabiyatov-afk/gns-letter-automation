@@ -108,6 +108,9 @@ class OcrResult:
     language: str
     issue: str | None = None
     critical_fields_agree: bool = False
+    taxpayer_fields_agree: bool = False
+    period_fields_agree: bool = False
+    recipient_fields_agree: bool = False
 
 
 @dataclass(slots=True)
@@ -116,6 +119,16 @@ class ClassificationResult:
     confidence: float
     reasons: list[str] = field(default_factory=list)
     automatic_terminal: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class VisualPageEvidence:
+    decision_layout: bool
+    confidence: float
+    horizontal_line_groups: int = 0
+    vertical_line_groups: int = 0
+    ink_density: float = 0.0
+    reasons: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)

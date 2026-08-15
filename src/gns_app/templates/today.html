@@ -1,13 +1,13 @@
 {% extends "base.html" %}
-{% block title %}Сегодня · Автоматизатор писем{% endblock %}
+{% block title %}Готовые ответы · Автоматизатор писем{% endblock %}
 {% block content %}
 <div class="page-heading">
   <div>
     <a class="back-link" href="/">← Главная</a>
-    <p class="eyebrow">РАБОТА ЗА {{ overview.business_date }}</p>
-    <h1>Проверка и общие ответы</h1>
+    <p class="eyebrow">ВСЕ ПОДТВЕРЖДЁННЫЕ ПИСЬМА</p>
+    <h1>Готовые ответы</h1>
     <p>
-      QR-письма уже подтверждены. Одним запросом проверьте готовые обращения
+      Дата загрузки не ограничивает обработку. Одним запросом проверьте все готовые обращения
       в АБС; старые периоды после этого будут направлены на проверку ОДБ.
     </p>
   </div>
@@ -45,8 +45,12 @@
     {% if overview.ready_abs %}
       <h2>Проверить все готовые обращения в АБС</h2>
       <p>
-        Логин и пароль вводятся один раз для текущего пакета, не сохраняются
-        и не записываются в журнал.
+        {% if abs_session_active %}
+          Сеанс АБС активен: повторный логин не требуется.
+        {% else %}
+          Введите логин и пароль один раз. Они живут только в памяти до ошибки АБС
+          или перезапуска приложения и не записываются в журнал.
+        {% endif %}
       </p>
     {% else %}
       <h2>Все готовые обращения уже проверены</h2>
@@ -54,10 +58,18 @@
     {% endif %}
   </div>
   {% if overview.ready_abs %}
-    <button class="button button-primary" type="button"
-            data-open-dialog="today-abs-dialog">
-      Проверить {{ overview.ready_abs }} в АБС
-    </button>
+    {% if abs_session_active %}
+      <form method="post" action="/today/abs">
+        <button class="button button-primary" type="submit">
+          Проверить {{ overview.ready_abs }} в АБС
+        </button>
+      </form>
+    {% else %}
+      <button class="button button-primary" type="button"
+              data-open-dialog="today-abs-dialog">
+        Войти и проверить {{ overview.ready_abs }} в АБС
+      </button>
+    {% endif %}
   {% endif %}
 </section>
 
@@ -75,23 +87,49 @@
       <p class="eyebrow">СТАРАЯ БАЗА ДО {{ threshold }}</p>
       <h2>Проверить в ОДБ</h2>
       <p>
-        Эти обращения уже прошли АБС. Откройте карточку и вручную отметьте
-        результат проверки старой базы ОДБ.
+        Эти обращения уже прошли АБС. Отметьте результат проверки старой
+        базы ОДБ сразу в списке.
       </p>
     </div>
   </div>
   <div class="odb-case-list">
   {% for item in overview.odb_cases %}
-    <a href="/cases/{{ item.id }}">
-      <div>
-        <strong>{{ item.recipient_display_name }}</strong>
-        <span>{{ item.district_place }}</span>
+    <article class="odb-quick-form" data-odb-case>
+      <div class="odb-quick-heading">
+        <div>
+          <strong>{{ item.recipient_display_name }}</strong>
+          <span>{{ item.district_place }}</span>
+        </div>
+        <a class="text-link" href="/cases/{{ item.id }}">Открыть карточку</a>
       </div>
-      <small>
-        {{ item.taxpayer_count }} {{ taxpayer_word(item.taxpayer_count) }} ·
-        период с {{ item.period_start }}
-      </small>
-    </a>
+      <div class="odb-quick-taxpayers">
+      {% for taxpayer in item.taxpayers %}
+        <div class="odb-quick-row" data-odb-row
+             data-odb-url="/cases/{{ item.id }}/odb/taxpayer">
+          <div class="odb-quick-person">
+            <strong>{{ taxpayer.name }}</strong>
+            <small>ПИН/ИНН {{ taxpayer.inn }}</small>
+            <input type="hidden" name="taxpayer_inn"
+                   value="{{ taxpayer.inn }}">
+          </div>
+          <div class="odb-result-buttons" aria-label="Результат ОДБ">
+            <button type="button" class="odb-result-button is-found"
+                    data-odb-result="found"
+                    title="Есть в ОДБ">✓ Есть</button>
+            <button type="button" class="odb-result-button is-not-found"
+                    data-odb-result="not_found"
+                    title="Нет в ОДБ">× Нет</button>
+          </div>
+        </div>
+      {% endfor %}
+      </div>
+      <div class="odb-quick-actions">
+        <small>
+          {% if item.period_start %}Период с {{ item.period_start }}
+          {% else %}Маршрут ОДБ выбран сотрудником{% endif %}
+        </small>
+      </div>
+    </article>
   {% endfor %}
   </div>
 </section>
@@ -131,6 +169,11 @@
               {{ taxpayer.name }}
             </a>
             <strong>ИНН {{ taxpayer.inn }}</strong>
+            {% if taxpayer.source_page_id %}
+              <a class="letter-pdf-link"
+                 href="/pages/{{ taxpayer.source_page_id }}/pdf"
+                 target="_blank">Открыть письмо</a>
+            {% endif %}
           </li>
         {% endfor %}
         </ol>
@@ -146,6 +189,11 @@
                   {{ taxpayer.name }}
                 </a>
                 <strong>ИНН {{ taxpayer.inn }}</strong>
+                {% if taxpayer.source_page_id %}
+                  <a class="letter-pdf-link"
+                     href="/pages/{{ taxpayer.source_page_id }}/pdf"
+                     target="_blank">Открыть письмо</a>
+                {% endif %}
               </li>
             {% endfor %}
             </ol>
@@ -157,6 +205,13 @@
           </div>
         {% endif %}
         <form method="post" action="/today/responses/{{ group.group_key }}">
+          <label class="field response-split-field">
+            <span>Лиц на одной странице</span>
+            <input type="number" name="taxpayers_per_page" min="1"
+                   max="{{ group.taxpayer_count }}"
+                   value="{{ group.taxpayer_count }}">
+            <small>Меньшее число создаст в том же Word несколько отдельных писем с новой шапкой.</small>
+          </label>
           <button class="button button-primary" type="submit"
                   {% if not group.can_generate %}disabled{% endif %}>
             Создать общий Word
@@ -176,11 +231,10 @@
   <div class="panel-heading">
     <div>
       <p class="eyebrow">НАЙДЕНЫ В АБС ИЛИ ОДБ</p>
-      <h2>Отдельные группы для ручного ответа</h2>
+      <h2>Список для ручного ответа</h2>
       <p>
-        Шаблон «счетов нет» к ним не применяется. Здесь показаны только
-        найденные лица, уже отсортированные по адресату. Для них нужен
-        отдельный утверждённый шаблон ответа.
+        Эти лица найдены в АБС или ОДБ. Ответ сотрудник пишет вручную в Word;
+        приложение только показывает список, отсортированный по адресату.
       </p>
     </div>
   </div>
@@ -196,40 +250,25 @@
           <span>{{ group.taxpayer_count }} {{ taxpayer_word(group.taxpayer_count) }}</span>
         </div>
         <ol class="group-taxpayers compact-taxpayers">
-        {% for taxpayer in group.taxpayers[:2] %}
+        {% for taxpayer in group.taxpayers %}
           <li>
             <a href="/cases/{{ taxpayer.source_case_id }}">
               {{ taxpayer.name }}
             </a>
             <strong>ИНН {{ taxpayer.inn }}</strong>
+            {% if taxpayer.source_page_id %}
+              <a class="letter-pdf-link"
+                 href="/pages/{{ taxpayer.source_page_id }}/pdf"
+                 target="_blank">Открыть письмо</a>
+            {% endif %}
           </li>
         {% endfor %}
         </ol>
-        {% if group.taxpayer_count > 2 %}
-          <details class="group-more">
-            <summary>
-              Показать ещё {{ group.taxpayer_count - 2 }}
-            </summary>
-            <ol class="group-taxpayers" start="3">
-            {% for taxpayer in group.taxpayers[2:] %}
-              <li>
-                <a href="/cases/{{ taxpayer.source_case_id }}">
-                  {{ taxpayer.name }}
-                </a>
-                <strong>ИНН {{ taxpayer.inn }}</strong>
-              </li>
-            {% endfor %}
-            </ol>
-          </details>
-        {% endif %}
-        <div class="group-issues">
-          <p>Нужен отдельный утверждённый шаблон ответа.</p>
-        </div>
       </article>
     {% endfor %}
     </div>
   {% else %}
-    <div class="empty-state">Найденных в АБС или ОДБ лиц за сегодня нет.</div>
+    <div class="empty-state">Найденных в АБС или ОДБ лиц нет.</div>
   {% endif %}
 </section>
 
@@ -237,7 +276,7 @@
   <div class="panel-heading">
     <div>
       <p class="eyebrow">ГОТОВЫЕ ФАЙЛЫ</p>
-      <h2>Созданные сегодня общие ответы</h2>
+      <h2>Созданные общие ответы</h2>
     </div>
   </div>
   {% if overview.generated_groups %}
@@ -255,7 +294,7 @@
     {% endfor %}
     </div>
   {% else %}
-    <div class="empty-state">Общие ответы за сегодня ещё не создавались.</div>
+    <div class="empty-state">Общие ответы ещё не создавались.</div>
   {% endif %}
 </section>
 
@@ -264,13 +303,13 @@
     <div class="modal-heading">
       <div>
         <p class="eyebrow">ТЕСТОВАЯ АБС</p>
-        <h2>Проверить пакет за сегодня</h2>
+        <h2>Войти и проверить все готовые письма</h2>
       </div>
       <button type="button" class="modal-close" data-close-dialog>×</button>
     </div>
     <p class="warning-note">
-      Учётные данные живут только во время этого запроса. Сейчас используется
-      тестовая база АБС.
+      Учётные данные хранятся только в оперативной памяти активного сеанса.
+      При ошибке АБС сеанс автоматически завершается. Сейчас используется тестовая база.
     </p>
     <label class="field">
       <span>Логин АБС</span>

@@ -12,6 +12,7 @@ dependencies = [
     "fastapi>=0.116,<1",
     "httpx>=0.28,<1",
     "jinja2>=3.1,<4",
+    "numpy>=2,<3",
     "python-multipart>=0.0.20,<1",
     "uvicorn>=0.35,<1",
     "pillow>=11,<13",
@@ -20,6 +21,7 @@ dependencies = [
     "pypdfium2>=5,<6",
     "pymorphy3>=2.0.6,<3",
     "python-docx>=1.2,<2",
+    "pyzbar>=0.1.9,<1",
     "zxing-cpp>=3.0,<4",
 ]
 
@@ -38,7 +40,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-gns_app = ["templates/*.html", "static/*"]
+gns_app = ["templates/*.html", "static/*", "data/*.csv"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

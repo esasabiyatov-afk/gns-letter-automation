@@ -103,6 +103,24 @@ def test_today_batch_checks_and_groups_by_recipient(workflow):
     assert "one-time-secret" not in audit_text
 
 
+def test_abs_session_reuses_credentials_only_in_memory(workflow):
+    first = _insert_ready_case(
+        workflow, "12345678901234", 'ОсОО "Первый"'
+    )
+    second = _insert_ready_case(
+        workflow, "23456789012345", 'ОсОО "Второй"'
+    )
+
+    workflow.check_abs(first, "session-user", "session-secret")
+    assert workflow.abs_session_active()
+    workflow.check_abs(second)
+
+    assert workflow.get_case(second)["status"] == CaseStatus.READY_FOR_RESPONSE
+    audit_text = "\n".join(event["payload_json"] for event in workflow.get_audit())
+    assert "session-user" not in audit_text
+    assert "session-secret" not in audit_text
+
+
 def test_found_taxpayer_is_separate_and_never_uses_absence_template(workflow):
     _insert_ready_case(
         workflow, "11111111111111", 'ОсОО "Найденный"'
@@ -114,9 +132,7 @@ def test_found_taxpayer_is_separate_and_never_uses_absence_template(workflow):
     assert not overview["not_found_groups"]
     assert len(overview["found_groups"]) == 1
     assert not overview["found_groups"][0]["can_generate"]
-    assert "отдельный утверждённый шаблон" in " ".join(
-        overview["found_groups"][0]["issues"]
-    )
+    assert not overview["found_groups"][0]["issues"]
 
 
 def test_ocr_only_decision_stays_in_manual_review(workflow):

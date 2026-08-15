@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}Настройки · Автоматизатор писем{% endblock %}
+{% block content %}
+<section class="panel settings-panel">
+  <p class="eyebrow">Настройки</p>
+  <h1>Ручная проверка</h1>
+  <p class="settings-intro">
+    Здесь можно включить дополнительные элементы формы. Основная обработка,
+    проверка QR и OCR от этих переключателей не меняются.
+  </p>
+  {% if message %}<div class="alert alert-success">{{ message }}</div>{% endif %}
+  {% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
+
+  <form method="post" action="/settings" class="settings-form">
+    <label class="setting-toggle">
+      <input type="checkbox" name="allow_multiple_taxpayers" value="true"
+             {% if ui_preferences.allow_multiple_taxpayers %}checked{% endif %}>
+      <span>
+        <strong>Разрешить добавление нескольких налогоплательщиков</strong>
+        <small>Показывает кнопку «Добавить» и удаление строк в ручной форме.</small>
+      </span>
+    </label>
+
+    <label class="field setting-field">
+      <span>Порог периода для проверки ОДБ</span>
+      <input type="date" name="period_threshold" value="{{ threshold }}" required>
+      <small>Если начало периода раньше этой даты — после АБС нужна проверка ОДБ.</small>
+    </label>
+
+    <label class="field setting-field">
+      <span>Папка входящих писем PDF</span>
+      <input name="inbox_dir" value="{{ inbox_dir }}" required>
+      <small>Кнопка «Сканировать папку» будет брать PDF из этого пути.</small>
+    </label>
+
+    <label class="setting-toggle">
+      <input type="checkbox" name="require_review_checkbox" value="true"
+             {% if ui_preferences.require_review_checkbox %}checked{% endif %}>
+      <span>
+        <strong>Требовать отдельную галочку сверки</strong>
+        <small>Если выключено, нажатие «Подтвердить и продолжить» считается подтверждением сотрудника.</small>
+      </span>
+    </label>
+
+    <button class="button button-primary" type="submit">Сохранить настройки</button>
+  </form>
+
+  <section class="settings-reset">
+    <h2>Сброс обработки</h2>
+    <p>
+      Очищаются загруженные копии, результаты OCR/QR, проверки и готовые ответы.
+      Настройки, исполнители, справочник ГНС и исходные PDF в папке входящих
+      сохраняются.
+    </p>
+    <form method="post" action="/settings/reset-processing"
+          class="settings-reset-actions">
+      <button class="button button-secondary" type="submit"
+              name="action" value="clear"
+              onclick="return confirm('Очистить все данные обработки? Исходные PDF в папке входящих останутся.');">
+        Очистить обработку
+      </button>
+      <button class="button button-danger" type="submit"
+              name="action" value="rescan"
+              onclick="return confirm('Очистить данные и заново обработать все PDF из выбранной папки?');">
+        Сбросить и проверить папку заново
+      </button>
+    </form>
+  </section>
+</section>
+{% endblock %}

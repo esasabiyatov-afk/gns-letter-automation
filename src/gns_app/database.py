@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
-from gns_app.text_cleanup import clean_location
+from gns_app.text_cleanup import clean_location, clean_taxpayer_name
 
 
 def utc_now() -> str:
@@ -45,10 +45,12 @@ CREATE TABLE IF NOT EXISTS cases (
     recipient_display_name TEXT,
     period_start TEXT,
     period_end TEXT,
+    period_route TEXT,
     employee_name TEXT,
     fields_confirmed INTEGER NOT NULL DEFAULT 0,
     abs_status TEXT NOT NULL DEFAULT 'not_checked',
     response_status TEXT,
+    official_parse_version INTEGER NOT NULL DEFAULT 0,
     response_path TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -75,6 +77,8 @@ CREATE TABLE IF NOT EXISTS pages (
     ocr_status TEXT NOT NULL DEFAULT 'not_started',
     ocr_confidence REAL NOT NULL DEFAULT 0,
     extracted_text TEXT,
+    type_evidence_text TEXT,
+    type_evidence_method TEXT,
     status TEXT NOT NULL,
     issue_code TEXT,
     issue_message TEXT,
@@ -237,7 +241,46 @@ class Database:
                 """
             )
             self._ensure_taxpayer_columns(connection)
+            self._ensure_page_columns(connection)
+            self._ensure_case_columns(connection)
             self._clean_legacy_district_places(connection)
+            self._normalize_legacy_taxpayer_names(connection)
+
+    @staticmethod
+    def _ensure_page_columns(connection: sqlite3.Connection) -> None:
+        existing = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(pages)"
+            ).fetchall()
+        }
+        additions = {
+            "type_evidence_text": "TEXT",
+            "type_evidence_method": "TEXT",
+        }
+        for name, column_type in additions.items():
+            if name not in existing:
+                connection.execute(
+                    f"ALTER TABLE pages ADD COLUMN {name} {column_type}"
+                )
+
+    @staticmethod
+    def _ensure_case_columns(connection: sqlite3.Connection) -> None:
+        existing = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(cases)"
+            ).fetchall()
+        }
+        if "official_parse_version" not in existing:
+            connection.execute(
+                "ALTER TABLE cases ADD COLUMN "
+                "official_parse_version INTEGER NOT NULL DEFAULT 0"
+            )
+        if "period_route" not in existing:
+            connection.execute(
+                "ALTER TABLE cases ADD COLUMN period_route TEXT"
+            )
 
     @staticmethod
     def _ensure_taxpayer_columns(connection: sqlite3.Connection) -> None:
@@ -304,6 +347,25 @@ class Database:
                     now,
                 ),
             )
+
+    @staticmethod
+    def _normalize_legacy_taxpayer_names(
+        connection: sqlite3.Connection,
+    ) -> None:
+        for column in ("name", "registry_name"):
+            rows = connection.execute(
+                f"SELECT id, {column} FROM taxpayers "
+                f"WHERE {column} IS NOT NULL AND {column} != ''"
+            ).fetchall()
+            for row in rows:
+                cleaned = clean_taxpayer_name(row[column])
+                if cleaned != row[column]:
+                    connection.execute(
+                        f"UPDATE taxpayers SET {column} = ?, updated_at = ? "
+                        "WHERE id = ?",
+                        (cleaned, utc_now(), row["id"]),
+                    )
+
     def execute(self, sql: str, parameters: Sequence[Any] = ()) -> None:
         with self.connect() as connection:
             connection.execute(sql, parameters)

@@ -4,7 +4,7 @@
 <div class="page-heading">
   <div>
     <div class="breadcrumb-links">
-      <a class="back-link" href="/today">← Сегодня</a>
+      <a class="back-link" href="/today">← Готовые ответы</a>
       <a class="back-link" href="/cases">Все обращения</a>
     </div>
     <p class="eyebrow">КАРТОЧКА ОБРАЩЕНИЯ</p>
@@ -33,7 +33,15 @@
       <div><dt>Должность в ответе</dt><dd>{{ recipient_position_display or '—' }}</dd></div>
       <div><dt>Полное ФИО</dt><dd>{{ case.recipient_full_name or '—' }}</dd></div>
       <div><dt>Обращение</dt><dd>{{ case.recipient_display_name or '—' }}</dd></div>
-      <div><dt>Период</dt><dd>{{ case.period_start or '—' }} — {{ case.period_end or '—' }}</dd></div>
+      <div><dt>Период</dt><dd>
+        {% if case.period_start and case.period_end %}
+          {{ case.period_start }} — {{ case.period_end }}
+        {% elif case.period_route == 'odb' %}
+          Даты не читаются · проверить в ОДБ
+        {% elif case.period_route == 'no_odb' %}
+          Даты не читаются · ОДБ не требуется
+        {% else %}—{% endif %}
+      </dd></div>
       <div><dt>Исполнитель</dt><dd>{{ case.employee_name or '—' }}</dd></div>
       <div><dt>Источник</dt><dd>{{ source_labels.get(case.source_kind, case.source_kind or '—') }}</dd></div>
     </dl>
@@ -96,9 +104,15 @@
       </p>
     {% elif case.status == 'ready_for_abs' %}
       <h2>Проверить налогоплательщиков в тестовой АБС</h2>
-      <p>Логин и пароль используются только для одного запроса и не сохраняются.</p>
+      <p>
+        {% if abs_session_active %}
+          Сеанс АБС активен. Проверка запускается без повторного входа.
+        {% else %}
+          Войдите один раз; сеанс действует до ошибки АБС или перезапуска приложения.
+        {% endif %}
+      </p>
     {% elif case.status == 'ready_for_response' %}
-      <h2>Готово к общему ответу за сегодня</h2>
+      <h2>Готово к общему ответу</h2>
       <p>
         Обращение будет объединено с другими письмами тому же адресату.
       </p>
@@ -131,9 +145,15 @@
         </button>
       </form>
     {% elif case.status == 'ready_for_abs' %}
-      <button class="button button-primary" type="button" data-open-dialog="abs-dialog">
-        Открыть проверку АБС
-      </button>
+      {% if abs_session_active %}
+        <form method="post" action="/cases/{{ case.id }}/abs">
+          <button class="button button-primary" type="submit">Проверить в АБС</button>
+        </form>
+      {% else %}
+        <button class="button button-primary" type="button" data-open-dialog="abs-dialog">
+          Войти и проверить в АБС
+        </button>
+      {% endif %}
     {% elif case.status == 'ready_for_response' %}
       <a class="button button-primary" href="/today">
         Открыть общие ответы
@@ -191,11 +211,12 @@
       <button type="button" class="modal-close" data-close-dialog>×</button>
     </div>
     <p class="warning-note">
-      Данные не сохраняются. В текущей версии используется фейковая база.
+      Данные остаются только в памяти активного сеанса и не записываются в БД
+      или журнал. При ошибке потребуется войти снова. Используется фейковая база.
     </p>
     <label class="field"><span>Логин АБС</span><input name="username" autocomplete="off" required></label>
     <label class="field"><span>Пароль АБС</span><input name="password" type="password" autocomplete="new-password" required></label>
-    <button class="button button-primary button-block" type="submit">Проверить один раз</button>
+    <button class="button button-primary button-block" type="submit">Войти и проверить</button>
   </form>
 </dialog>
 {% endblock %}

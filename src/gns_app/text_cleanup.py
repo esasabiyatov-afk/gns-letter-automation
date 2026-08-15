@@ -14,3 +14,17 @@ def clean_location(value: str | None) -> str:
         return ""
     normalized = re.sub(r"\s+", " ", value).strip()
     return normalized.strip(LOCATION_EDGE_NOISE).strip()
+
+
+def clean_taxpayer_name(value: str | None) -> str:
+    """Нормализует отображение наименования без изменения его смысла."""
+    if not value:
+        return ""
+    normalized = re.sub(r"\s+", " ", value).strip()
+    normalized = re.sub(
+        r"\bобщество\s+с\s+ограниченной\s+ответственностью\b",
+        "ОсОО",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    return normalized

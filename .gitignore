@@ -8,6 +8,8 @@ runtime/
 dist/
 build/
 *.egg-info/
+.tmp.driveupload/
+tmp/
 .idea/
 .vscode/
 .DS_Store

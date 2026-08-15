@@ -70,6 +70,51 @@ class PdfService:
             quality_score=self._quality_score(image),
         )
 
+    def render_page_for_qr(
+        self,
+        pdf_path: Path,
+        page_number: int,
+        output_path: Path,
+        scale: float = 3.2,
+    ) -> Path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            pdf = pdfium.PdfDocument(str(pdf_path))
+            try:
+                page = pdf[page_number - 1]
+                image = page.render(scale=scale).to_pil().convert("L")
+            finally:
+                pdf.close()
+        except Exception as exc:
+            raise PdfProcessingError(
+                f"Не удалось подготовить страницу {page_number} для QR: {exc}"
+            ) from exc
+        image.save(output_path, format="PNG", optimize=True)
+        return output_path
+
+    def render_page_for_ocr(
+        self,
+        pdf_path: Path,
+        page_number: int,
+        output_path: Path,
+        scale: float = 3.0,
+    ) -> Path:
+        """Render a temporary high-resolution color image for local OCR."""
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            pdf = pdfium.PdfDocument(str(pdf_path))
+            try:
+                page = pdf[page_number - 1]
+                image = page.render(scale=scale).to_pil().convert("RGB")
+            finally:
+                pdf.close()
+        except Exception as exc:
+            raise PdfProcessingError(
+                f"Не удалось подготовить страницу {page_number} для OCR: {exc}"
+            ) from exc
+        image.save(output_path, format="PNG", optimize=True)
+        return output_path
+
     def extract_embedded_text(self, pdf_path: Path, page_number: int) -> str:
         try:
             reader = PdfReader(str(pdf_path))

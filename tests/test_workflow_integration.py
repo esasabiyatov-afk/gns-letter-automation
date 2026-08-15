@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from gns_app.domain import AbsStatus, CaseStatus
+from gns_app.domain import CaseStatus
 
 
 def test_sample_pdf_end_to_end_without_guessing(
@@ -53,12 +53,8 @@ def test_sample_pdf_end_to_end_without_guessing(
     case = workflow.get_case(case_id)
     assert case["recipient_display_name"] == "Телтаеву Р. З."
     assert case["source_kind"] == "manual"
-    assert case["status"] == CaseStatus.READY_FOR_ABS
-
-    abs_result = workflow.check_abs(case_id, "test-user", "one-time-password")
-    assert abs_result.status == AbsStatus.NOT_FOUND
-    case = workflow.get_case(case_id)
     assert case["status"] == CaseStatus.READY_FOR_RESPONSE
+    assert workflow.get_taxpayers(case_id)[0]["abs_result"] == "not_found"
 
     response = workflow.generate_response(case_id)
     assert response.exists()

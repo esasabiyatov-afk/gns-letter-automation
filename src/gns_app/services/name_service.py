@@ -198,7 +198,12 @@ class NameService:
     @staticmethod
     def _decline_surname(surname: str, gender: str | None) -> str:
         lower = surname.casefold()
-        if gender == "male":
+        if gender is None and lower.endswith(
+            ("ова", "ева", "ёва", "ина", "ына", "ская", "цкая")
+        ):
+            gender = "female"
+        # Окончание мужской фамилии достаточно даже при отчестве-инициале.
+        if gender in {"male", None}:
             if lower.endswith(("ов", "ев", "ёв", "ин", "ын")):
                 return surname + "у"
             if lower.endswith("ский"):

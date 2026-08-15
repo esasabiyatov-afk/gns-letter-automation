@@ -13,6 +13,7 @@ from docx.text.paragraph import Paragraph
 from lxml import etree
 
 from gns_app.services.name_service import NameService
+from gns_app.services.taxpayer_service import response_taxpayer_name
 
 
 class WordTemplateError(ValueError):
@@ -88,7 +89,7 @@ class WordTemplateService:
         if len(taxpayers) == 1:
             taxpayer = taxpayers[0]
             replacements[self.TOKENS["subjects"]] = (
-                f" {taxpayer['name'].strip()}"
+                f" {response_taxpayer_name(taxpayer['name'], taxpayer['inn'])}"
             )
             replacements[self.TOKENS["inns"]] = (
                 f"ИНН: {taxpayer['inn'].strip()} "
@@ -109,6 +110,46 @@ class WordTemplateService:
         self._assert_no_tokens(working_path)
         os.replace(working_path, output_path)
         return output_path
+
+    def render_pages(
+        self,
+        output_path: Path,
+        case: dict[str, str],
+        taxpayers: list[dict[str, str]],
+        taxpayers_per_page: int,
+    ) -> Path:
+        if taxpayers_per_page <= 0 or taxpayers_per_page >= len(taxpayers):
+            return self.render(output_path, case, taxpayers)
+        chunks = [
+            taxpayers[index : index + taxpayers_per_page]
+            for index in range(0, len(taxpayers), taxpayers_per_page)
+        ]
+        temporary_paths: list[Path] = []
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            for index, chunk in enumerate(chunks, 1):
+                temporary = output_path.with_name(
+                    f".{output_path.stem}-page-{index}-{uuid4().hex}.docx"
+                )
+                self.render(temporary, case, chunk)
+                temporary_paths.append(temporary)
+
+            combined = Document(str(temporary_paths[0]))
+            for temporary in temporary_paths[1:]:
+                combined.add_page_break()
+                source = Document(str(temporary))
+                for element in source.element.body:
+                    if element.tag.endswith("}sectPr"):
+                        continue
+                    combined.element.body.insert(-1, deepcopy(element))
+
+            working_path = output_path.with_suffix(".working.docx")
+            combined.save(working_path)
+            os.replace(working_path, output_path)
+            return output_path
+        finally:
+            for temporary in temporary_paths:
+                temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _validate(
@@ -166,7 +207,7 @@ class WordTemplateService:
             if index > 1:
                 target.add_run().add_break()
             run = target.add_run(
-                f"{index}. {taxpayer['name'].strip()} "
+                f"{index}. {response_taxpayer_name(taxpayer['name'], taxpayer['inn'])} "
                 f"ИНН: {taxpayer['inn'].strip()};"
             )
             if reference_properties is not None:
@@ -175,7 +216,8 @@ class WordTemplateService:
     @staticmethod
     def _plain_taxpayer_list(taxpayers: list[dict[str, str]]) -> str:
         return "; ".join(
-            f"{index}. {item['name'].strip()} ИНН: {item['inn'].strip()}"
+            f"{index}. {response_taxpayer_name(item['name'], item['inn'])} "
+            f"ИНН: {item['inn'].strip()}"
             for index, item in enumerate(taxpayers, 1)
         )
 
