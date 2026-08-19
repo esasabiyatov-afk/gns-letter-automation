@@ -15,7 +15,15 @@ from gns_app.domain import (
 )
 
 
-def _insert_ready_case(workflow, inn: str, name: str) -> str:
+def _insert_ready_case(
+    workflow,
+    inn: str,
+    name: str,
+    *,
+    district_place: str = "по Ленинскому району города Бишкек",
+    recipient_full_name: str = "Телтаев Рахатбек Замирбекович",
+    recipient_display_name: str = "Телтаеву Р. З.",
+) -> str:
     upload_id = uuid4().hex
     case_id = uuid4().hex
     now = utc_now()
@@ -36,14 +44,20 @@ def _insert_ready_case(workflow, inn: str, name: str) -> str:
             recipient_display_name, period_start, period_end,
             employee_name, fields_confirmed, abs_status,
             created_at, updated_at
-        ) VALUES (?, ?, 'ready_for_abs', 'qr_official',
-                  'по Ленинскому району города Бишкек',
-                  'Зам. начальника управления',
-                  'Телтаев Рахатбек Замирбекович',
-                  'Телтаеву Р. З.', '2020-01-01', '2026-01-01',
+        ) VALUES (?, ?, 'ready_for_abs', 'qr_official', ?,
+                  'Зам. начальника управления', ?, ?,
+                  '2020-01-01', '2026-01-01',
                   'Гапарова Э.', 1, 'not_checked', ?, ?)
         """,
-        (case_id, upload_id, now, now),
+        (
+            case_id,
+            upload_id,
+            district_place,
+            recipient_full_name,
+            recipient_display_name,
+            now,
+            now,
+        ),
     )
     workflow.db.execute(
         """
@@ -198,3 +212,40 @@ def test_ocr_disagreement_does_not_prefill_critical_fields(workflow):
     assert case["period_start"] is None
     assert case["period_end"] is None
     assert workflow.get_taxpayers(case_id) == []
+
+
+def test_generate_all_ready_daily_responses_creates_one_file_per_recipient(
+    workflow,
+):
+    first = _insert_ready_case(
+        workflow,
+        "12345678901234",
+        'ОсОО "Первый"',
+        district_place="по Ленинскому району города Бишкек",
+        recipient_full_name="Телтаев Рахатбек Замирбекович",
+        recipient_display_name="Телтаеву Р. З.",
+    )
+    second = _insert_ready_case(
+        workflow,
+        "23456789012345",
+        'ОсОО "Второй"',
+        district_place="по Свердловскому району города Бишкек",
+        recipient_full_name="Асанова Айгуль Токтогуловна",
+        recipient_display_name="Асановой А. Т.",
+    )
+
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    overview = workflow.today_overview()
+    assert len(overview["not_found_groups"]) == 2
+
+    summary = workflow.generate_all_ready_daily_responses()
+
+    assert len(summary["created"]) == 2
+    assert summary["errors"] == []
+    assert workflow.get_case(first)["status"] == CaseStatus.RESPONSE_CREATED
+    assert workflow.get_case(second)["status"] == CaseStatus.RESPONSE_CREATED
+    assert not workflow.today_overview()["not_found_groups"]
+
+    # Повторный вызов не должен падать и не находит новых готовых групп.
+    empty_summary = workflow.generate_all_ready_daily_responses()
+    assert empty_summary == {"created": [], "errors": []}

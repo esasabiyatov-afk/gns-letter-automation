@@ -35,8 +35,8 @@
     </div>
     <div class="queue-actions">
       <form method="post" action="/review/{{ page.id }}/type"
-            class="queue-type-form">
-        <select name="page_type" aria-label="Тип страницы">
+            class="queue-type-form" data-auto-submit-form>
+        <select name="page_type" aria-label="Тип страницы" data-auto-submit>
           <option value="letter" {% if page.page_type == 'letter' %}selected{% endif %}>Письмо</option>
           <option value="decision" {% if page.page_type == 'decision' %}selected{% endif %}>Решение</option>
           <option value="attachment" {% if page.page_type == 'attachment' %}selected{% endif %}>Приложение</option>

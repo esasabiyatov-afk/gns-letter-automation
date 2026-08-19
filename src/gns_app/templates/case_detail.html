@@ -59,7 +59,7 @@
           <small>ИНН {{ taxpayer.inn }}</small>
           {% if taxpayer.registry_status %}
             <small class="registry-state registry-{{ taxpayer.registry_status }}">
-              ОсОО.KG:
+              {{ taxpayer.registry_provider or "Реестр" }}:
               {{ registry_status_labels.get(taxpayer.registry_status,
                                              taxpayer.registry_status) }}
             </small>
@@ -160,6 +160,12 @@
       </a>
     {% elif case.status == 'response_created' %}
       <a class="button button-primary" href="/cases/{{ case.id }}/response">Скачать Word</a>
+      {% if case.response_page_overflow %}
+        <small class="page-overflow-warning">
+          ⚠ Похоже, письмо не уместится на одной странице — откройте и
+          проверьте перед отправкой.
+        </small>
+      {% endif %}
     {% endif %}
   </div>
 </section>
@@ -176,31 +182,31 @@
       </p>
     </div>
   </div>
-  <form method="post" action="/cases/{{ case.id }}/odb">
-    <div class="odb-list">
-    {% for taxpayer in taxpayers %}
-      <article>
-        <div>
-          <strong>{{ taxpayer.name }}</strong>
-          <small>ИНН {{ taxpayer.inn }}</small>
-          <input type="hidden" name="taxpayer_inn"
-                 value="{{ taxpayer.inn }}">
+  <div class="odb-case-list">
+    <article class="odb-quick-form" data-odb-case>
+      <div class="odb-quick-taxpayers">
+      {% for taxpayer in odb_pending_taxpayers %}
+        <div class="odb-quick-row" data-odb-row
+             data-odb-url="/cases/{{ case.id }}/odb/taxpayer">
+          <div class="odb-quick-person">
+            <strong>{{ taxpayer.name }}</strong>
+            <small>ПИН/ИНН {{ taxpayer.inn }}</small>
+            <input type="hidden" name="taxpayer_inn"
+                   value="{{ taxpayer.inn }}">
+          </div>
+          <div class="odb-result-buttons" aria-label="Результат ОДБ">
+            <button type="button" class="odb-result-button is-found"
+                    data-odb-result="found"
+                    title="Есть в ОДБ">✓ Есть</button>
+            <button type="button" class="odb-result-button is-not-found"
+                    data-odb-result="not_found"
+                    title="Нет в ОДБ">× Нет</button>
+          </div>
         </div>
-        <label class="field odb-selector">
-          <span>Результат ОДБ</span>
-          <select name="odb_result" required>
-            <option value="">Выберите</option>
-            <option value="not_found">Не найден</option>
-            <option value="found">Найден</option>
-          </select>
-        </label>
-      </article>
-    {% endfor %}
-    </div>
-    <button class="button button-primary" type="submit">
-      Сохранить проверку ОДБ
-    </button>
-  </form>
+      {% endfor %}
+      </div>
+    </article>
+  </div>
 </section>
 {% endif %}
 

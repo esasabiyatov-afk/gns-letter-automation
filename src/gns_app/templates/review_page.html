@@ -191,21 +191,6 @@
               <span>Наименование</span>
               <textarea name="taxpayer_name" rows="2" data-autogrow
                         placeholder="Наименование или ФИО">{{ taxpayer.name }}</textarea>
-              {% if taxpayer.registry_status and taxpayer.registry_status != 'not_applicable' %}
-                <small class="registry-state registry-{{ taxpayer.registry_status }}">
-                  ОсОО.KG:
-                  {{ registry_status_labels.get(taxpayer.registry_status,
-                                                 taxpayer.registry_status) }}
-                </small>
-                {% if taxpayer.registry_name
-                      and taxpayer.registry_status == 'mismatch' %}
-                  <small>Название в реестре: {{ taxpayer.registry_name }}</small>
-                  <button type="button" class="text-button registry-name-choice"
-                          data-registry-name="{{ taxpayer.registry_name }}">
-                    Использовать название из реестра
-                  </button>
-                {% endif %}
-              {% endif %}
             </label>
             <label class="field inn-field">
               <span>ИНН</span>

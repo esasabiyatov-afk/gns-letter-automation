@@ -11,10 +11,24 @@ if (-not (Test-Path -LiteralPath ".venv\Scripts\python.exe")) {
 & ".venv\Scripts\python.exe" -m pip install -e ".[dev]"
 
 $pythonPath = Join-Path $projectRoot ".venv\Scripts\python.exe"
+
+# tesserocr ещё не установлен на этом шаге - это ожидаемо. Native-команда пишет
+# ошибку в stderr, а PowerShell при $ErrorActionPreference = "Stop" превращает
+# это в завершающее исключение, даже с "2>$null". Поэтому временно переключаем
+# режим на этом единственном вызове.
+$previousErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
 & $pythonPath -c "import tesserocr" 2>$null
-if ($LASTEXITCODE -ne 0) {
+$tesserocrExitCode = $LASTEXITCODE
+$ErrorActionPreference = $previousErrorActionPreference
+
+if ($tesserocrExitCode -ne 0) {
+    Write-Host "tesserocr не найден, устанавливаю готовый wheel..."
     $wheelUrl = "https://github.com/simonflueckiger/tesserocr-windows_build/releases/download/tesserocr-v2.10.0-tesseract-5.5.2/tesserocr-2.10.0-cp312-cp312-win_amd64.whl"
     & $pythonPath -m pip install $wheelUrl
+}
+else {
+    Write-Host "tesserocr уже установлен."
 }
 
 $modelRoot = Join-Path $env:LOCALAPPDATA "GNSLetterAutomation\models"

@@ -39,7 +39,9 @@ from gns_app.services.official_document import (
 from gns_app.services.pdf_service import PdfProcessingError, PdfService
 from gns_app.services.qr_service import QrService
 from gns_app.services.registry_service import (
+    CompositeRegistryClient,
     OsooRegistryClient,
+    ReestrKgClient,
     RegistryLookupError,
     RegistryLookupResult,
 )
@@ -66,6 +68,7 @@ class WorkflowService:
     GNS_OFFICES_SOURCE_SETTING = "gns_offices_source_hash"
     PERIOD_THRESHOLD_SETTING = "period_threshold"
     INBOX_DIR_SETTING = "inbox_dir"
+    REGISTRY_PRIORITY_SETTING = "registry_priority"
     UI_SETTING_DEFAULTS = {
         "allow_multiple_taxpayers": False,
         "show_recipient_salutation": True,
@@ -103,7 +106,11 @@ class WorkflowService:
         self.abs = FakeAbsGateway()
         # Только оперативная память процесса: в БД и журнал не попадает.
         self._abs_session_credentials: tuple[str, str] | None = None
-        self.registry = OsooRegistryClient()
+        self.registry = CompositeRegistryClient(
+            OsooRegistryClient(),
+            ReestrKgClient(),
+            priority_getter=self.get_registry_priority,
+        )
         self.word = WordTemplateService(
             settings.source_templates_dir,
             self.names,
@@ -158,11 +165,25 @@ class WorkflowService:
         value = str(row["value"]).strip() if row else ""
         return Path(value).resolve() if value else self.settings.inbox_dir.resolve()
 
+    def get_registry_priority(self) -> str:
+        row = self.db.fetch_one(
+            "SELECT value FROM settings WHERE key = ?",
+            (self.REGISTRY_PRIORITY_SETTING,),
+        )
+        value = str(row["value"]).strip() if row else ""
+        if value in (
+            CompositeRegistryClient.PRIMARY_OSOO,
+            CompositeRegistryClient.PRIMARY_REESTR_KG,
+        ):
+            return value
+        return CompositeRegistryClient.PRIMARY_OSOO
+
     def update_operational_settings(
         self,
         *,
         period_threshold: str,
         inbox_dir: str,
+        registry_priority: str = CompositeRegistryClient.PRIMARY_OSOO,
         actor: str = "Сотрудник",
     ) -> None:
         try:
@@ -176,6 +197,11 @@ class WorkflowService:
             raise WorkflowValidationError(
                 "Не удалось открыть или создать папку писем"
             ) from exc
+        if registry_priority not in (
+            CompositeRegistryClient.PRIMARY_OSOO,
+            CompositeRegistryClient.PRIMARY_REESTR_KG,
+        ):
+            registry_priority = CompositeRegistryClient.PRIMARY_OSOO
         now = utc_now()
         self.db.executemany(
             """
@@ -187,13 +213,18 @@ class WorkflowService:
             [
                 (self.PERIOD_THRESHOLD_SETTING, threshold.isoformat(), now),
                 (self.INBOX_DIR_SETTING, str(folder), now),
+                (self.REGISTRY_PRIORITY_SETTING, registry_priority, now),
             ],
         )
         self.db.audit(
             "settings",
             "processing",
             "processing_settings_updated",
-            {"period_threshold": threshold.isoformat(), "inbox_dir": str(folder)},
+            {
+                "period_threshold": threshold.isoformat(),
+                "inbox_dir": str(folder),
+                "registry_priority": registry_priority,
+            },
             actor=actor,
         )
 
@@ -2351,7 +2382,8 @@ class WorkflowService:
                     UPDATE taxpayers
                     SET name = '', registry_status = NULL,
                         registry_name = NULL, registry_director = NULL,
-                        registry_checked_at = NULL, updated_at = ?
+                        registry_checked_at = NULL, registry_provider = NULL,
+                        updated_at = ?
                     WHERE id = ?
                     """,
                     (utc_now(), keep["id"]),
@@ -2693,6 +2725,7 @@ class WorkflowService:
             status = "error"
             official_name = None
             director = None
+            provider = None
             kind = classify_taxpayer(taxpayer["name"], taxpayer["inn"])
             if kind == TaxpayerKind.INDIVIDUAL:
                 status = "not_applicable"
@@ -2703,6 +2736,7 @@ class WorkflowService:
                     result = self.registry.lookup_by_inn(taxpayer["inn"])
                     official_name = clean_taxpayer_name(result.official_name)
                     director = result.director
+                    provider = result.provider
                     if result.status == "found" and official_name:
                         status = (
                             "match"
@@ -2714,6 +2748,7 @@ class WorkflowService:
                         status = result.status
                 except RegistryLookupError:
                     status = "error"
+                    provider = None
 
             checked_at = utc_now()
             self.db.execute(
@@ -2721,7 +2756,7 @@ class WorkflowService:
                 UPDATE taxpayers
                 SET registry_status = ?, registry_name = ?,
                     registry_director = ?, registry_checked_at = ?,
-                    updated_at = ?
+                    registry_provider = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -2729,6 +2764,7 @@ class WorkflowService:
                     official_name,
                     director,
                     checked_at,
+                    provider,
                     checked_at,
                     taxpayer["id"],
                 ),
@@ -2741,7 +2777,7 @@ class WorkflowService:
                 {
                     "automatic": automatic,
                     "status": status,
-                    "provider": "ОсОО.KG",
+                    "provider": provider or "",
                 },
             )
         case = self.get_case(case_id)
@@ -3498,6 +3534,33 @@ class WorkflowService:
             ),
         )
 
+    def generate_all_ready_daily_responses(
+        self,
+        business_date: date | None = None,
+    ) -> dict[str, Any]:
+        day = business_date or datetime.now(self.BUSINESS_TIMEZONE).date()
+        ready_groups = [
+            item
+            for item in self._daily_response_groups(day, AbsStatus.NOT_FOUND)
+            if item["can_generate"]
+        ]
+        created: list[str] = []
+        errors: list[dict[str, str]] = []
+        for group in ready_groups:
+            try:
+                group_id, _ = self.generate_daily_response(
+                    group["group_key"], business_date=day
+                )
+                created.append(group_id)
+            except (WorkflowValidationError, ValueError) as exc:
+                errors.append(
+                    {
+                        "recipient": group["recipient_display_name"],
+                        "message": str(exc),
+                    }
+                )
+        return {"created": created, "errors": errors}
+
     def generate_daily_response(
         self,
         group_key: str,
@@ -3540,7 +3603,7 @@ class WorkflowService:
             raise WorkflowValidationError(
                 "Количество лиц на странице должно быть от 1 до размера группы"
             )
-        self.word.render_pages(
+        _, likely_overflow = self.word.render_pages(
             output,
             case_snapshot,
             group["taxpayers"],
@@ -3555,8 +3618,9 @@ class WorkflowService:
                     id, business_date, group_key, abs_bucket, status,
                     district_place, recipient_position, recipient_full_name,
                     recipient_display_name, employee_name, taxpayer_count,
-                    response_path, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    response_path, response_page_overflow, created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     group_id,
@@ -3571,6 +3635,7 @@ class WorkflowService:
                     group["employee_name"],
                     group["taxpayer_count"],
                     str(output),
+                    int(likely_overflow),
                     now,
                     now,
                 ),
@@ -3671,13 +3736,17 @@ class WorkflowService:
         for case in cases:
             path = Path(case["response_path"])
             try:
-                self.word.render(
+                _, likely_overflow = self.word.render(
                     path,
                     case,
                     self.get_taxpayers(case["id"]),
                 )
             except (OSError, ValueError):
                 continue
+            self.db.execute(
+                "UPDATE cases SET response_page_overflow = ? WHERE id = ?",
+                (int(likely_overflow), case["id"]),
+            )
             self.db.audit(
                 "case",
                 case["id"],
@@ -3736,17 +3805,19 @@ class WorkflowService:
             )
         taxpayers = self.get_taxpayers(case_id)
         output = self.settings.responses_dir / f"response-{case_id}.docx"
-        self.word.render(output, case, taxpayers)
+        _, likely_overflow = self.word.render(output, case, taxpayers)
         self.db.execute(
             """
             UPDATE cases
-            SET status = ?, response_status = ?, response_path = ?, updated_at = ?
+            SET status = ?, response_status = ?, response_path = ?,
+                response_page_overflow = ?, updated_at = ?
             WHERE id = ?
             """,
             (
                 CaseStatus.RESPONSE_CREATED,
                 "created",
                 str(output),
+                int(likely_overflow),
                 utc_now(),
                 case_id,
             ),
@@ -3758,6 +3829,7 @@ class WorkflowService:
             {
                 "filename": output.name,
                 "taxpayer_count": len(taxpayers),
+                "page_overflow": likely_overflow,
             },
         )
         return output

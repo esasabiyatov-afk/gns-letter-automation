@@ -145,6 +145,14 @@
         одного сотрудника ГНС.
       </p>
     </div>
+    {% if overview.not_found_groups
+          and overview.not_found_groups|selectattr('can_generate')|list %}
+      <form method="post" action="/today/responses/create-all">
+        <button class="button button-primary" type="submit">
+          Создать все готовые ответы
+        </button>
+      </form>
+    {% endif %}
   </div>
   {% if overview.not_found_groups %}
     <div class="response-group-grid">
@@ -205,13 +213,15 @@
           </div>
         {% endif %}
         <form method="post" action="/today/responses/{{ group.group_key }}">
-          <label class="field response-split-field">
-            <span>Лиц на одной странице</span>
-            <input type="number" name="taxpayers_per_page" min="1"
-                   max="{{ group.taxpayer_count }}"
-                   value="{{ group.taxpayer_count }}">
-            <small>Меньшее число создаст в том же Word несколько отдельных писем с новой шапкой.</small>
-          </label>
+          {% if group.taxpayer_count > 1 %}
+            <label class="field response-split-field">
+              <span>Лиц на одной странице</span>
+              <input type="number" name="taxpayers_per_page" min="1"
+                     max="{{ group.taxpayer_count }}"
+                     value="{{ group.taxpayer_count }}">
+              <small>Меньшее число создаст в том же Word несколько отдельных писем с новой шапкой.</small>
+            </label>
+          {% endif %}
           <button class="button button-primary" type="submit"
                   {% if not group.can_generate %}disabled{% endif %}>
             Создать общий Word
@@ -287,6 +297,12 @@
           <strong>{{ group.recipient_display_name }}</strong>
           <span>УГНС {{ group.district_place }}</span>
           <small>{{ group.taxpayer_count }} {{ taxpayer_word(group.taxpayer_count) }}</small>
+          {% if group.response_page_overflow %}
+            <small class="page-overflow-warning">
+              ⚠ Похоже, письмо не уместится на одной странице — откройте
+              и проверьте перед отправкой.
+            </small>
+          {% endif %}
         </div>
         <a class="button button-secondary"
            href="/response-groups/{{ group.id }}">Скачать Word</a>

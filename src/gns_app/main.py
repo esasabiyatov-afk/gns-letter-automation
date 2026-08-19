@@ -402,21 +402,25 @@ def registry_suggestion(inn: str = "", name: str = ""):
     except RegistryLookupError as exc:
         return {"status": "error", "message": str(exc)}
 
+    provider = result.provider or "реестр"
     if result.status == "found" and result.official_name:
         return {
             "status": "found",
             "official_name": clean_taxpayer_name(result.official_name),
             "director": result.director or "",
-            "message": "Найдена запись в ОсОО.KG.",
+            "provider": provider,
+            "message": f"Найдена запись в {provider}.",
         }
     if result.status == "multiple":
         return {
             "status": "multiple",
-            "message": "ОсОО.KG вернул несколько записей; нужна проверка.",
+            "provider": provider,
+            "message": f"{provider} вернул несколько записей; нужна проверка.",
         }
     return {
         "status": "not_found",
-        "message": "ОсОО.KG не нашёл запись по этому ИНН.",
+        "provider": provider,
+        "message": f"{provider} не нашёл запись по этому ИНН.",
     }
 
 
@@ -438,6 +442,7 @@ def settings_page(request: Request, message: str = "", error: str = ""):
         context(
             request,
             inbox_dir=str(workflow.get_inbox_dir()),
+            registry_priority=workflow.get_registry_priority(),
             message=message,
             error=error,
         ),
@@ -450,6 +455,7 @@ def update_settings(
     require_review_checkbox: bool = Form(False),
     period_threshold: str = Form(...),
     inbox_dir: str = Form(...),
+    registry_priority: str = Form("osoo"),
 ):
     try:
         workflow.update_ui_preferences(
@@ -460,6 +466,7 @@ def update_settings(
         workflow.update_operational_settings(
             period_threshold=period_threshold,
             inbox_dir=inbox_dir,
+            registry_priority=registry_priority,
         )
     except WorkflowValidationError as exc:
         return RedirectResponse(
@@ -537,6 +544,28 @@ def abs_check_today(
                 f"{summary['case_count']}."
             )
         ),
+        status_code=303,
+    )
+
+
+@app.post("/today/responses/create-all")
+def create_all_grouped_responses():
+    summary = workflow.generate_all_ready_daily_responses()
+    created = len(summary["created"])
+    errors = summary["errors"]
+    if created and not errors:
+        message = quote(f"Создано ответов: {created}.")
+        return RedirectResponse(f"/today?message={message}", status_code=303)
+    if created and errors:
+        message = quote(
+            f"Создано ответов: {created}. Не удалось создать: {len(errors)}."
+        )
+        return RedirectResponse(f"/today?message={message}", status_code=303)
+    if errors:
+        message = quote("Ничего не создано: " + errors[0]["message"])
+        return RedirectResponse(f"/today?error={message}", status_code=303)
+    return RedirectResponse(
+        "/today?message=" + quote("Нет готовых групп для создания ответа."),
         status_code=303,
     )
 
@@ -873,9 +902,29 @@ def confirm_review(
             f"/review/{page_id}?error={quote(str(exc))}",
             status_code=303,
         )
+    remaining = [
+        page for page in workflow.list_review_pages() if page["id"] != page_id
+    ]
+    if remaining:
+        next_page_id = remaining[0]["id"]
+        message = quote(
+            f"Страница подтверждена. Осталось проверить: {len(remaining)}."
+        )
+        return RedirectResponse(
+            f"/review/{next_page_id}?message={message}",
+            status_code=303,
+        )
     if case_id:
-        return RedirectResponse(f"/cases/{case_id}", status_code=303)
-    return RedirectResponse("/review", status_code=303)
+        return RedirectResponse(
+            f"/cases/{case_id}?message=" + quote(
+                "Страница подтверждена. Проблемных страниц больше нет."
+            ),
+            status_code=303,
+        )
+    return RedirectResponse(
+        "/review?message=" + quote("Проблемных страниц больше нет."),
+        status_code=303,
+    )
 
 
 @app.post("/review/{page_id}/type")
@@ -920,6 +969,9 @@ def case_detail(request: Request, case_id: str, message: str = "", error: str = 
             request,
             case=case,
             taxpayers=taxpayers,
+            odb_pending_taxpayers=[
+                item for item in taxpayers if not item.get("odb_result")
+            ],
             odb_pending=(
                 case["status"] == "manual_period_rule"
                 and any(not item.get("odb_result") for item in taxpayers)

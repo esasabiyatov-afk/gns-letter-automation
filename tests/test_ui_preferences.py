@@ -66,6 +66,32 @@ def test_period_threshold_and_inbox_path_are_persisted(workflow, tmp_path):
     assert inbox.is_dir()
 
 
+def test_registry_priority_defaults_to_osoo(workflow):
+    assert workflow.get_registry_priority() == "osoo"
+
+
+def test_registry_priority_is_persisted(workflow, tmp_path):
+    workflow.update_operational_settings(
+        period_threshold="2020-01-01",
+        inbox_dir=str(tmp_path / "incoming-pdf"),
+        registry_priority="reestr_kg",
+    )
+
+    assert workflow.get_registry_priority() == "reestr_kg"
+
+
+def test_registry_priority_falls_back_to_osoo_for_unknown_value(
+    workflow, tmp_path
+):
+    workflow.update_operational_settings(
+        period_threshold="2020-01-01",
+        inbox_dir=str(tmp_path / "incoming-pdf"),
+        registry_priority="not_a_real_registry",
+    )
+
+    assert workflow.get_registry_priority() == "osoo"
+
+
 def test_long_legal_form_is_abbreviated_without_changing_name():
     assert clean_taxpayer_name(
         'Общество с ограниченной ответственностью "Жер Компани"'

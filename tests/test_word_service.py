@@ -44,6 +44,126 @@ def test_renders_single_response_without_placeholders(
     assert "[ФИО.Исп]" not in text
 
 
+def test_render_returns_overflow_flag_alongside_path(tmp_path, project_root):
+    service = WordTemplateService(project_root / "УГНС")
+    output = tmp_path / "single.docx"
+
+    result_path, likely_overflow = service.render(
+        output,
+        {
+            "district_place": "по Ленинскому району города Бишкек",
+            "recipient_position": "Зам. начальника управления",
+            "recipient_display_name": "Телтаеву Р. З.",
+            "employee_name": "Гапарова Э.",
+        },
+        [{"name": 'ОсОО "Тест"', "inn": "02312201410117"}],
+    )
+
+    assert result_path == output
+    assert likely_overflow is False
+
+
+def test_short_letter_is_not_flagged_as_overflowing(tmp_path, project_root):
+    service = WordTemplateService(project_root / "УГНС")
+    output = tmp_path / "short.docx"
+
+    _, likely_overflow = service.render(
+        output,
+        {
+            "district_place": "по Ленинскому району города Бишкек",
+            "recipient_position": "Зам. начальника управления",
+            "recipient_display_name": "Телтаеву Р. З.",
+            "employee_name": "Гапарова Э.",
+        },
+        [{"name": 'ОсОО "Тест"', "inn": "02312201410117"}],
+    )
+
+    assert likely_overflow is False
+
+
+def test_long_taxpayer_list_is_flagged_as_likely_overflowing(
+    tmp_path, project_root
+):
+    # Откалибровано по реальным замерам: при рендере через LibreOffice
+    # именно на 14-м налогоплательщике письмо реально перестаёт помещаться
+    # на одну страницу (13 - ещё влезает, 14 - уже нет). Берём заведомо
+    # длинный список, чтобы не зависеть от точной границы в один
+    # налогоплательщик.
+    service = WordTemplateService(project_root / "УГНС")
+    output = tmp_path / "long.docx"
+    taxpayers = [
+        {"name": f'ОсОО "Тестовая Компания Номер {i}"', "inn": f"{i:014d}"}
+        for i in range(1, 31)
+    ]
+
+    _, likely_overflow = service.render(
+        output,
+        {
+            "district_place": "по Ленинскому району города Бишкек",
+            "recipient_position": "Зам. начальника управления",
+            "recipient_display_name": "Телтаеву Р. З.",
+            "employee_name": "Гапарова Э.",
+        },
+        taxpayers,
+    )
+
+    assert likely_overflow is True
+
+
+def test_render_pages_reports_overflow_when_a_chunk_itself_overflows(
+    tmp_path, project_root
+):
+    service = WordTemplateService(project_root / "УГНС")
+    output = tmp_path / "chunked.docx"
+    taxpayers = [
+        {"name": f'ОсОО "Тестовая Компания Номер {i}"', "inn": f"{i:014d}"}
+        for i in range(1, 31)
+    ]
+
+    # Каждый кусок по 30 налогоплательщиков сам по себе не влезет на
+    # одну страницу, даже несмотря на явный разрыв страницы между кусками.
+    _, likely_overflow = service.render_pages(
+        output,
+        {
+            "district_place": "по Ленинскому району города Бишкек",
+            "recipient_position": "Зам. начальника управления",
+            "recipient_display_name": "Телтаеву Р. З.",
+            "employee_name": "Гапарова Э.",
+        },
+        taxpayers,
+        taxpayers_per_page=30,
+    )
+
+    assert likely_overflow is True
+
+
+def test_render_pages_does_not_flag_overflow_when_split_keeps_each_chunk_short(
+    tmp_path, project_root
+):
+    service = WordTemplateService(project_root / "УГНС")
+    output = tmp_path / "chunked_short.docx"
+    taxpayers = [
+        {"name": f'ОсОО "Тестовая Компания Номер {i}"', "inn": f"{i:014d}"}
+        for i in range(1, 31)
+    ]
+
+    # Тот же список, но разбит на короткие куски по 5 - каждый кусок
+    # заведомо помещается на одну страницу.
+    _, likely_overflow = service.render_pages(
+        output,
+        {
+            "district_place": "по Ленинскому району города Бишкек",
+            "recipient_position": "Зам. начальника управления",
+            "recipient_display_name": "Телтаеву Р. З.",
+            "employee_name": "Гапарова Э.",
+        },
+        taxpayers,
+        taxpayers_per_page=5,
+    )
+
+    assert likely_overflow is False
+
+
 def test_renders_multiple_taxpayers_on_separate_lines(
     tmp_path, project_root
 ):

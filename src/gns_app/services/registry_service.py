@@ -105,6 +105,265 @@ class _CompanySearchParser(HTMLParser):
         return companies
 
 
+class ReestrKgClient:
+    """Сверка компаний через публичный поиск reestr.kg.
+
+    reestr.kg отдаёт страницу поиска за Cloudflare-проверкой, поэтому вместо
+    обычного httpx-клиента используется cloudscraper (обходит только
+    браузерную JS-проверку Cloudflare, не CAPTCHA и не авторизацию).
+    Между запросами выдерживается небольшая пауза, как и для ОсОО.KG.
+    """
+
+    BASE_URL = "https://reestr.kg"
+    ALLOWED_HOSTS = frozenset({"reestr.kg", "www.reestr.kg"})
+
+    def __init__(
+        self,
+        *,
+        crawl_delay_seconds: float = 3.0,
+        cache_seconds: float = 3600.0,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+        scraper: object | None = None,
+    ):
+        self.crawl_delay_seconds = crawl_delay_seconds
+        self.cache_seconds = cache_seconds
+        self.clock = clock
+        self.sleeper = sleeper
+        self._last_request_at: float | None = None
+        self._cache: dict[str, tuple[float, RegistryLookupResult]] = {}
+        self._lock = threading.Lock()
+        self._scraper = scraper
+
+    def _client(self):
+        if self._scraper is not None:
+            return self._scraper
+        try:
+            import cloudscraper
+        except ImportError as exc:  # pragma: no cover - зависит от окружения
+            raise RegistryLookupError(
+                "Библиотека cloudscraper не установлена. Переустановите "
+                "зависимости приложения."
+            ) from exc
+        self._scraper = cloudscraper.create_scraper()
+        return self._scraper
+
+    def lookup_by_inn(self, inn: str) -> RegistryLookupResult:
+        clean_inn = re.sub(r"\D", "", inn)
+        if len(clean_inn) != 14:
+            raise RegistryLookupError("Для сверки нужны ровно 14 цифр ИНН")
+        return self._search(clean_inn, search_mode="inn", exact=True)
+
+    def search_by_name(self, name: str) -> RegistryLookupResult:
+        clean_name = " ".join(name.split())
+        if len(clean_name) < 2:
+            raise RegistryLookupError(
+                "Для поиска по названию введите минимум 2 символа"
+            )
+        if len(clean_name) > 160:
+            raise RegistryLookupError(
+                "Название для поиска не должно быть длиннее 160 символов"
+            )
+        return self._search(clean_name, search_mode="name", exact=False)
+
+    def _search(
+        self,
+        query: str,
+        *,
+        search_mode: str,
+        exact: bool,
+    ) -> RegistryLookupResult:
+        cache_key = f"{search_mode}:{query.casefold()}"
+        with self._lock:
+            cached = self._cache.get(cache_key)
+            now = self.clock()
+            if cached and now - cached[0] <= self.cache_seconds:
+                value = cached[1]
+                return RegistryLookupResult(
+                    status=value.status,
+                    query=value.query,
+                    search_mode=value.search_mode,
+                    matches=value.matches,
+                    inn=value.inn,
+                    official_name=value.official_name,
+                    director=value.director,
+                    provider=value.provider,
+                    from_cache=True,
+                )
+
+            if self._last_request_at is not None:
+                elapsed = self.clock() - self._last_request_at
+                remaining = self.crawl_delay_seconds - elapsed
+                if remaining > 0:
+                    self.sleeper(remaining)
+
+            try:
+                response = self._client().get(
+                    f"{self.BASE_URL}/search",
+                    params={"q": query, "page": 1},
+                    timeout=15,
+                )
+            except Exception as exc:  # noqa: BLE001 - cloudscraper/requests
+                self._last_request_at = self.clock()
+                raise RegistryLookupError(
+                    "reestr.kg не ответил вовремя или недоступен. "
+                    "Повторите позже."
+                ) from exc
+            self._last_request_at = self.clock()
+
+            self._validate_response(response)
+            matches = self._parse(response.text)
+            if search_mode == "inn":
+                matches = [
+                    company for company in matches if company.inn == query
+                ]
+            unique_matches = tuple(
+                {
+                    (company.inn, company.name, company.director): company
+                    for company in matches
+                }.values()
+            )
+            if unique_matches:
+                result = RegistryLookupResult(
+                    status=(
+                        "found" if len(unique_matches) == 1 else "multiple"
+                    ),
+                    query=query,
+                    search_mode=search_mode,
+                    matches=unique_matches,
+                    inn=(
+                        unique_matches[0].inn
+                        if len(unique_matches) == 1
+                        else None
+                    ),
+                    official_name=(
+                        unique_matches[0].name
+                        if len(unique_matches) == 1
+                        else None
+                    ),
+                    director=(
+                        unique_matches[0].director
+                        if len(unique_matches) == 1
+                        else None
+                    ),
+                    provider="reestr.kg",
+                )
+            else:
+                result = RegistryLookupResult(
+                    status="not_found",
+                    query=query,
+                    search_mode=search_mode,
+                    provider="reestr.kg",
+                )
+            self._cache[cache_key] = (self.clock(), result)
+            return result
+
+    def _validate_response(self, response) -> None:
+        status_code = getattr(response, "status_code", None)
+        if status_code is not None and status_code >= 400:
+            raise RegistryLookupError(
+                f"reestr.kg вернул ошибку HTTP {status_code}."
+            )
+        final_url = str(getattr(response, "url", ""))
+        parsed = urlparse(final_url)
+        if parsed.hostname and parsed.hostname not in self.ALLOWED_HOSTS:
+            raise RegistryLookupError(
+                "reestr.kg перенаправил запрос на посторонний адрес."
+            )
+        content = getattr(response, "content", b"") or b""
+        if len(content) > 4 * 1024 * 1024:
+            raise RegistryLookupError(
+                "HTML-ответ reestr.kg превышает допустимый размер."
+            )
+
+    @staticmethod
+    def _parse(html: str) -> list[RegistryCompany]:
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError as exc:  # pragma: no cover - зависит от окружения
+            raise RegistryLookupError(
+                "Библиотека beautifulsoup4 не установлена. Переустановите "
+                "зависимости приложения."
+            ) from exc
+
+        soup = BeautifulSoup(html, "html.parser")
+        companies: list[RegistryCompany] = []
+        seen_inns: set[str] = set()
+        for a_tag in soup.find_all("a", href=True):
+            href = a_tag["href"]
+            if "/companies/" not in href:
+                continue
+            inn = href.rstrip("/").split("/companies/")[-1].strip()
+            if not re.fullmatch(r"\d{14}", inn) or inn in seen_inns:
+                continue
+
+            parent_card = a_tag.parent
+            h3 = parent_card.find("h3") if parent_card else None
+            name = h3.get_text(strip=True) if h3 else ""
+            if not name:
+                aria = a_tag.get("aria-label", "") or ""
+                name = aria.replace("Перейти к компании ", "").strip()
+            if not name:
+                continue
+
+            seen_inns.add(inn)
+            companies.append(RegistryCompany(inn=inn, name=name))
+        return companies
+
+
+class CompositeRegistryClient:
+    """Основной + резервный реестр с настраиваемым приоритетом.
+
+    Сначала пробуем реестр, выбранный как основной в настройках. Если он
+    выбросил ошибку (сеть недоступна, сайт не отвечает, изменилась
+    разметка) — автоматически пробуем второй. Если оба недоступны,
+    поднимается ошибка первого из них, чтобы сообщение оставалось понятным.
+    """
+
+    PRIMARY_OSOO = "osoo"
+    PRIMARY_REESTR_KG = "reestr_kg"
+
+    def __init__(
+        self,
+        osoo_client: "OsooRegistryClient",
+        reestr_kg_client: "ReestrKgClient",
+        priority_getter: Callable[[], str],
+    ):
+        self._clients = {
+            self.PRIMARY_OSOO: osoo_client,
+            self.PRIMARY_REESTR_KG: reestr_kg_client,
+        }
+        self._priority_getter = priority_getter
+
+    def _ordered_clients(self) -> tuple[object, object]:
+        try:
+            primary_key = self._priority_getter()
+        except Exception:  # noqa: BLE001 - настройки не должны валить сверку
+            primary_key = self.PRIMARY_OSOO
+        if primary_key not in self._clients:
+            primary_key = self.PRIMARY_OSOO
+        secondary_key = (
+            self.PRIMARY_REESTR_KG
+            if primary_key == self.PRIMARY_OSOO
+            else self.PRIMARY_OSOO
+        )
+        return self._clients[primary_key], self._clients[secondary_key]
+
+    def lookup_by_inn(self, inn: str) -> RegistryLookupResult:
+        primary, secondary = self._ordered_clients()
+        try:
+            return primary.lookup_by_inn(inn)
+        except RegistryLookupError:
+            return secondary.lookup_by_inn(inn)
+
+    def search_by_name(self, name: str) -> RegistryLookupResult:
+        primary, secondary = self._ordered_clients()
+        try:
+            return primary.search_by_name(name)
+        except RegistryLookupError:
+            return secondary.search_by_name(name)
+
+
 class OsooRegistryClient:
     """Ручная HTML-сверка одного ИНН через публичную форму ОсОО.KG.
 
