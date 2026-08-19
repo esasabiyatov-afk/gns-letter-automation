@@ -11,10 +11,20 @@ build/
 .tmp.driveupload/
 tmp/
 УГНС/
+models/
+.codex/
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Local secrets, databases, and logs must never be committed.
+.env
+.env.*
+*.db
+*.sqlite
+*.sqlite3
+*.log
 
 # Входящие и шаблоны могут содержать банковскую и налоговую информацию.
 # Они остаются локально и не должны случайно попасть в репозиторий.
@@ -22,3 +32,6 @@ Thumbs.db
 *.PDF
 *.doc
 *.docx
+*.xls
+*.xlsx
+*.xlsm

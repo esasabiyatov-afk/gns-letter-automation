@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS cases (
     response_status TEXT,
     official_parse_version INTEGER NOT NULL DEFAULT 0,
     response_path TEXT,
+    response_page_overflow INTEGER,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -107,6 +108,7 @@ CREATE TABLE IF NOT EXISTS taxpayers (
     registry_name TEXT,
     registry_director TEXT,
     registry_checked_at TEXT,
+    registry_provider TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -172,6 +174,7 @@ CREATE TABLE IF NOT EXISTS response_groups (
     employee_name TEXT NOT NULL,
     taxpayer_count INTEGER NOT NULL,
     response_path TEXT,
+    response_page_overflow INTEGER,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -243,6 +246,7 @@ class Database:
             self._ensure_taxpayer_columns(connection)
             self._ensure_page_columns(connection)
             self._ensure_case_columns(connection)
+            self._ensure_response_group_columns(connection)
             self._clean_legacy_district_places(connection)
             self._normalize_legacy_taxpayer_names(connection)
 
@@ -281,6 +285,11 @@ class Database:
             connection.execute(
                 "ALTER TABLE cases ADD COLUMN period_route TEXT"
             )
+        if "response_page_overflow" not in existing:
+            connection.execute(
+                "ALTER TABLE cases ADD COLUMN "
+                "response_page_overflow INTEGER"
+            )
 
     @staticmethod
     def _ensure_taxpayer_columns(connection: sqlite3.Connection) -> None:
@@ -296,12 +305,27 @@ class Database:
             "registry_name": "TEXT",
             "registry_director": "TEXT",
             "registry_checked_at": "TEXT",
+            "registry_provider": "TEXT",
         }
         for name, column_type in additions.items():
             if name not in existing:
                 connection.execute(
                     f"ALTER TABLE taxpayers ADD COLUMN {name} {column_type}"
                 )
+
+    @staticmethod
+    def _ensure_response_group_columns(connection: sqlite3.Connection) -> None:
+        existing = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(response_groups)"
+            ).fetchall()
+        }
+        if "response_page_overflow" not in existing:
+            connection.execute(
+                "ALTER TABLE response_groups ADD COLUMN "
+                "response_page_overflow INTEGER"
+            )
 
     @staticmethod
     def _clean_legacy_district_places(

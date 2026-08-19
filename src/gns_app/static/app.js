@@ -11,6 +11,12 @@
     });
   }
 
+  document.querySelectorAll("[data-auto-submit]").forEach((select) => {
+    select.addEventListener("change", () => {
+      select.closest("form[data-auto-submit-form]")?.requestSubmit();
+    });
+  });
+
   document.querySelectorAll("[data-open-dialog]").forEach((button) => {
     button.addEventListener("click", () => {
       document.getElementById(button.dataset.openDialog)?.showModal();
@@ -44,8 +50,9 @@
         row.classList.add("is-removing");
         window.setTimeout(() => {
           row.remove();
-          if (!odbCase.querySelector("[data-odb-row]")) odbCase.remove();
-          const panel = document.querySelector(".odb-today-panel");
+          const willBeEmpty = !odbCase.querySelector("[data-odb-row]");
+          const panel = odbCase.closest(".panel");
+          if (willBeEmpty) odbCase.remove();
           if (panel && !panel.querySelector("[data-odb-case]")) panel.remove();
         }, 180);
       } catch (error) {
@@ -116,7 +123,7 @@
       result.appendChild(message);
       if (data.status === "found" && data.official_name) {
         result.classList.add("is-found");
-        message.textContent = `ОсОО.KG: ${data.official_name}`;
+        message.textContent = `${data.provider || "Реестр"}: ${data.official_name}`;
         const useName = document.createElement("button");
         useName.type = "button";
         useName.className = "text-button registry-name-choice";
@@ -145,7 +152,7 @@
       row.dataset.registryLookupKey = lookupKey;
       if (result) {
         result.className = "registry-live-result";
-        result.textContent = "Проверяем ИНН в ОсОО.KG…";
+        result.textContent = "Проверяем ИНН в реестре…";
       }
       row._registryTimer = window.setTimeout(async () => {
         const controller = new AbortController();

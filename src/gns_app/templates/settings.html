@@ -33,6 +33,23 @@
       <small>Кнопка «Сканировать папку» будет брать PDF из этого пути.</small>
     </label>
 
+    <label class="field setting-field">
+      <span>Основной реестр для сверки названий</span>
+      <select name="registry_priority">
+        <option value="osoo" {% if registry_priority == 'osoo' %}selected{% endif %}>
+          ОсОО.KG (по умолчанию)
+        </option>
+        <option value="reestr_kg" {% if registry_priority == 'reestr_kg' %}selected{% endif %}>
+          reestr.kg
+        </option>
+      </select>
+      <small>
+        Сверка всегда идёт через выбранный реестр. Если он не отвечает
+        (сайт недоступен, изменилась разметка и т.п.), приложение
+        автоматически пробует второй реестр — без ручного переключения.
+      </small>
+    </label>
+
     <label class="setting-toggle">
       <input type="checkbox" name="require_review_checkbox" value="true"
              {% if ui_preferences.require_review_checkbox %}checked{% endif %}>
