@@ -86,6 +86,15 @@
       новые PDF только от разрешённых отправителей. Уже учтённые письма
       повторно не скачиваются.
     </p>
+    {% if outlook_test_mode %}
+      <div class="outlook-status outlook-status-ready">
+        <strong>Тестовый адрес: {{ outlook_test_email }}</strong>
+        <small>
+          Другие отправители игнорируются. Программная отправка на любые
+          другие адреса заблокирована.
+        </small>
+      </div>
+    {% endif %}
 
     <div class="outlook-status outlook-status-{{ outlook_status.state }}">
       <strong>{{ outlook_status.message }}</strong>
@@ -136,6 +145,7 @@
         <span>Дополнительные разрешённые отправители</span>
         <input name="outlook_allowed_senders"
                value="{{ outlook_allowed_senders }}"
+               {% if outlook_test_mode %}readonly{% endif %}
                placeholder="sender@gmail.com">
         <small>
           Несколько адресов указываются через запятую. Домены sti.gov.kg и

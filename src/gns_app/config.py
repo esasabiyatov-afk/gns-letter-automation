@@ -33,6 +33,9 @@ class Settings:
     tolubay_ca_file: Path | None = None
     tolubay_timeout_seconds: float = 30.0
     tolubay_verify_tls: bool = True
+    outlook_test_email: str = ""
+    outlook_allow_test_send: bool = False
+    outlook_allow_insecure_certificate: bool = False
 
     @classmethod
     def load(cls) -> "Settings":
@@ -69,6 +72,28 @@ class Settings:
         if tolubay_verify_text not in {"true", "false"}:
             raise ValueError(
                 "GNS_TOLUBAY_VERIFY_TLS должен быть true или false"
+            )
+        outlook_test_send_text = os.environ.get(
+            "GNS_OUTLOOK_ALLOW_TEST_SEND", "false"
+        ).strip().casefold()
+        if outlook_test_send_text not in {"true", "false"}:
+            raise ValueError(
+                "GNS_OUTLOOK_ALLOW_TEST_SEND должен быть true или false"
+            )
+        outlook_insecure_certificate_text = os.environ.get(
+            "GNS_OUTLOOK_ALLOW_INSECURE_CERTIFICATE", "false"
+        ).strip().casefold()
+        if outlook_insecure_certificate_text not in {"true", "false"}:
+            raise ValueError(
+                "GNS_OUTLOOK_ALLOW_INSECURE_CERTIFICATE должен быть true или false"
+            )
+        outlook_test_email = os.environ.get(
+            "GNS_OUTLOOK_TEST_EMAIL", ""
+        ).strip().casefold()
+        if outlook_test_email not in {"", "esasabiyatov@gmail.com"}:
+            raise ValueError(
+                "GNS_OUTLOOK_TEST_EMAIL разрешён только для согласованного "
+                "тестового адреса"
             )
 
         return cls(
@@ -129,6 +154,11 @@ class Settings:
                 ),
             ),
             tolubay_verify_tls=tolubay_verify_text == "true",
+            outlook_test_email=outlook_test_email,
+            outlook_allow_test_send=outlook_test_send_text == "true",
+            outlook_allow_insecure_certificate=(
+                outlook_insecure_certificate_text == "true"
+            ),
         )
 
     def ensure_directories(self) -> None:

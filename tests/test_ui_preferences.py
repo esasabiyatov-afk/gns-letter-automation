@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from gns_app.text_cleanup import clean_taxpayer_name
 
 
@@ -28,6 +30,41 @@ def test_abs_insecure_tls_warning_is_rendered(workflow, monkeypatch):
     assert response.status_code == 200
     assert "Проверка сертификата АБС отключена" in response.text
     assert "Подлинность сервера не подтверждается" in response.text
+
+
+def test_outlook_office_test_warnings_are_rendered(workflow, monkeypatch):
+    from starlette.testclient import TestClient
+
+    from gns_app import main
+    from gns_app.services.outlook_service import (
+        OutlookOutgoingService,
+        OutlookService,
+    )
+
+    test_settings = replace(
+        workflow.settings,
+        outlook_test_email="esasabiyatov@gmail.com",
+        outlook_allow_test_send=True,
+        outlook_allow_insecure_certificate=True,
+    )
+    monkeypatch.setattr(main, "workflow", workflow)
+    monkeypatch.setattr(main, "settings", test_settings)
+    monkeypatch.setattr(
+        main,
+        "outlook_outgoing",
+        OutlookOutgoingService(
+            workflow.db,
+            test_settings,
+            OutlookService(object()),
+        ),
+    )
+
+    response = TestClient(main.app).get("/cases")
+
+    assert response.status_code == 200
+    assert "Outlook автоматически подтверждает" in response.text
+    assert "esasabiyatov@gmail.com" in response.text
+    assert "отправка разрешена только" in response.text
 
 
 def test_confirmed_recipient_is_suggested_by_partial_name(workflow):

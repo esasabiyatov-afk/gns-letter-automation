@@ -304,6 +304,7 @@ CREATE TABLE IF NOT EXISTS outlook_outgoing_messages (
     attachment_name TEXT NOT NULL,
     attachment_sha256 TEXT NOT NULL,
     outlook_entry_id TEXT,
+    sent_at TEXT,
     error_message TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -362,6 +363,7 @@ class Database:
             self._ensure_case_columns(connection)
             self._ensure_response_group_columns(connection)
             self._ensure_gns_office_columns(connection)
+            self._ensure_outlook_outgoing_columns(connection)
             self._clean_legacy_district_places(connection)
             self._normalize_legacy_taxpayer_names(connection)
 
@@ -530,6 +532,21 @@ class Database:
                 )
                 letter_order += 1
                 start_order += count
+
+    @staticmethod
+    def _ensure_outlook_outgoing_columns(
+        connection: sqlite3.Connection,
+    ) -> None:
+        existing = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(outlook_outgoing_messages)"
+            ).fetchall()
+        }
+        if "sent_at" not in existing:
+            connection.execute(
+                "ALTER TABLE outlook_outgoing_messages ADD COLUMN sent_at TEXT"
+            )
 
     @staticmethod
     def _clean_legacy_district_places(

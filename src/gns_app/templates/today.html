@@ -436,30 +436,48 @@
                     </button>
                   </form>
                 {% elif letter.signed_scan.status == 'confirmed' %}
-                  {% if letter.gns_email %}
+                  {% if outlook_test_mode or letter.gns_email %}
                     <div class="outlook-draft-status">
-                      <small>Получатель: {{ letter.gns_email }}</small>
+                      <small>
+                        Получатель:
+                        {% if outlook_test_mode %}{{ outlook_test_email }} · тестовый режим{% else %}{{ letter.gns_email }}{% endif %}
+                      </small>
                       {% if letter.outlook_message %}
                         {% if letter.outlook_message.status == 'draft_created' %}
                           <strong>Черновик Outlook создан</strong>
                           <small>{{ letter.outlook_message.subject }}</small>
+                        {% elif letter.outlook_message.status == 'sent' %}
+                          <strong>✓ Тестовое письмо отправлено</strong>
+                          <small>{{ letter.outlook_message.sent_at }}</small>
                         {% elif letter.outlook_message.status == 'technical_error' %}
                           <strong>Ошибка Outlook</strong>
                           <small>{{ letter.outlook_message.error_message }}</small>
                         {% endif %}
                       {% endif %}
                     </div>
-                    <form method="post"
-                          action="/response-letters/{{ letter.id }}/outlook-draft">
-                      <input type="hidden" name="group_id" value="{{ group.id }}">
-                      <button class="button button-primary" type="submit">
-                        {% if letter.outlook_message and letter.outlook_message.status == 'draft_created' %}
-                          Открыть черновик Outlook
-                        {% else %}
-                          Создать письмо Outlook
-                        {% endif %}
-                      </button>
-                    </form>
+                    {% if not letter.outlook_message or letter.outlook_message.status != 'sent' %}
+                      <form method="post"
+                            action="/response-letters/{{ letter.id }}/outlook-draft">
+                        <input type="hidden" name="group_id" value="{{ group.id }}">
+                        <button class="button button-primary" type="submit">
+                          {% if letter.outlook_message and letter.outlook_message.status == 'draft_created' %}
+                            Открыть черновик Outlook
+                          {% else %}
+                            Создать письмо Outlook
+                          {% endif %}
+                        </button>
+                      </form>
+                    {% endif %}
+                    {% if outlook_test_send_enabled and letter.outlook_message and letter.outlook_message.status == 'draft_created' %}
+                      <form method="post"
+                            action="/response-letters/{{ letter.id }}/outlook-test-send"
+                            onsubmit="return confirm('Отправить PDF только на {{ outlook_test_email }}?');">
+                        <input type="hidden" name="group_id" value="{{ group.id }}">
+                        <button class="button button-danger" type="submit">
+                          Отправить тестовое письмо
+                        </button>
+                      </form>
+                    {% endif %}
                   {% else %}
                     <strong>Для подразделения не настроен email</strong>
                   {% endif %}

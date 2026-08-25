@@ -41,6 +41,7 @@ from gns_app.services.outlook_service import (
     OutlookIntegrationError,
     OutlookOutgoingService,
     OutlookService,
+    SubprocessOutlookGateway,
 )
 from gns_app.services.registry_service import RegistryLookupError
 from gns_app.services.scanner_service import ScannerCancelled, ScannerError
@@ -56,7 +57,13 @@ from gns_app.text_cleanup import clean_taxpayer_name
 PACKAGE_DIR = Path(__file__).resolve().parent
 db = Database(settings.database_path)
 workflow = WorkflowService(db, settings)
-outlook = OutlookService()
+outlook = OutlookService(
+    SubprocessOutlookGateway(
+        allow_insecure_certificate=(
+            settings.outlook_allow_insecure_certificate
+        )
+    )
+)
 outlook_importer = OutlookInboxImporter(db, settings, outlook)
 outlook_outgoing = OutlookOutgoingService(db, settings, outlook)
 
@@ -343,6 +350,8 @@ EVENT_LABELS = {
     "outlook_outgoing_subject_updated": "Обновлена тема исходящих писем",
     "outlook_draft_created": "Создан черновик исходящего письма Outlook",
     "outlook_draft_failed": "Ошибка создания черновика Outlook",
+    "outlook_test_message_sent": "Отправлено тестовое письмо Outlook",
+    "outlook_test_send_failed": "Ошибка тестовой отправки Outlook",
     "gns_offices_replaced": "Обновлён справочник налоговых органов",
     "gns_office_emails_updated": "Обновлены официальные email подразделений",
     "gns_office_location_expanded": "Район дополнен областью или городом",
@@ -434,6 +443,12 @@ def context(request: Request, **values):
         "abs_tls_verification_disabled": (
             workflow.abs_tls_verification_disabled()
         ),
+        "outlook_insecure_certificate_confirmation": (
+            settings.outlook_allow_insecure_certificate
+        ),
+        "outlook_test_mode": outlook_outgoing.test_mode_enabled(),
+        "outlook_test_email": outlook_outgoing.get_test_recipient(),
+        "outlook_test_send_enabled": outlook_outgoing.test_send_enabled(),
         **values,
     }
 
@@ -647,6 +662,11 @@ def download_diagnostics():
                 "enabled" if settings.tolubay_verify_tls else "disabled"
             ),
             "outlook_state": outlook.last_result().state,
+            "outlook_test_mode": outlook_outgoing.test_mode_enabled(),
+            "outlook_test_send_enabled": outlook_outgoing.test_send_enabled(),
+            "outlook_insecure_certificate_confirmation": (
+                settings.outlook_allow_insecure_certificate
+            ),
             "database_available": settings.database_path.is_file(),
             "ocr_engine_imported": ocr_health.get("engine_imported", False),
             "ocr_fast_files_available": ocr_health.get(
@@ -740,6 +760,29 @@ def create_response_letter_outlook_draft(
         "Существующий черновик Outlook открыт."
         if result.get("existing_outlook_draft")
         else "Черновик Outlook создан и открыт для проверки."
+    )
+    return RedirectResponse(
+        f"/today?message={quote(message)}#group-{quote(group_id)}",
+        status_code=303,
+    )
+
+
+@app.post("/response-letters/{letter_id}/outlook-test-send")
+def send_response_letter_outlook_test_message(
+    letter_id: str,
+    group_id: str = Form(""),
+):
+    try:
+        result = outlook_outgoing.send_test_message(workflow, letter_id)
+    except OutlookIntegrationError as exc:
+        return RedirectResponse(
+            f"/today?error={quote(str(exc))}#group-{quote(group_id)}",
+            status_code=303,
+        )
+    message = (
+        "Тестовое письмо уже было отправлено; повторная отправка отменена."
+        if result.get("already_sent")
+        else f"Тестовое письмо отправлено на {outlook_outgoing.get_test_recipient()}."
     )
     return RedirectResponse(
         f"/today?message={quote(message)}#group-{quote(group_id)}",

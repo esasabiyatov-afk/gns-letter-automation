@@ -5,13 +5,19 @@ import json
 import shutil
 import subprocess
 import sys
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+from pypdf import PdfWriter
+
+from gns_app.database import utc_now
+
 from gns_app.services.outlook_service import (
     OutlookAccountInfo,
     OutlookConnectionError,
+    OutlookDraftResult,
     OutlookInboxImporter,
     OutlookInboxScan,
     OutlookProbe,
@@ -21,9 +27,18 @@ from gns_app.services.outlook_service import (
     OutlookService,
     OutlookScannedAttachment,
     OutlookScannedMessage,
+    OutlookSendResult,
     PyWin32OutlookGateway,
     SubprocessOutlookGateway,
 )
+
+
+def write_test_pdf(path: Path) -> Path:
+    writer = PdfWriter()
+    writer.add_blank_page(width=595, height=842)
+    with path.open("wb") as stream:
+        writer.write(stream)
+    return path
 
 
 def sample_probe(*, sync_requested: bool = False) -> OutlookProbe:
@@ -108,7 +123,7 @@ class FakeImportGateway(FakeGateway):
             messages=(
                 OutlookScannedMessage(
                     source_key=message_key,
-                    sender_smtp="esensabiyatov@gmail.com",
+                    sender_smtp="esasabiyatov@gmail.com",
                     received_at="2026-08-21T09:00:00+06:00",
                     attachment_count=2,
                     pdf_attachment_count=2,
@@ -307,8 +322,9 @@ def test_com_gateway_creates_and_reopens_same_outlook_draft(
             return self.values.get(name)
 
         def Add(self, name, property_type, add_to_folder_fields):
+            assert name == "GNS App Draft Key"
             assert property_type == 1
-            assert add_to_folder_fields is True
+            assert add_to_folder_fields is False
             value = UserProperty()
             self.values[name] = value
             return value
@@ -393,6 +409,102 @@ def test_com_gateway_creates_and_reopens_same_outlook_draft(
     assert items.values[0].display_count == 2
 
 
+def test_com_gateway_sends_only_existing_pdf_draft_to_exact_account(
+    monkeypatch,
+):
+    class Property:
+        Value = "gns-test-scan-one"
+
+    class UserProperties:
+        def Find(self, name):
+            return Property() if name == "GNS App Draft Key" else None
+
+    class Attachment:
+        FileName = "Тест.pdf"
+
+    class Attachments:
+        Count = 1
+
+        def Item(self, index):
+            assert index == 1
+            return Attachment()
+
+    class Mail:
+        EntryID = "draft-entry-1"
+
+        def __init__(self):
+            self.To = "real.person@example.com"
+            self.CC = "copy@example.com"
+            self.BCC = "hidden@example.com"
+            self.UserProperties = UserProperties()
+            self.Attachments = Attachments()
+            self.SendUsingAccount = None
+            self.sent = 0
+
+        def Save(self):
+            pass
+
+        def Send(self):
+            self.sent += 1
+
+    mail = Mail()
+
+    class Items:
+        Count = 1
+
+        def Item(self, index):
+            assert index == 1
+            return mail
+
+    account = SimpleNamespace(SmtpAddress="ovo@tolubaybank.kg")
+
+    class Accounts:
+        Count = 1
+
+        def Item(self, index):
+            assert index == 1
+            return account
+
+    namespace = SimpleNamespace(
+        GetDefaultFolder=lambda folder_id: SimpleNamespace(Items=Items()),
+        Accounts=Accounts(),
+    )
+    application = SimpleNamespace(GetNamespace=lambda name: namespace)
+    pythoncom = SimpleNamespace(
+        CoInitialize=lambda: None,
+        CoUninitialize=lambda: None,
+    )
+    client = SimpleNamespace(Dispatch=lambda name: application)
+    monkeypatch.setitem(sys.modules, "pythoncom", pythoncom)
+    monkeypatch.setitem(sys.modules, "win32com", SimpleNamespace(client=client))
+
+    result = PyWin32OutlookGateway().send_draft(
+        draft_key="gns-test-scan-one",
+        recipient_email="esasabiyatov@gmail.com",
+        sending_account="",
+    )
+
+    assert result.recipient_email == "esasabiyatov@gmail.com"
+    assert mail.To == "esasabiyatov@gmail.com"
+    assert mail.CC == ""
+    assert mail.BCC == ""
+    assert mail.SendUsingAccount is account
+    assert mail.sent == 1
+
+    try:
+        PyWin32OutlookGateway().send_draft(
+            draft_key="gns-test-scan-one",
+            recipient_email="real.person@example.com",
+            sending_account="",
+        )
+    except OutlookConnectionError as exc:
+        assert "esasabiyatov@gmail.com" in str(exc)
+    else:
+        raise AssertionError("Отправка не на тестовый адрес должна быть запрещена")
+
+    assert mail.sent == 1
+
+
 def test_outlook_subject_template_accepts_only_known_placeholders(workflow):
     service = OutlookOutgoingService(
         workflow.db,
@@ -415,12 +527,114 @@ def test_outlook_subject_template_accepts_only_known_placeholders(workflow):
         raise AssertionError("Неизвестная подстановка должна быть отклонена")
 
 
+def test_test_mode_sends_once_only_to_fixed_address(workflow):
+    now = utc_now()
+    workflow.db.execute(
+        """
+        INSERT INTO response_groups(
+            id, business_date, group_key, abs_bucket, status,
+            district_place, recipient_position, recipient_full_name,
+            recipient_display_name, employee_name, taxpayer_count,
+            taxpayers_per_letter, response_path, created_at, updated_at
+        ) VALUES (
+            'test-mail-group', '2026-08-25', 'test-mail', 'not_found',
+            'created', 'Тестовое подразделение', 'Начальнику',
+            'Тестовый Получатель', 'Получателю Т. П.', 'Тестовый сотрудник',
+            1, 1, 'unused.docx', ?, ?
+        )
+        """,
+        (now, now),
+    )
+    workflow.db.execute(
+        """
+        INSERT INTO response_letters(
+            id, response_group_id, letter_order, taxpayer_start_order,
+            taxpayer_count, outgoing_number, created_at, updated_at
+        ) VALUES ('test-mail-letter', 'test-mail-group', 1, 1, 1,
+                  '9544', ?, ?)
+        """,
+        (now, now),
+    )
+    scan_dir = workflow.settings.runtime_dir / "signed_scans" / "mail-test"
+    scan_dir.mkdir(parents=True)
+    pdf_path = scan_dir / "signed.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=595, height=842)
+    with pdf_path.open("wb") as stream:
+        writer.write(stream)
+    workflow.db.execute(
+        """
+        INSERT INTO signed_response_scans(
+            id, response_letter_id, status, source, original_filename,
+            original_path, pdf_path, sha256, size_bytes, page_count,
+            correct_letter_confirmed, signature_confirmed,
+            bank_seal_confirmed, confirmed_by, confirmed_at,
+            created_at, updated_at
+        ) VALUES (
+            'test-mail-scan', 'test-mail-letter', 'confirmed', 'upload',
+            'signed.pdf', ?, ?, 'test-sha', ?, 1, 1, 1, 1,
+            'Тестовый сотрудник', ?, ?, ?
+        )
+        """,
+        (str(pdf_path), str(pdf_path), pdf_path.stat().st_size, now, now, now),
+    )
+
+    class Gateway:
+        def __init__(self):
+            self.draft_requests = []
+            self.send_requests = []
+
+        def create_draft(self, **request):
+            self.draft_requests.append(request)
+            return OutlookDraftResult(
+                entry_id="test-draft-entry",
+                recipient_email=request["recipient_email"],
+                subject=request["subject"],
+                attachment_name=request["attachment_name"],
+            )
+
+        def send_draft(self, **request):
+            self.send_requests.append(request)
+            return OutlookSendResult(
+                entry_id="test-sent-entry",
+                recipient_email=request["recipient_email"],
+            )
+
+    gateway = Gateway()
+    test_settings = replace(
+        workflow.settings,
+        outlook_test_email="esasabiyatov@gmail.com",
+        outlook_allow_test_send=True,
+    )
+    outgoing = OutlookOutgoingService(
+        workflow.db,
+        test_settings,
+        OutlookService(gateway),
+    )
+
+    draft = outgoing.create_draft(workflow, "test-mail-letter")
+    sent = outgoing.send_test_message(workflow, "test-mail-letter")
+    repeated = outgoing.send_test_message(workflow, "test-mail-letter")
+
+    assert draft["recipient_email"] == "esasabiyatov@gmail.com"
+    assert gateway.draft_requests[0]["draft_key"] == (
+        "gns-test-scan-test-mail-scan"
+    )
+    assert sent["status"] == "sent"
+    assert not sent["already_sent"]
+    assert repeated["already_sent"]
+    assert len(gateway.send_requests) == 1
+    assert gateway.send_requests[0]["recipient_email"] == (
+        "esasabiyatov@gmail.com"
+    )
+    assert gateway.send_requests[0]["sending_account"] == ""
+
+
 def test_com_gateway_filters_sender_and_exports_only_pdf(
     monkeypatch,
     tmp_path,
-    project_root,
 ):
-    source_pdf = project_root / "УГНС" / "пример письма.pdf"
+    source_pdf = write_test_pdf(tmp_path / "source.pdf")
 
     class Accessor:
         def __init__(self, internet_id):
@@ -461,7 +675,7 @@ def test_com_gateway_filters_sender_and_exports_only_pdf(
             self.PropertyAccessor = Accessor(internet_id)
             self.Attachments = Attachments()
 
-    allowed_mail = Mail("esensabiyatov@gmail.com", "allowed@example.test")
+    allowed_mail = Mail("esasabiyatov@gmail.com", "allowed@example.test")
     blocked_mail = Mail("blocked@example.test", "blocked@example.test")
 
     class Items:
@@ -502,7 +716,7 @@ def test_com_gateway_filters_sender_and_exports_only_pdf(
     staging_dir = tmp_path / "staging"
     staging_dir.mkdir()
     scan = PyWin32OutlookGateway().scan_inbox(
-        allowed_senders=frozenset({"esensabiyatov@gmail.com"}),
+        allowed_senders=frozenset({"esasabiyatov@gmail.com"}),
         allowed_domains=frozenset({"sti.gov.kg", "salyk.kg"}),
         received_since=date(2026, 8, 20),
         known_message_keys=frozenset(),
@@ -565,6 +779,37 @@ def test_outlook_draft_route_reports_created_and_existing(monkeypatch):
     assert "message=" in reopened.headers["location"]
 
 
+def test_outlook_test_send_route_reports_sent_and_idempotent(monkeypatch):
+    from gns_app import main
+
+    class FakeOutgoing:
+        repeated = False
+
+        @classmethod
+        def send_test_message(cls, workflow, letter_id):
+            assert letter_id == "letter-1"
+            return {"already_sent": cls.repeated}
+
+        @staticmethod
+        def get_test_recipient():
+            return "esasabiyatov@gmail.com"
+
+    monkeypatch.setattr(main, "outlook_outgoing", FakeOutgoing())
+
+    sent = main.send_response_letter_outlook_test_message(
+        "letter-1", "group-1"
+    )
+    FakeOutgoing.repeated = True
+    repeated = main.send_response_letter_outlook_test_message(
+        "letter-1", "group-1"
+    )
+
+    assert sent.status_code == 303
+    assert "message=" in sent.headers["location"]
+    assert repeated.status_code == 303
+    assert "message=" in repeated.headers["location"]
+
+
 def test_outlook_import_route_queues_only_new_uploads(monkeypatch):
     from fastapi import BackgroundTasks
 
@@ -595,14 +840,14 @@ def test_outlook_import_route_queues_only_new_uploads(monkeypatch):
 
 def test_outlook_import_saves_message_once_and_reuses_duplicate_content(
     workflow,
-    project_root,
+    tmp_path,
 ):
     workflow.initialize_employee_profiles()
-    gateway = FakeImportGateway(project_root / "УГНС" / "пример письма.pdf")
+    gateway = FakeImportGateway(write_test_pdf(tmp_path / "source.pdf"))
     service = OutlookService(gateway)
     importer = OutlookInboxImporter(workflow.db, workflow.settings, service)
     importer.update_settings(
-        allowed_senders="esensabiyatov@gmail.com",
+        allowed_senders="esasabiyatov@gmail.com",
         import_since="2026-08-20",
         mailbox="esasabiyatov@gmail.com",
     )
@@ -675,6 +920,27 @@ def test_outlook_import_settings_validate_sender_and_date(workflow):
 
     assert importer.get_auto_enabled()
     assert importer.get_auto_interval_minutes() == 7
+
+
+def test_outlook_test_mode_ignores_all_other_sender_rules(workflow):
+    test_settings = replace(
+        workflow.settings,
+        outlook_test_email="esasabiyatov@gmail.com",
+    )
+    importer = OutlookInboxImporter(
+        workflow.db,
+        test_settings,
+        OutlookService(FakeGateway()),
+    )
+    importer.update_settings(
+        allowed_senders="real.person@example.com",
+        import_since=date.today().isoformat(),
+    )
+
+    assert importer.get_allowed_senders() == frozenset(
+        {"esasabiyatov@gmail.com"}
+    )
+    assert importer.get_allowed_domains() == frozenset()
 
 
 def test_outlook_automation_status_is_persisted(workflow):

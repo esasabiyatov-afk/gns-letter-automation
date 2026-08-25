@@ -45,6 +45,18 @@
         в согласованной офисной сети.
       </div>
     {% endif %}
+    {% if outlook_insecure_certificate_confirmation %}
+      <div class="alert alert-error">
+        Outlook автоматически подтверждает только предупреждение о
+        недействительном сертификате. Режим согласован для офисного теста.
+      </div>
+    {% endif %}
+    {% if outlook_test_mode %}
+      <div class="alert alert-success">
+        Почта работает в тестовом режиме: входящие PDF принимаются только от
+        {{ outlook_test_email }}, отправка разрешена только на этот же адрес.
+      </div>
+    {% endif %}
     {% if request.query_params.get('error') %}
       <div class="alert alert-error">{{ request.query_params.get('error') }}</div>
     {% endif %}

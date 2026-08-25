@@ -5,6 +5,7 @@ import os
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from ctypes import wintypes
 from typing import Iterable
 
@@ -15,6 +16,35 @@ SWP_NOMOVE = 0x0002
 SWP_SHOWWINDOW = 0x0040
 HWND_TOPMOST = -1
 HWND_NOTOPMOST = -2
+BM_CLICK = 0x00F5
+IDYES = 6
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+OUTLOOK_CERTIFICATE_TITLE_MARKERS = (
+    "internet security warning",
+    "security warning",
+    "предупреждение безопасности интернета",
+    "предупреждение системы безопасности в интернете",
+    "предупреждение системы безопасности",
+)
+OUTLOOK_CERTIFICATE_TEXT_MARKERS = (
+    "certificate",
+    "сертификат",
+)
+OUTLOOK_CERTIFICATE_PROBLEM_MARKERS = (
+    "expired",
+    "not yet valid",
+    "cannot be verified",
+    "could not be verified",
+    "истек",
+    "просроч",
+    "еще не действителен",
+    "ещё не действителен",
+    "не может быть проверен",
+    "не удалось проверить",
+    "отсутствует отношение доверия",
+    "корневом сертификате",
+)
 
 
 def focus_window_handle(hwnd: int) -> bool:
@@ -59,6 +89,156 @@ def _window_class(user32, hwnd: int) -> str:
     buffer = ctypes.create_unicode_buffer(256)
     user32.GetClassNameW(wintypes.HWND(hwnd), buffer, len(buffer))
     return buffer.value
+
+
+def _looks_like_outlook_certificate_warning(
+    title: str,
+    child_texts: Iterable[str],
+) -> bool:
+    normalized_title = title.casefold()
+    normalized_text = "\n".join(child_texts).casefold()
+    return (
+        any(marker in normalized_title for marker in OUTLOOK_CERTIFICATE_TITLE_MARKERS)
+        and any(marker in normalized_text for marker in OUTLOOK_CERTIFICATE_TEXT_MARKERS)
+        and any(marker in normalized_text for marker in OUTLOOK_CERTIFICATE_PROBLEM_MARKERS)
+    )
+
+
+def _window_process_image(user32, kernel32, hwnd: int) -> str:
+    process_id = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(
+        wintypes.HWND(hwnd), ctypes.byref(process_id)
+    )
+    if not process_id.value:
+        return ""
+    process = kernel32.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION,
+        False,
+        process_id.value,
+    )
+    if not process:
+        return ""
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(buffer))
+        if not kernel32.QueryFullProcessImageNameW(
+            process, 0, buffer, ctypes.byref(size)
+        ):
+            return ""
+        return buffer.value
+    finally:
+        kernel32.CloseHandle(process)
+
+
+def confirm_outlook_certificate_dialog_once() -> bool:
+    """Confirm only a recognized invalid-certificate dialog owned by Outlook."""
+    if sys.platform != "win32":
+        return False
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    matches: list[int] = []
+    callback_type = ctypes.WINFUNCTYPE(
+        wintypes.BOOL,
+        wintypes.HWND,
+        wintypes.LPARAM,
+    )
+
+    @callback_type
+    def callback(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        if _window_class(user32, hwnd) != "#32770":
+            return True
+        image = _window_process_image(user32, kernel32, hwnd).casefold()
+        if not image.endswith("\\outlook.exe"):
+            return True
+
+        child_texts: list[str] = []
+        yes_buttons: list[int] = []
+        child_callback_type = ctypes.WINFUNCTYPE(
+            wintypes.BOOL,
+            wintypes.HWND,
+            wintypes.LPARAM,
+        )
+
+        @child_callback_type
+        def child_callback(child, _child_lparam):
+            text = _window_text(user32, child)
+            if text:
+                child_texts.append(text)
+            if (
+                _window_class(user32, child).casefold() == "button"
+                and int(user32.GetDlgCtrlID(wintypes.HWND(child))) == IDYES
+            ):
+                yes_buttons.append(int(child))
+            return True
+
+        user32.EnumChildWindows(
+            wintypes.HWND(hwnd), child_callback, 0
+        )
+        if (
+            yes_buttons
+            and _looks_like_outlook_certificate_warning(
+                _window_text(user32, hwnd), child_texts
+            )
+        ):
+            matches.append(yes_buttons[0])
+            return False
+        return True
+
+    user32.EnumWindows(callback, 0)
+    if not matches:
+        return False
+    return bool(
+        user32.PostMessageW(
+            wintypes.HWND(matches[0]), BM_CLICK, 0, 0
+        )
+    )
+
+
+@dataclass(slots=True)
+class OutlookCertificateDialogWatcher:
+    thread: threading.Thread
+    stop_event: threading.Event
+    confirmed_event: threading.Event
+
+    def finish(self, grace_seconds: float = 5.0) -> bool:
+        self.confirmed_event.wait(max(0.0, grace_seconds))
+        self.stop_event.set()
+        self.thread.join(timeout=1.0)
+        return self.confirmed_event.is_set()
+
+
+def start_outlook_certificate_dialog_watcher(
+    *,
+    timeout_seconds: float = 20.0,
+) -> OutlookCertificateDialogWatcher | None:
+    """Watch briefly and confirm only Outlook's known certificate warning."""
+    if sys.platform != "win32":
+        return None
+    stop_event = threading.Event()
+    confirmed_event = threading.Event()
+
+    def watch() -> None:
+        deadline = time.monotonic() + timeout_seconds
+        while not stop_event.is_set() and time.monotonic() < deadline:
+            if confirm_outlook_certificate_dialog_once():
+                confirmed_event.set()
+                return
+            stop_event.wait(0.15)
+
+    thread = threading.Thread(
+        target=watch,
+        name="gns-outlook-certificate-confirmation",
+        daemon=True,
+    )
+    watcher = OutlookCertificateDialogWatcher(
+        thread=thread,
+        stop_event=stop_event,
+        confirmed_event=confirmed_event,
+    )
+    thread.start()
+    return watcher
 
 
 def find_and_focus_window(
