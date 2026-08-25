@@ -66,9 +66,15 @@ def test_customer_search_posts_full_form_and_reads_exact_inn():
     assert opener.request is not None
     assert opener.request.get_method() == "POST"
     assert opener.request.get_header("X-requested-with") == "XMLHttpRequest"
+    assert opener.request.get_header("Accept") == "text/html, */*; q=0.01"
+    assert opener.request.get_header("Referer") == (
+        "https://abs.example.test/OnlineBank.Management.MVC/"
+    )
     fields = parse_qs(opener.request.data.decode("utf-8"), keep_blank_values=True)
     assert fields["SearchIdentificationNo"] == [inn]
     assert fields["ShowLinks"] == ["True"]
+    assert fields["page"] == ["1"]
+    assert fields["pageSize"] == ["50"]
     assert fields["SearchSurname"] == [""]
     assert len(results) == 1
     assert results[0].customer_id == "42"
@@ -79,6 +85,14 @@ def test_customer_search_accepts_recognizable_empty_table():
     client, _ = _client(
         "<table><thead><tr><th>ID</th><th>ФИО / Наименование</th>"
         "</tr></thead><tbody></tbody></table>"
+    )
+
+    assert client.search_customers({"SearchIdentificationNo": "12345678901234"}) == []
+
+
+def test_customer_search_accepts_official_empty_message():
+    client, _ = _client(
+        "<div>Клиенты с заданными параметрами не найдены</div>"
     )
 
     assert client.search_customers({"SearchIdentificationNo": "12345678901234"}) == []

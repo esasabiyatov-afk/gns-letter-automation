@@ -62,6 +62,44 @@ def test_initialize_corrects_legacy_qr_source(tmp_path):
     )["source_kind"] == "manual"
 
 
+def test_initialize_adds_abs_account_summary_columns_to_legacy_database(tmp_path):
+    path = tmp_path / "legacy-abs.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE taxpayers (
+                id TEXT PRIMARY KEY,
+                case_id TEXT NOT NULL,
+                display_order INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                inn TEXT NOT NULL,
+                name_source TEXT NOT NULL,
+                inn_source TEXT NOT NULL,
+                manually_confirmed INTEGER NOT NULL DEFAULT 0,
+                abs_result TEXT,
+                abs_account_result TEXT,
+                odb_result TEXT,
+                registry_status TEXT,
+                registry_name TEXT,
+                registry_director TEXT,
+                registry_checked_at TEXT,
+                registry_provider TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+    Database(path).initialize()
+
+    with sqlite3.connect(path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(taxpayers)")
+        }
+    assert "abs_active_account_count" in columns
+    assert "abs_closed_account_count" in columns
+
+
 def test_initialize_cleans_edge_quote_and_audits_change(tmp_path):
     db = Database(tmp_path / "cleanup.sqlite3")
     db.initialize()

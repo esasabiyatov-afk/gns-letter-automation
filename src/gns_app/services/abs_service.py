@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from typing import Any
 from urllib.error import HTTPError, URLError
 
 from gns_app.config import Settings
@@ -109,6 +110,16 @@ class TolubayAbsGateway:
     def _normalized_inn(value: object) -> str:
         return "".join(character for character in str(value) if character.isdigit())
 
+    @classmethod
+    def _questionnaire_inn(cls, questionnaire: object) -> str:
+        fields = getattr(questionnaire, "fields", None)
+        if not isinstance(fields, Mapping):
+            raise ProtocolError("Customer questionnaire fields are missing")
+        raw_value: Any = fields.get("GeneralInfoModel.IdentificationNumber")
+        if isinstance(raw_value, Mapping):
+            raw_value = raw_value.get("value") or raw_value.get("text") or ""
+        return cls._normalized_inn(raw_value or "")
+
     @staticmethod
     def _protocol_status(error: ProtocolError) -> AbsStatus:
         cause = error.__cause__
@@ -145,34 +156,63 @@ class TolubayAbsGateway:
         try:
             client = self._client_factory(self.config)
             client.login(username.strip(), password)
-            taxpayer_results: list[dict[str, str]] = []
+            taxpayer_results: list[dict[str, Any]] = []
             for taxpayer in taxpayers:
                 inn = taxpayer["inn"]
                 matches = client.search_customers(
                     {"SearchIdentificationNo": inn},
                     page_size=100,
                 )
-                exact_matches = [
-                    customer
-                    for customer in matches
-                    if self._normalized_inn(customer.identity) == inn
-                ]
                 if not matches:
                     taxpayer_result = AbsStatus.NOT_FOUND
-                elif len(matches) != 1 or len(exact_matches) != 1:
+                    active_account_count = None
+                    closed_account_count = None
+                elif len(matches) != 1:
                     taxpayer_result = AbsStatus.MULTIPLE
+                    active_account_count = None
+                    closed_account_count = None
                 else:
-                    # До уточнения бизнес-правила сама точная анкета клиента
-                    # достаточна для ручной обработки. Отсутствие счетов не
-                    # разрешает автоматический ответ об отсутствии клиента.
-                    taxpayer_result = AbsStatus.FOUND
-                taxpayer_results.append(
-                    {
-                        "inn": inn,
-                        "name": taxpayer["name"],
-                        "result": str(taxpayer_result),
-                    }
-                )
+                    # Анкета и агрегированные сведения о счетах читаются
+                    # только для одного кандидата. Бизнес-решение о наличии
+                    # счета по-прежнему подтверждает сотрудник.
+                    customer = matches[0]
+                    summary_inn = self._normalized_inn(customer.identity)
+                    questionnaire = client.get_customer_questionnaire(
+                        customer.customer_id
+                    )
+                    questionnaire_inn = self._questionnaire_inn(questionnaire)
+                    identity_confirmed = (
+                        summary_inn == inn or questionnaire_inn == inn
+                    )
+                    identity_conflict = (
+                        bool(questionnaire_inn and questionnaire_inn != inn)
+                        or bool(
+                            len(summary_inn) == 14 and summary_inn != inn
+                        )
+                    )
+                    if not identity_confirmed or identity_conflict:
+                        taxpayer_result = AbsStatus.MULTIPLE
+                        active_account_count = None
+                        closed_account_count = None
+                    else:
+                        accounts = client.get_accounts(
+                            customer.customer_id,
+                            include_closed=True,
+                        )
+                        closed_account_count = sum(
+                            1 for account in accounts if account.is_closed
+                        )
+                        active_account_count = (
+                            len(accounts) - closed_account_count
+                        )
+                        taxpayer_result = AbsStatus.FOUND
+                taxpayer_results.append({
+                    "inn": inn,
+                    "name": taxpayer["name"],
+                    "result": str(taxpayer_result),
+                    "active_account_count": active_account_count,
+                    "closed_account_count": closed_account_count,
+                })
         except AuthenticationError:
             return self._failure(
                 AbsStatus.AUTH_ERROR,

@@ -859,6 +859,67 @@ def test_found_abs_questionnaire_waits_for_manual_account_result(workflow):
     assert workflow.get_case(case_id)["status"] == "ready_for_response"
 
 
+def test_real_abs_account_counts_are_persisted_without_auto_confirmation(
+    workflow, monkeypatch
+):
+    from bs4 import BeautifulSoup
+    from starlette.testclient import TestClient
+
+    from gns_app import main
+
+    class AccountSummaryGateway:
+        is_fake = False
+        supports_session = False
+
+        @staticmethod
+        def check(username, password, taxpayers):
+            assert username == "employee"
+            assert password == "one-time-secret"
+            return AbsCheckResult(
+                status=AbsStatus.FOUND,
+                taxpayers=[
+                    {
+                        "inn": taxpayers[0]["inn"],
+                        "name": taxpayers[0]["name"],
+                        "result": AbsStatus.FOUND,
+                        "active_account_count": 2,
+                        "closed_account_count": 1,
+                    }
+                ],
+                message="Анкета найдена.",
+                is_fake=False,
+            )
+
+    workflow.abs = AccountSummaryGateway()
+    case_id = _insert_ready_case(
+        workflow, "12345678901234", 'ОсОО "Первый"'
+    )
+
+    workflow.check_abs(case_id, "employee", "one-time-secret")
+
+    taxpayer = workflow.get_taxpayers(case_id)[0]
+    assert taxpayer["abs_active_account_count"] == 2
+    assert taxpayer["abs_closed_account_count"] == 1
+    assert taxpayer["abs_account_result"] is None
+    assert workflow.get_case(case_id)["status"] == "needs_review"
+    overview_taxpayer = workflow.today_overview()["found_groups"][0][
+        "taxpayers"
+    ][0]
+    assert overview_taxpayer["abs_active_account_count"] == 2
+    assert overview_taxpayer["abs_closed_account_count"] == 1
+    monkeypatch.setattr(main, "workflow", workflow)
+    response = TestClient(main.app).get("/today")
+    assert response.status_code == 200
+    visible_text = " ".join(
+        BeautifulSoup(response.text, "html.parser")
+        .get_text(" ", strip=True)
+        .split()
+    )
+    assert "АБС прочитала счета: активных — 2, закрытых — 1." in visible_text
+    assert "Есть счёт" in response.text
+    assert "Счёта нет" in response.text
+
+
 def test_found_abs_questionnaire_with_account_stays_manual(workflow):
     case_id = _insert_ready_case(
         workflow, "12345678901234", 'ОсОО "Первый"'

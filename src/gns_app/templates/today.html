@@ -336,6 +336,14 @@
             </a>
             <strong>ИНН {{ taxpayer.inn }}</strong>
             {% if taxpayer.abs_result == 'found' and not taxpayer.abs_account_result %}
+              {% if taxpayer.abs_active_account_count is not none
+                    and taxpayer.abs_closed_account_count is not none %}
+                <small>
+                  АБС прочитала счета: активных —
+                  {{ taxpayer.abs_active_account_count }}, закрытых —
+                  {{ taxpayer.abs_closed_account_count }}.
+                </small>
+              {% endif %}
               <form class="abs-account-form" method="post"
                     action="/cases/{{ taxpayer.source_case_id }}/abs-account/taxpayer">
                 <input type="hidden" name="taxpayer_inn" value="{{ taxpayer.inn }}">

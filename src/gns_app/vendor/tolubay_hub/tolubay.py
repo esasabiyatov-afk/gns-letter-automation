@@ -523,11 +523,17 @@ class TolubayClient:
             "ShowLinks": "True",
             **{field: "" for field in CUSTOMER_SEARCH_FIELDS},
             **normalized,
+            "page": page,
+            "pageSize": page_size,
         }
         body, _, _ = self._post_form(
             CUSTOMER_SEARCH_RESULT,
             payload,
-            headers={"X-Requested-With": "XMLHttpRequest"},
+            headers={
+                "Accept": "text/html, */*; q=0.01",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": urljoin(self.config.base_url, ROOT + "/"),
+            },
         )
         html = body.decode("utf-8", errors="replace")
         parser = _HtmlTablesParser()
@@ -555,6 +561,7 @@ class TolubayClient:
         if table is None:
             explicit_empty = re.search(
                 r"(?:ничего\s+не\s+найден|запис(?:ей|и)\s+не\s+найден|"
+                r"клиент(?:ы|ов)?\s+с\s+заданными\s+параметрами\s+не\s+найден|"
                 r"данн(?:ые|ых)\s+отсутств|нет\s+данных|no\s+(?:records|data))",
                 html,
                 flags=re.IGNORECASE,

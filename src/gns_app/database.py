@@ -105,6 +105,8 @@ CREATE TABLE IF NOT EXISTS taxpayers (
     manually_confirmed INTEGER NOT NULL DEFAULT 0,
     abs_result TEXT,
     abs_account_result TEXT,
+    abs_active_account_count INTEGER,
+    abs_closed_account_count INTEGER,
     odb_result TEXT,
     registry_status TEXT,
     registry_name TEXT,
@@ -415,6 +417,8 @@ class Database:
         additions = {
             "odb_result": "TEXT",
             "abs_account_result": "TEXT",
+            "abs_active_account_count": "INTEGER",
+            "abs_closed_account_count": "INTEGER",
             "registry_status": "TEXT",
             "registry_name": "TEXT",
             "registry_director": "TEXT",

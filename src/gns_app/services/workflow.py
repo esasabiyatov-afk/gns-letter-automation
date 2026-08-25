@@ -3361,11 +3361,15 @@ class WorkflowService:
                 """
                 UPDATE taxpayers
                 SET abs_result = ?, abs_account_result = NULL,
+                    abs_active_account_count = ?,
+                    abs_closed_account_count = ?,
                     odb_result = NULL, updated_at = ?
                 WHERE case_id = ? AND inn = ?
                 """,
                 (
                     taxpayer_result["result"],
+                    taxpayer_result.get("active_account_count"),
+                    taxpayer_result.get("closed_account_count"),
                     utc_now(),
                     case_id,
                     taxpayer_result["inn"],
@@ -3930,6 +3934,8 @@ class WorkflowService:
                 taxpayers.display_order,
                 taxpayers.abs_result,
                 taxpayers.abs_account_result,
+                taxpayers.abs_active_account_count,
+                taxpayers.abs_closed_account_count,
                 taxpayers.odb_result,
                 (
                     SELECT pages.id
@@ -4011,6 +4017,12 @@ class WorkflowService:
                     "inn": inn,
                     "abs_result": row.get("abs_result"),
                     "abs_account_result": row.get("abs_account_result"),
+                    "abs_active_account_count": row.get(
+                        "abs_active_account_count"
+                    ),
+                    "abs_closed_account_count": row.get(
+                        "abs_closed_account_count"
+                    ),
                     "odb_result": row.get("odb_result"),
                 }
                 group["_taxpayers_by_inn"][inn] = taxpayer

@@ -77,6 +77,15 @@
             АБС: {{ abs_status_labels.get(taxpayer.abs_result or 'not_checked',
                                           taxpayer.abs_result or 'не проверен') }}
           </em>
+          {% if taxpayer.abs_active_account_count is not none
+                and taxpayer.abs_closed_account_count is not none %}
+            <small>
+              Счета по данным АБС: активных —
+              {{ taxpayer.abs_active_account_count }}, закрытых —
+              {{ taxpayer.abs_closed_account_count }}.
+              Наличие счёта подтверждает сотрудник.
+            </small>
+          {% endif %}
           {% if case.status == 'manual_period_rule'
                 or taxpayer.odb_result %}
             <em class="abs-result abs-{{ taxpayer.odb_result or 'not_checked' }}">
