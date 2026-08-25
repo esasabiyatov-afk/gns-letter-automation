@@ -32,6 +32,7 @@ class Settings:
     tolubay_base_url: str = "https://ob.tolubay.kg"
     tolubay_ca_file: Path | None = None
     tolubay_timeout_seconds: float = 30.0
+    tolubay_verify_tls: bool = True
 
     @classmethod
     def load(cls) -> "Settings":
@@ -62,6 +63,13 @@ class Settings:
         if abs_mode not in {"fake", "tolubay"}:
             raise ValueError("GNS_ABS_MODE должен быть fake или tolubay")
         tolubay_ca_text = os.environ.get("GNS_TOLUBAY_CA_FILE", "").strip()
+        tolubay_verify_text = os.environ.get(
+            "GNS_TOLUBAY_VERIFY_TLS", "true"
+        ).strip().casefold()
+        if tolubay_verify_text not in {"true", "false"}:
+            raise ValueError(
+                "GNS_TOLUBAY_VERIFY_TLS должен быть true или false"
+            )
 
         return cls(
             project_root=project_root,
@@ -120,6 +128,7 @@ class Settings:
                     float(os.environ.get("GNS_TOLUBAY_TIMEOUT_SECONDS", "30")),
                 ),
             ),
+            tolubay_verify_tls=tolubay_verify_text == "true",
         )
 
     def ensure_directories(self) -> None:

@@ -9,6 +9,27 @@ def test_review_preferences_are_simple_by_default(workflow):
     }
 
 
+def test_abs_insecure_tls_state_is_exposed_for_global_warning(workflow):
+    workflow.abs.tls_verification_disabled = True
+
+    assert workflow.abs_tls_verification_disabled()
+
+
+def test_abs_insecure_tls_warning_is_rendered(workflow, monkeypatch):
+    from starlette.testclient import TestClient
+
+    from gns_app import main
+
+    workflow.abs.tls_verification_disabled = True
+    monkeypatch.setattr(main, "workflow", workflow)
+
+    response = TestClient(main.app).get("/cases")
+
+    assert response.status_code == 200
+    assert "Проверка сертификата АБС отключена" in response.text
+    assert "Подлинность сервера не подтверждается" in response.text
+
+
 def test_confirmed_recipient_is_suggested_by_partial_name(workflow):
     workflow.db.execute(
         """

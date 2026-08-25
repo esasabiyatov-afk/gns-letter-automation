@@ -279,11 +279,38 @@ def test_tolubay_gateway_rejects_unconfirmed_inn_before_network_call():
     assert not created
 
 
-def test_tolubay_gateway_forbids_disabled_tls_verification():
-    with pytest.raises(ValueError, match="TLS"):
+def test_tolubay_gateway_rejects_disabled_tls_for_another_host():
+    with pytest.raises(ValueError, match="ob.tolubay.kg"):
         TolubayAbsGateway(
             TolubayConfig(
                 base_url="https://abs.example.test",
                 verify_tls=False,
             )
+        )
+
+
+def test_tolubay_gateway_allows_explicit_insecure_mode_for_exact_host():
+    adapter = TolubayAbsGateway(
+        TolubayConfig(
+            base_url="https://ob.tolubay.kg",
+            verify_tls=False,
+        ),
+        client_factory=lambda config: StubTolubayClient(),
+    )
+
+    assert adapter.tls_verification_disabled
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://ob.tolubay.kg",
+        "https://ob.tolubay.kg.example.test",
+        "https://user:secret@ob.tolubay.kg",
+    ],
+)
+def test_tolubay_gateway_insecure_mode_is_bound_to_exact_https_origin(base_url):
+    with pytest.raises(ValueError, match="ob.tolubay.kg"):
+        TolubayAbsGateway(
+            TolubayConfig(base_url=base_url, verify_tls=False)
         )

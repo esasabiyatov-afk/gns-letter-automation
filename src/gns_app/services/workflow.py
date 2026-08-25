@@ -145,6 +145,9 @@ class WorkflowService:
     def abs_is_fake(self) -> bool:
         return bool(getattr(self.abs, "is_fake", False))
 
+    def abs_tls_verification_disabled(self) -> bool:
+        return bool(getattr(self.abs, "tls_verification_disabled", False))
+
     def abs_session_supported(self) -> bool:
         return bool(getattr(self.abs, "supports_session", False))
 

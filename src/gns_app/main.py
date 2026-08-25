@@ -431,6 +431,9 @@ def context(request: Request, **values):
         "abs_session_active": workflow.abs_session_active(),
         "abs_session_supported": workflow.abs_session_supported(),
         "abs_is_fake": workflow.abs_is_fake(),
+        "abs_tls_verification_disabled": (
+            workflow.abs_tls_verification_disabled()
+        ),
         **values,
     }
 
@@ -640,6 +643,9 @@ def download_diagnostics():
         settings.runtime_dir,
         extra={
             "abs_mode": settings.abs_mode,
+            "abs_tls_verification": (
+                "enabled" if settings.tolubay_verify_tls else "disabled"
+            ),
             "outlook_state": outlook.last_result().state,
             "database_available": settings.database_path.is_file(),
             "ocr_engine_imported": ocr_health.get("engine_imported", False),

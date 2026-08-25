@@ -38,6 +38,13 @@
   </header>
 
   <main class="page-shell">
+    {% if abs_tls_verification_disabled %}
+      <div class="alert alert-error">
+        Проверка сертификата АБС отключена для ob.tolubay.kg.
+        Подлинность сервера не подтверждается; используйте режим только
+        в согласованной офисной сети.
+      </div>
+    {% endif %}
     {% if request.query_params.get('error') %}
       <div class="alert alert-error">{{ request.query_params.get('error') }}</div>
     {% endif %}

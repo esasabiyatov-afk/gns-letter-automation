@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 
 from gns_app.config import Settings
 from gns_app.domain import AbsCheckResult, AbsStatus
@@ -93,8 +94,19 @@ class TolubayAbsGateway:
         client_factory: Callable[[TolubayConfig], TolubayClient] = TolubayClient,
     ) -> None:
         if not config.verify_tls:
-            raise ValueError("Проверку TLS для рабочей АБС отключать нельзя")
+            parsed = urlparse(config.base_url)
+            if (
+                parsed.scheme.casefold() != "https"
+                or (parsed.hostname or "").casefold() != "ob.tolubay.kg"
+                or parsed.username
+                or parsed.password
+            ):
+                raise ValueError(
+                    "Отключение проверки TLS разрешено только для "
+                    "https://ob.tolubay.kg"
+                )
         self.config = config
+        self.tls_verification_disabled = not config.verify_tls
         self._client_factory = client_factory
 
     @staticmethod
@@ -265,7 +277,7 @@ def create_abs_gateway(settings: Settings) -> FakeAbsGateway | TolubayAbsGateway
             TolubayConfig(
                 base_url=settings.tolubay_base_url,
                 ca_file=settings.tolubay_ca_file,
-                verify_tls=True,
+                verify_tls=settings.tolubay_verify_tls,
                 timeout_seconds=settings.tolubay_timeout_seconds,
             )
         )
