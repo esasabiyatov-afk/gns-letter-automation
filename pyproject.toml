@@ -26,11 +26,16 @@ dependencies = [
     "zxing-cpp>=3.0,<4",
     "beautifulsoup4>=4.12,<5",
     "cloudscraper>=1.2,<2",
+    "pywin32>=306,<400; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.4,<9",
+]
+release = [
+    "pyinstaller>=6.10,<7",
+    "py7zr>=0.22,<2",
 ]
 
 [project.scripts]

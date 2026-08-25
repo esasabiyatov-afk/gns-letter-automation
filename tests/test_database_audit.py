@@ -1,3 +1,6 @@
+import json
+import sqlite3
+
 import pytest
 
 from gns_app.database import Database
@@ -97,3 +100,76 @@ def test_initialize_cleans_edge_quote_and_audits_change(tmp_path):
         """
     )
     assert event is not None
+
+
+def test_initialize_backfills_letters_for_legacy_split_response(tmp_path):
+    path = tmp_path / "legacy-response.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE response_groups (
+                id TEXT PRIMARY KEY,
+                business_date TEXT NOT NULL,
+                group_key TEXT NOT NULL,
+                abs_bucket TEXT NOT NULL,
+                status TEXT NOT NULL,
+                district_place TEXT NOT NULL,
+                recipient_position TEXT NOT NULL,
+                recipient_full_name TEXT NOT NULL,
+                recipient_display_name TEXT NOT NULL,
+                employee_name TEXT NOT NULL,
+                taxpayer_count INTEGER NOT NULL,
+                response_path TEXT,
+                response_page_overflow INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE audit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO response_groups(
+                id, business_date, group_key, abs_bucket, status,
+                district_place, recipient_position, recipient_full_name,
+                recipient_display_name, employee_name, taxpayer_count,
+                response_path, created_at, updated_at
+            ) VALUES ('legacy-group', '2026-08-22', 'key', 'not_found',
+                      'created', 'по району', 'Начальник', 'Тестов Тест',
+                      'Тестову Т.', 'Сотрудник', 5, 'response.docx',
+                      '2026-08-22T01:00:00+00:00',
+                      '2026-08-22T01:00:00+00:00')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO audit_events(
+                entity_type, entity_id, event_type, actor,
+                payload_json, created_at
+            ) VALUES ('response_group', 'legacy-group',
+                      'grouped_response_created', 'system', ?,
+                      '2026-08-22T01:00:00+00:00')
+            """,
+            (json.dumps({"taxpayers_per_page": 2}),),
+        )
+
+    database = Database(path)
+    database.initialize()
+
+    group = database.fetch_one(
+        "SELECT * FROM response_groups WHERE id = 'legacy-group'"
+    )
+    letters = database.fetch_all(
+        "SELECT * FROM response_letters "
+        "WHERE response_group_id = 'legacy-group' ORDER BY letter_order"
+    )
+    assert group["taxpayers_per_letter"] == 2
+    assert [letter["taxpayer_count"] for letter in letters] == [2, 2, 1]

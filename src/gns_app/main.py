@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+import os
+import sys
+from contextlib import asynccontextmanager, suppress
 from datetime import date
 from pathlib import Path
 from urllib.parse import quote
@@ -27,9 +29,23 @@ from fastapi.templating import Jinja2Templates
 
 from gns_app.config import settings
 from gns_app.database import Database
+from gns_app.diagnostics import (
+    APP_VERSION,
+    create_diagnostic_bundle,
+    record_event,
+    record_exception,
+)
 from gns_app.services.storage import StorageError, ensure_within
+from gns_app.services.outlook_service import (
+    OutlookInboxImporter,
+    OutlookIntegrationError,
+    OutlookOutgoingService,
+    OutlookService,
+)
 from gns_app.services.registry_service import RegistryLookupError
+from gns_app.services.scanner_service import ScannerCancelled, ScannerError
 from gns_app.services.taxpayer_service import TaxpayerKind, classify_taxpayer
+from gns_app.services.windows_focus import start_foreground_watcher
 from gns_app.services.workflow import (
     WorkflowService,
     WorkflowValidationError,
@@ -40,6 +56,9 @@ from gns_app.text_cleanup import clean_taxpayer_name
 PACKAGE_DIR = Path(__file__).resolve().parent
 db = Database(settings.database_path)
 workflow = WorkflowService(db, settings)
+outlook = OutlookService()
+outlook_importer = OutlookInboxImporter(db, settings, outlook)
+outlook_outgoing = OutlookOutgoingService(db, settings, outlook)
 
 
 async def _resume_interrupted_uploads(upload_ids: list[str]) -> None:
@@ -51,23 +70,142 @@ async def _resume_interrupted_uploads(upload_ids: list[str]) -> None:
         )
 
 
+async def _run_automated_outlook_import() -> None:
+    outlook_importer.record_automation_status(
+        state="running",
+        message="Проверяется папка входящих Outlook.",
+    )
+    try:
+        summary = await asyncio.to_thread(outlook_importer.import_new, workflow)
+    except OutlookIntegrationError as exc:
+        outlook_importer.record_automation_status(
+            state="error",
+            message=str(exc),
+            errors=1,
+        )
+        return
+    except Exception:
+        outlook_importer.record_automation_status(
+            state="error",
+            message=(
+                "Автоматическая проверка завершилась технической ошибкой. "
+                "Приложение повторит попытку по расписанию."
+            ),
+            errors=1,
+        )
+        return
+
+    processing_errors = 0
+    for upload_id in summary["imported"]:
+        try:
+            await asyncio.to_thread(workflow.process_upload, upload_id)
+        except Exception:
+            processing_errors += 1
+    error_count = (
+        int(summary["scan_errors"])
+        + int(bool(summary.get("sync_error")))
+        + len(summary["errors"])
+        + processing_errors
+    )
+    state = "warning" if error_count else "success"
+    message = (
+        f"Проверка завершена. Новых писем: {summary['new_messages']}; "
+        f"сохранено PDF: {summary['saved_attachments']}; ошибок: {error_count}."
+    )
+    outlook_importer.record_automation_status(
+        state=state,
+        message=message,
+        new_messages=summary["new_messages"],
+        saved_attachments=summary["saved_attachments"],
+        errors=error_count,
+    )
+
+
+async def _outlook_automation_loop() -> None:
+    while True:
+        try:
+            enabled = outlook_importer.get_auto_enabled()
+            if enabled:
+                await _run_automated_outlook_import()
+                delay_seconds = (
+                    outlook_importer.get_auto_interval_minutes() * 60
+                )
+            else:
+                delay_seconds = 15
+        except Exception:
+            # Даже временная ошибка БД или адаптера не должна навсегда
+            # остановить фоновую проверку.
+            delay_seconds = 15
+        await asyncio.sleep(delay_seconds)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    settings.ensure_directories()
-    db.initialize()
-    workflow.initialize_employee_profiles()
-    workflow.initialize_gns_offices()
-    workflow.reconcile_gns_office_hints()
-    workflow.reconcile_structured_ocr_hints()
-    workflow.reconcile_recipient_display_names()
-    workflow.reprocess_incomplete_official_documents()
-    workflow.reconcile_official_qr_pages()
-    workflow.reconcile_confident_scan_decisions()
-    workflow.repair_cleaned_responses()
+    record_event(
+        "application",
+        "startup",
+        "started",
+        details={
+            "abs_mode": settings.abs_mode,
+            "frozen": bool(getattr(sys, "frozen", False)),
+        },
+        runtime_dir=settings.runtime_dir,
+    )
+    try:
+        settings.ensure_directories()
+        db.initialize()
+        workflow.initialize_employee_profiles()
+        workflow.initialize_gns_offices()
+        workflow.initialize_gns_office_emails()
+        workflow.reconcile_gns_office_hints()
+        workflow.reconcile_structured_ocr_hints()
+        workflow.reconcile_recipient_display_names()
+        workflow.reprocess_incomplete_official_documents()
+        workflow.reconcile_official_qr_pages()
+        workflow.reconcile_confident_scan_decisions()
+        workflow.repair_cleaned_responses()
+        ocr_health = workflow.ocr.health_check()
+        record_event(
+            "ocr",
+            "startup_health",
+            (
+                "ready"
+                if ocr_health.get("fast_initialized")
+                else "unavailable"
+            ),
+            details=ocr_health,
+            runtime_dir=settings.runtime_dir,
+        )
+    except Exception as exc:
+        record_exception(
+            "application",
+            "startup",
+            exc,
+            runtime_dir=settings.runtime_dir,
+        )
+        raise
+    record_event(
+        "application",
+        "startup",
+        "ready",
+        runtime_dir=settings.runtime_dir,
+    )
     resume_ids = workflow.interrupted_upload_ids()
     if resume_ids:
         asyncio.create_task(_resume_interrupted_uploads(resume_ids))
-    yield
+    outlook_task = asyncio.create_task(_outlook_automation_loop())
+    try:
+        yield
+    finally:
+        outlook_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await outlook_task
+        record_event(
+            "application",
+            "shutdown",
+            "completed",
+            runtime_dir=settings.runtime_dir,
+        )
 
 
 app = FastAPI(
@@ -176,6 +314,9 @@ EVENT_LABELS = {
     "upload_registered": "PDF зарегистрирован",
     "upload_reprocess_requested": "Запрошена повторная обработка",
     "page_reprocess_requested": "Запрошена повторная обработка страницы",
+    "precise_ocr_requested": "Запрошен точный OCR",
+    "precise_ocr_completed": "Точный OCR завершён",
+    "precise_ocr_failed": "Ошибка точного OCR",
     "official_qr_auto_completed": "Страница подтверждена официальным QR",
     "official_qr_manual_confirmation_removed": (
         "Лишнее ручное подтверждение страницы отменено"
@@ -188,14 +329,22 @@ EVENT_LABELS = {
     "official_document_processed": "Официальная версия обработана",
     "page_manually_confirmed": "Страница подтверждена сотрудником",
     "fake_abs_checked": "Выполнена тестовая проверка АБС",
+    "abs_checked": "Выполнена проверка АБС Tolubay",
     "fake_abs_startup_rolled_back": "Отменена массовая автопроверка АБС",
     "fake_abs_batch_checked": "Выполнена пакетная проверка АБС",
+    "abs_batch_checked": "Выполнена пакетная проверка АБС Tolubay",
     "odb_checked": "Записана ручная проверка ОДБ",
     "processing_data_reset": "Сброшены данные обработки",
     "registry_checked": "Выполнена сверка с ОсОО.KG",
     "registry_variance_accepted": "Подтверждены расхождения ОсОО.KG",
     "inbox_scanned": "Просканирована папка входящих",
+    "outlook_inbox_scanned": "Проверены новые письма Outlook",
+    "outlook_import_settings_updated": "Обновлены настройки Outlook",
+    "outlook_outgoing_subject_updated": "Обновлена тема исходящих писем",
+    "outlook_draft_created": "Создан черновик исходящего письма Outlook",
+    "outlook_draft_failed": "Ошибка создания черновика Outlook",
     "gns_offices_replaced": "Обновлён справочник налоговых органов",
+    "gns_office_emails_updated": "Обновлены официальные email подразделений",
     "gns_office_location_expanded": "Район дополнен областью или городом",
     "gns_office_suggested": "Предложен налоговый орган по OCR",
     "ocr_recipient_suggested": "Предложены должность и ФИО по OCR",
@@ -216,6 +365,11 @@ EVENT_LABELS = {
     ),
     "response_created": "Создан ответ Word",
     "grouped_response_created": "Создан общий ответ Word",
+    "outgoing_number_assigned": "Назначен исходящий номер",
+    "outgoing_number_changed": "Изменён исходящий номер",
+    "abs_account_manually_checked": "Вручную проверено наличие счёта в АБС",
+    "signed_response_scan_registered": "Зарегистрирован подписанный скан",
+    "signed_response_scan_confirmed": "Подписанный скан проверен",
     "district_place_edge_noise_removed": (
         "Удалены лишние краевые символы в реквизите ГНС"
     ),
@@ -233,6 +387,7 @@ ENTITY_LABELS = {
     "case": "Обращение",
     "settings": "Настройка",
     "response_group": "Общий ответ",
+    "response_letter": "Исходящее письмо",
     "taxpayer": "Налогоплательщик",
 }
 
@@ -274,6 +429,8 @@ def context(request: Request, **values):
         "employee_profiles": workflow.list_employee_profiles(),
         "ui_preferences": workflow.get_ui_preferences(),
         "abs_session_active": workflow.abs_session_active(),
+        "abs_session_supported": workflow.abs_session_supported(),
+        "abs_is_fake": workflow.abs_is_fake(),
         **values,
     }
 
@@ -315,13 +472,28 @@ def index(request: Request, message: str = "", error: str = ""):
 
 
 @app.get("/today", response_class=HTMLResponse)
-def today(request: Request, message: str = "", error: str = ""):
+def today(
+    request: Request,
+    message: str = "",
+    error: str = "",
+    outgoing_start: str = "",
+):
+    outgoing_preview = None
+    if outgoing_start:
+        try:
+            outgoing_preview = workflow.preview_outgoing_numbers(
+                outgoing_start
+            )
+        except WorkflowValidationError as exc:
+            error = str(exc)
     return templates.TemplateResponse(
         request,
         "today.html",
         context(
             request,
             overview=workflow.today_overview(),
+            outgoing_preview=outgoing_preview,
+            outgoing_start=outgoing_start,
             message=message,
             error=error,
         ),
@@ -443,9 +615,162 @@ def settings_page(request: Request, message: str = "", error: str = ""):
             request,
             inbox_dir=str(workflow.get_inbox_dir()),
             registry_priority=workflow.get_registry_priority(),
+            processing_workers=workflow.get_processing_workers(),
+            outlook_status=outlook.last_result(),
+            outlook_allowed_senders=", ".join(
+                sorted(outlook_importer.get_allowed_senders())
+            ),
+            outlook_import_since=outlook_importer.get_import_since().isoformat(),
+            outlook_mailbox=outlook_importer.get_mailbox(),
+            outlook_auto_enabled=outlook_importer.get_auto_enabled(),
+            outlook_auto_interval=outlook_importer.get_auto_interval_minutes(),
+            outlook_auto_status=outlook_importer.get_automation_status(),
+            outlook_import_stats=outlook_importer.stats(),
+            outlook_subject_template=outlook_outgoing.get_subject_template(),
             message=message,
             error=error,
         ),
+    )
+
+
+@app.get("/settings/diagnostics/download")
+def download_diagnostics():
+    ocr_health = workflow.ocr.last_health() or workflow.ocr.health_check()
+    bundle = create_diagnostic_bundle(
+        settings.runtime_dir,
+        extra={
+            "abs_mode": settings.abs_mode,
+            "outlook_state": outlook.last_result().state,
+            "database_available": settings.database_path.is_file(),
+            "ocr_engine_imported": ocr_health.get("engine_imported", False),
+            "ocr_fast_files_available": ocr_health.get(
+                "fast_files_available", False
+            ),
+            "ocr_fast_initialized": ocr_health.get(
+                "fast_initialized", False
+            ),
+            "ocr_fast_error_type": ocr_health.get("fast_error_type", ""),
+            "ocr_best_files_available": ocr_health.get(
+                "best_files_available", False
+            ),
+            "ocr_best_initialized": ocr_health.get(
+                "best_initialized", False
+            ),
+            "ocr_best_error_type": ocr_health.get("best_error_type", ""),
+        },
+    )
+    return FileResponse(
+        bundle,
+        media_type="application/zip",
+        filename=bundle.name,
+    )
+
+
+@app.post("/settings/outlook/check")
+def check_outlook_connection():
+    result = outlook.diagnose()
+    parameter = "message" if result.successful else "error"
+    return RedirectResponse(
+        f"/settings?{parameter}={quote(result.message)}",
+        status_code=303,
+    )
+
+
+@app.post("/settings/outlook/send-receive")
+def request_outlook_send_receive():
+    result = outlook.request_send_receive()
+    parameter = "message" if result.successful else "error"
+    return RedirectResponse(
+        f"/settings?{parameter}={quote(result.message)}",
+        status_code=303,
+    )
+
+
+@app.post("/settings/outlook/config")
+def update_outlook_import_settings(
+    outlook_allowed_senders: str = Form(""),
+    outlook_import_since: str = Form(...),
+    outlook_mailbox: str = Form(""),
+    outlook_auto_enabled: bool = Form(False),
+    outlook_auto_interval: int = Form(5),
+    outlook_subject_template: str = Form(
+        OutlookOutgoingService.DEFAULT_SUBJECT_TEMPLATE
+    ),
+):
+    try:
+        outlook_outgoing.validate_subject_template(outlook_subject_template)
+        outlook_importer.update_settings(
+            allowed_senders=outlook_allowed_senders,
+            import_since=outlook_import_since,
+            mailbox=outlook_mailbox,
+            auto_enabled=outlook_auto_enabled,
+            auto_interval_minutes=outlook_auto_interval,
+        )
+        outlook_outgoing.update_subject_template(outlook_subject_template)
+    except OutlookIntegrationError as exc:
+        return RedirectResponse(
+            f"/settings?error={quote(str(exc))}",
+            status_code=303,
+        )
+    return RedirectResponse(
+        "/settings?message=" + quote("Настройки Outlook сохранены."),
+        status_code=303,
+    )
+
+
+@app.post("/response-letters/{letter_id}/outlook-draft")
+def create_response_letter_outlook_draft(
+    letter_id: str,
+    group_id: str = Form(""),
+):
+    try:
+        result = outlook_outgoing.create_draft(workflow, letter_id)
+    except OutlookIntegrationError as exc:
+        return RedirectResponse(
+            f"/today?error={quote(str(exc))}#group-{quote(group_id)}",
+            status_code=303,
+        )
+    message = (
+        "Существующий черновик Outlook открыт."
+        if result.get("existing_outlook_draft")
+        else "Черновик Outlook создан и открыт для проверки."
+    )
+    return RedirectResponse(
+        f"/today?message={quote(message)}#group-{quote(group_id)}",
+        status_code=303,
+    )
+
+
+@app.post("/settings/outlook/import")
+def import_outlook_attachments(background_tasks: BackgroundTasks):
+    try:
+        summary = outlook_importer.import_new(workflow)
+    except OutlookIntegrationError as exc:
+        return RedirectResponse(
+            f"/settings?error={quote(str(exc))}",
+            status_code=303,
+        )
+    for upload_id in summary["imported"]:
+        background_tasks.add_task(workflow.process_upload, upload_id)
+    error_count = (
+        int(summary["scan_errors"])
+        + int(bool(summary.get("sync_error")))
+        + len(summary["errors"])
+    )
+    message = (
+        f"Outlook проверен. Новых писем: {summary['new_messages']}; "
+        f"сохранено PDF: {summary['saved_attachments']}; "
+        f"повторов: {summary['known'] + summary['duplicate_attachments']}; "
+        f"ошибок: {error_count}."
+    )
+    parameter = (
+        "error"
+        if error_count
+        else "message"
+    )
+    return RedirectResponse(
+        f"/settings?{parameter}={quote(message)}",
+        status_code=303,
     )
 
 
@@ -456,6 +781,7 @@ def update_settings(
     period_threshold: str = Form(...),
     inbox_dir: str = Form(...),
     registry_priority: str = Form("osoo"),
+    processing_workers: int = Form(2),
 ):
     try:
         workflow.update_ui_preferences(
@@ -467,6 +793,7 @@ def update_settings(
             period_threshold=period_threshold,
             inbox_dir=inbox_dir,
             registry_priority=registry_priority,
+            processing_workers=processing_workers,
         )
     except WorkflowValidationError as exc:
         return RedirectResponse(
@@ -548,6 +875,33 @@ def abs_check_today(
     )
 
 
+@app.post("/cases/{case_id}/abs-account/taxpayer")
+def abs_account_check_taxpayer(
+    case_id: str,
+    taxpayer_inn: str = Form(...),
+    account_result: str = Form(...),
+):
+    try:
+        result = workflow.confirm_abs_account_taxpayer(
+            case_id,
+            taxpayer_inn,
+            account_result,
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            f"/today?error={quote(str(exc))}", status_code=303
+        )
+    message = (
+        "Наличие счёта подтверждено — оставлено для ручного ответа."
+        if result["result"] == "found"
+        else "Счёта нет — обращение направлено дальше по правилу периода."
+    )
+    return RedirectResponse(
+        f"/today?message={quote(message)}", status_code=303
+    )
+
+
 @app.post("/today/responses/create-all")
 def create_all_grouped_responses():
     summary = workflow.generate_all_ready_daily_responses()
@@ -595,6 +949,158 @@ def create_grouped_response(
     )
 
 
+@app.post("/today/outgoing-numbers/assign")
+def assign_outgoing_numbers(
+    first_number: str = Form(...),
+    letter_ids: list[str] = Form(...),
+):
+    try:
+        summary = workflow.assign_outgoing_numbers(
+            first_number,
+            letter_ids,
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            f"/today?error={quote(str(exc))}",
+            status_code=303,
+        )
+    message = quote(
+        "Назначено исходящих номеров: "
+        f"{summary['letter_count']} — с {summary['first_number']} "
+        f"по {summary['last_number']}."
+    )
+    return RedirectResponse(f"/today?message={message}", status_code=303)
+
+
+@app.post("/response-letters/{letter_id}/outgoing-number")
+def update_outgoing_number(
+    letter_id: str,
+    outgoing_number: str = Form(""),
+    group_id: str = Form(""),
+):
+    try:
+        workflow.set_outgoing_number(
+            letter_id,
+            outgoing_number,
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            f"/today?error={quote(str(exc))}#group-{quote(group_id)}",
+            status_code=303,
+        )
+    return RedirectResponse(
+        "/today?message="
+        + quote("Исходящий номер обновлён.")
+        + f"#group-{quote(group_id)}",
+        status_code=303,
+    )
+
+
+@app.post("/response-letters/{letter_id}/scan-device")
+def scan_response_letter_from_device(
+    letter_id: str,
+    group_id: str = Form(""),
+):
+    try:
+        workflow.acquire_signed_response_scan(
+            letter_id,
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+    except ScannerCancelled:
+        return RedirectResponse(
+            f"/today?message={quote('Сканирование отменено.')}"
+            f"#group-{quote(group_id)}",
+            status_code=303,
+        )
+    except (ScannerError, WorkflowValidationError) as exc:
+        return RedirectResponse(
+            f"/today?error={quote(str(exc))}#group-{quote(group_id)}",
+            status_code=303,
+        )
+    return RedirectResponse(
+        "/today?message="
+        + quote("Скан получен. Откройте его и подтвердите подписи и печать.")
+        + f"#group-{quote(group_id)}",
+        status_code=303,
+    )
+
+
+@app.post("/response-letters/{letter_id}/scan-upload")
+def upload_response_letter_scan(
+    letter_id: str,
+    scan_file: UploadFile = File(...),
+    group_id: str = Form(""),
+):
+    try:
+        workflow.register_signed_response_scan(
+            letter_id,
+            scan_file.filename or "scan.pdf",
+            scan_file.file,
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            f"/today?error={quote(str(exc))}#group-{quote(group_id)}",
+            status_code=303,
+        )
+    finally:
+        scan_file.file.close()
+    return RedirectResponse(
+        "/today?message="
+        + quote("Документ загружен. Откройте его и завершите проверку.")
+        + f"#group-{quote(group_id)}",
+        status_code=303,
+    )
+
+
+@app.get("/signed-response-scans/{scan_id}")
+def download_signed_response_scan(scan_id: str):
+    scan = workflow.get_signed_response_scan(scan_id)
+    if not scan:
+        raise HTTPException(404, "Подписанный скан не найден")
+    try:
+        path = ensure_within(
+            Path(scan["pdf_path"]),
+            workflow.settings.runtime_dir / "signed_scans",
+        )
+    except StorageError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    if not path.is_file():
+        raise HTTPException(404, "Файл подписанного скана отсутствует")
+    return FileResponse(path, media_type="application/pdf", filename=path.name)
+
+
+@app.post("/signed-response-scans/{scan_id}/confirm")
+def confirm_signed_response_scan(
+    scan_id: str,
+    group_id: str = Form(""),
+    correct_letter: bool = Form(False),
+    signature_present: bool = Form(False),
+    bank_seal_present: bool = Form(False),
+):
+    try:
+        workflow.confirm_signed_response_scan(
+            scan_id,
+            correct_letter=correct_letter,
+            signature_present=signature_present,
+            bank_seal_present=bank_seal_present,
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            f"/today?error={quote(str(exc))}#group-{quote(group_id)}",
+            status_code=303,
+        )
+    return RedirectResponse(
+        "/today?message="
+        + quote("Подписанный ответ проверен и готов к отправке.")
+        + f"#group-{quote(group_id)}",
+        status_code=303,
+    )
+
+
 @app.get("/response-groups/{group_id}")
 def download_grouped_response(group_id: str):
     group = workflow.get_response_group(group_id)
@@ -603,7 +1109,7 @@ def download_grouped_response(group_id: str):
     try:
         path = ensure_within(
             Path(group["response_path"]),
-            settings.responses_dir,
+            workflow.settings.responses_dir,
         )
     except StorageError as exc:
         raise HTTPException(403, str(exc)) from exc
@@ -616,6 +1122,42 @@ def download_grouped_response(group_id: str):
             "wordprocessingml.document"
         ),
         filename=path.name,
+    )
+
+
+@app.post("/response-groups/{group_id}/open-for-print")
+def open_grouped_response_for_print(group_id: str):
+    group = workflow.get_response_group(group_id)
+    if not group or not group.get("response_path"):
+        return RedirectResponse(
+            "/today?error=" + quote("Общий ответ не найден"),
+            status_code=303,
+        )
+    try:
+        path = ensure_within(
+            Path(group["response_path"]),
+            workflow.settings.responses_dir,
+        )
+        if not path.exists():
+            raise OSError("missing response")
+        startfile = getattr(os, "startfile", None)
+        if startfile is None:
+            raise OSError("Word open is unavailable")
+        start_foreground_watcher(
+            title_parts=(path.stem,),
+            class_parts=("opusapp",),
+            timeout_seconds=20,
+        )
+        startfile(str(path))
+    except (StorageError, OSError):
+        return RedirectResponse(
+            "/today?error="
+            + quote("Не удалось открыть ответ в Word. Скачайте файл вручную."),
+            status_code=303,
+        )
+    return RedirectResponse(
+        "/today?message=" + quote("Ответ открыт в Word для проверки и печати."),
+        status_code=303,
     )
 
 
@@ -805,6 +1347,28 @@ def reprocess_page(
     )
 
 
+@app.post("/pages/{page_id}/precise-ocr")
+def precise_ocr_page(
+    background_tasks: BackgroundTasks,
+    page_id: str,
+):
+    try:
+        upload_id = workflow.request_precise_ocr(page_id)
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            f"/review/{page_id}?error={quote(str(exc))}",
+            status_code=303,
+        )
+    background_tasks.add_task(workflow.process_precise_ocr, page_id)
+    return RedirectResponse(
+        (
+            f"/uploads/{upload_id}?message="
+            f"{quote('Запущен точный OCR best. Страница останется в ручной проверке.')}"
+        ),
+        status_code=303,
+    )
+
+
 @app.get("/review", response_class=HTMLResponse)
 def review_queue(request: Request, message: str = "", error: str = ""):
     return templates.TemplateResponse(
@@ -838,6 +1402,29 @@ def review_page(request: Request, page_id: str, error: str = ""):
     taxpayers = (
         workflow.get_taxpayers(case["id"]) if case else []
     )
+    preferences = workflow.get_ui_preferences()
+    taxpayer_conflict_candidates: list[dict[str, str]] = []
+    if not preferences["allow_multiple_taxpayers"] and len(taxpayers) > 1:
+        ocr_unconfirmed = all(
+            not item.get("manually_confirmed")
+            and item.get("name_source") == "ocr_scan"
+            and item.get("inn_source") == "ocr_scan"
+            for item in taxpayers
+        )
+        names = {
+            " ".join((item.get("name") or "").split())
+            for item in taxpayers
+            if (item.get("name") or "").strip()
+        }
+        inns = list(dict.fromkeys(
+            item.get("inn") or "" for item in taxpayers if item.get("inn")
+        ))
+        if ocr_unconfirmed and len(names) <= 1 and len(inns) > 1:
+            taxpayer_conflict_candidates = [
+                {"inn": inn, "name": next(iter(names), "")}
+                for inn in inns
+            ]
+            taxpayers = [{"name": next(iter(names), ""), "inn": ""}]
     if not taxpayers:
         taxpayers = [{"name": "", "inn": ""}]
     upload = workflow.get_upload(page["upload_id"])
@@ -849,6 +1436,7 @@ def review_page(request: Request, page_id: str, error: str = ""):
             page=page,
             case=case or {},
             taxpayers=taxpayers,
+            taxpayer_conflict_candidates=taxpayer_conflict_candidates,
             upload=upload or {},
             gns_offices=workflow.list_gns_offices(),
             period_status=period_review_status(case or {}),
@@ -1007,7 +1595,9 @@ def abs_check(
 ):
     try:
         result = workflow.check_abs(case_id, username, password)
-        message = result.message + " Используется тестовая АБС."
+        message = result.message
+        if result.is_fake:
+            message += " Используется тестовая АБС."
         return RedirectResponse(
             f"/cases/{case_id}?message={quote(message)}",
             status_code=303,
@@ -1141,7 +1731,7 @@ def journal(request: Request):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "0.1.0"}
+    return {"status": "ok", "version": APP_VERSION}
 
 
 def run() -> None:

@@ -47,9 +47,12 @@
       <p>
         {% if abs_session_active %}
           Сеанс АБС активен: повторный логин не требуется.
-        {% else %}
+        {% elif abs_session_supported %}
           Введите логин и пароль один раз. Они живут только в памяти до ошибки АБС
           или перезапуска приложения и не записываются в журнал.
+        {% else %}
+          Введите логин и пароль для пакетной проверки. Они используются только
+          в этой операции и сразу очищаются.
         {% endif %}
       </p>
     {% else %}
@@ -237,6 +240,72 @@
   {% endif %}
 </section>
 
+<section class="panel today-groups outgoing-number-panel">
+  <div class="panel-heading">
+    <div>
+      <p class="eyebrow">НОМЕРА ИЗ ПРИЁМНОЙ БАНКА</p>
+      <h2>Исходящие номера</h2>
+      <p>
+        Сейчас без номера: {{ overview.unnumbered_letters|length }} отдельных
+        писем. Сначала зарезервируйте такой блок у приёмной, затем введите
+        первый свободный номер.
+      </p>
+    </div>
+  </div>
+
+  {% if overview.unnumbered_letters %}
+    <form class="outgoing-preview-form" method="get" action="/today">
+      <label class="field">
+        <span>Первый зарезервированный номер</span>
+        <input type="text" name="outgoing_start" inputmode="numeric"
+               pattern="[0-9]+" value="{{ outgoing_start }}"
+               placeholder="Например, 9544" required>
+      </label>
+      <button class="button button-secondary" type="submit">
+        Показать распределение
+      </button>
+    </form>
+  {% else %}
+    <div class="empty-state">
+      У созданных сегодня писем исходящие номера уже назначены либо ответы
+      ещё не сформированы.
+    </div>
+  {% endif %}
+
+  {% if outgoing_preview and outgoing_preview.count %}
+    <div class="outgoing-preview">
+      <div class="outgoing-preview-heading">
+        <strong>
+          Будут заняты номера {{ outgoing_preview.first_number }}–{{ outgoing_preview.last_number }}
+        </strong>
+        <span>{{ outgoing_preview.count }} писем</span>
+      </div>
+      <ol class="outgoing-preview-list">
+      {% for letter in outgoing_preview.letters %}
+        <li>
+          <strong>№ {{ letter.proposed_number }}</strong>
+          <span>{{ letter.recipient_display_name }}</span>
+          <small>
+            УГНС {{ letter.district_place }} · письмо {{ letter.letter_order }} ·
+            {{ letter.taxpayer_count }} {{ taxpayer_word(letter.taxpayer_count) }}
+          </small>
+        </li>
+      {% endfor %}
+      </ol>
+      <form method="post" action="/today/outgoing-numbers/assign">
+        <input type="hidden" name="first_number"
+               value="{{ outgoing_preview.first_number }}">
+        {% for letter in outgoing_preview.letters %}
+          <input type="hidden" name="letter_ids" value="{{ letter.id }}">
+        {% endfor %}
+        <button class="button button-primary" type="submit">
+          Подтвердить и вставить номера в Word
+        </button>
+      </form>
+    </div>
+  {% endif %}
+</section>
+
 <section class="panel today-groups found-groups">
   <div class="panel-heading">
     <div>
@@ -266,6 +335,19 @@
               {{ taxpayer.name }}
             </a>
             <strong>ИНН {{ taxpayer.inn }}</strong>
+            {% if taxpayer.abs_result == 'found' and not taxpayer.abs_account_result %}
+              <form class="abs-account-form" method="post"
+                    action="/cases/{{ taxpayer.source_case_id }}/abs-account/taxpayer">
+                <input type="hidden" name="taxpayer_inn" value="{{ taxpayer.inn }}">
+                <span>Анкета найдена. Есть действующий счёт?</span>
+                <button class="button button-secondary" name="account_result"
+                        value="found" type="submit">Есть счёт</button>
+                <button class="button button-secondary" name="account_result"
+                        value="not_found" type="submit">Счёта нет</button>
+              </form>
+            {% elif taxpayer.abs_account_result == 'found' %}
+              <small>Подтверждено: счёт есть</small>
+            {% endif %}
             {% if taxpayer.source_page_id %}
               <a class="letter-pdf-link"
                  href="/pages/{{ taxpayer.source_page_id }}/pdf"
@@ -297,6 +379,112 @@
           <strong>{{ group.recipient_display_name }}</strong>
           <span>УГНС {{ group.district_place }}</span>
           <small>{{ group.taxpayer_count }} {{ taxpayer_word(group.taxpayer_count) }}</small>
+          <div class="generated-letter-numbers">
+          {% for letter in group.letters %}
+            <div class="generated-letter-card">
+              <form method="post"
+                    action="/response-letters/{{ letter.id }}/outgoing-number">
+                <input type="hidden" name="group_id" value="{{ group.id }}">
+                <label>
+                  <span>
+                    Письмо {{ letter.letter_order }}{% if group.letter_count > 1 %}
+                    из {{ group.letter_count }}{% endif %}
+                  </span>
+                  <input type="text" name="outgoing_number" inputmode="numeric"
+                         pattern="[0-9]*"
+                         value="{{ letter.outgoing_number or '' }}"
+                         placeholder="Без номера">
+                </label>
+                <button class="button button-secondary" type="submit">
+                  Сохранить номер
+                </button>
+              </form>
+              <div class="signed-scan-block">
+              {% if letter.signed_scan %}
+                <div class="signed-scan-status">
+                  <a href="/signed-response-scans/{{ letter.signed_scan.id }}"
+                     target="_blank">Открыть подписанный скан</a>
+                  <small>
+                    {{ letter.signed_scan.page_count }} стр.
+                  </small>
+                  {% if letter.signed_scan.status == 'confirmed' %}
+                    <strong>✓ Проверен, готов к отправке</strong>
+                  {% else %}
+                    <strong>Требуется проверка</strong>
+                  {% endif %}
+                </div>
+                {% if letter.signed_scan.status == 'needs_confirmation' %}
+                  <form class="scan-confirm-form" method="post"
+                        action="/signed-response-scans/{{ letter.signed_scan.id }}/confirm">
+                    <input type="hidden" name="group_id" value="{{ group.id }}">
+                    <label><input type="checkbox" name="correct_letter" value="true" required>
+                      Это нужное письмо</label>
+                    <label><input type="checkbox" name="signature_present" value="true" required>
+                      Все подписи собраны</label>
+                    <label><input type="checkbox" name="bank_seal_present" value="true" required>
+                      Печать банка стоит</label>
+                    <button class="button button-primary" type="submit">
+                      Подтвердить скан
+                    </button>
+                  </form>
+                {% elif letter.signed_scan.status == 'confirmed' %}
+                  {% if letter.gns_email %}
+                    <div class="outlook-draft-status">
+                      <small>Получатель: {{ letter.gns_email }}</small>
+                      {% if letter.outlook_message %}
+                        {% if letter.outlook_message.status == 'draft_created' %}
+                          <strong>Черновик Outlook создан</strong>
+                          <small>{{ letter.outlook_message.subject }}</small>
+                        {% elif letter.outlook_message.status == 'technical_error' %}
+                          <strong>Ошибка Outlook</strong>
+                          <small>{{ letter.outlook_message.error_message }}</small>
+                        {% endif %}
+                      {% endif %}
+                    </div>
+                    <form method="post"
+                          action="/response-letters/{{ letter.id }}/outlook-draft">
+                      <input type="hidden" name="group_id" value="{{ group.id }}">
+                      <button class="button button-primary" type="submit">
+                        {% if letter.outlook_message and letter.outlook_message.status == 'draft_created' %}
+                          Открыть черновик Outlook
+                        {% else %}
+                          Создать письмо Outlook
+                        {% endif %}
+                      </button>
+                    </form>
+                  {% else %}
+                    <strong>Для подразделения не настроен email</strong>
+                  {% endif %}
+                {% endif %}
+              {% else %}
+                <div class="scan-actions">
+                  <form method="post"
+                        action="/response-letters/{{ letter.id }}/scan-device">
+                    <input type="hidden" name="group_id" value="{{ group.id }}">
+                    <button class="button button-primary" type="submit">
+                      Сканировать A4
+                    </button>
+                  </form>
+                  <form class="scan-upload-form" method="post"
+                        enctype="multipart/form-data"
+                        action="/response-letters/{{ letter.id }}/scan-upload">
+                    <input type="hidden" name="group_id" value="{{ group.id }}">
+                    <label>
+                      <span>Или загрузить файл</span>
+                      <input type="file" name="scan_file"
+                             accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff" required>
+                      <small>PDF и TIFF могут содержать несколько страниц.</small>
+                    </label>
+                    <button class="button button-secondary" type="submit">
+                      Загрузить
+                    </button>
+                  </form>
+                </div>
+              {% endif %}
+              </div>
+            </div>
+          {% endfor %}
+          </div>
           {% if group.response_page_overflow %}
             <small class="page-overflow-warning">
               ⚠ Похоже, письмо не уместится на одной странице — откройте
@@ -304,8 +492,16 @@
             </small>
           {% endif %}
         </div>
-        <a class="button button-secondary"
-           href="/response-groups/{{ group.id }}">Скачать Word</a>
+        <div class="generated-response-actions">
+          <form method="post"
+                action="/response-groups/{{ group.id }}/open-for-print">
+            <button class="button button-primary" type="submit">
+              Открыть в Word для печати
+            </button>
+          </form>
+          <a class="button button-secondary"
+             href="/response-groups/{{ group.id }}">Скачать копию</a>
+        </div>
       </article>
     {% endfor %}
     </div>

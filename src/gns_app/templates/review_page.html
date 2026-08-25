@@ -35,9 +35,16 @@
           <strong>Распознанный текст</strong>
           <small>Можно выделять и копировать. Это подсказка, а не подтверждённый источник.</small>
         </div>
-        <button type="button" class="button button-secondary" id="copy-ocr">
-          Копировать текст
-        </button>
+        <div class="viewer-actions">
+          <form method="post" action="/pages/{{ page.id }}/precise-ocr">
+            <button type="submit" class="button button-secondary">
+              Повторить точным OCR
+            </button>
+          </form>
+          <button type="button" class="button button-secondary" id="copy-ocr">
+            Копировать текст
+          </button>
+        </div>
       </div>
       <pre id="ocr-selectable" tabindex="0">{{ page.extracted_text or 'Текст OCR отсутствует.' }}</pre>
     </div>
@@ -185,6 +192,21 @@
           {% endif %}
         </div>
         <div id="taxpayer-list">
+        {% if taxpayer_conflict_candidates %}
+          <fieldset class="ocr-conflict" data-taxpayer-conflict>
+            <legend>OCR распознал разные варианты ИНН</legend>
+            <p>Сверьте цифры с изображением письма и выберите правильный вариант либо введите ИНН вручную.</p>
+            <div class="ocr-conflict-options">
+            {% for candidate in taxpayer_conflict_candidates %}
+              <label>
+                <input type="radio" name="ocr_inn_candidate"
+                       value="{{ candidate.inn }}" data-ocr-inn-candidate>
+                <strong>{{ candidate.inn }}</strong>
+              </label>
+            {% endfor %}
+            </div>
+          </fieldset>
+        {% endif %}
         {% for taxpayer in taxpayers %}
           <div class="taxpayer-row">
             <label class="field taxpayer-name-field">

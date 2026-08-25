@@ -50,6 +50,22 @@
       </small>
     </label>
 
+    <label class="field setting-field">
+      <span>Одновременно обрабатывать страниц</span>
+      <select name="processing_workers">
+        <option value="2" {% if processing_workers == 2 %}selected{% endif %}>
+          2 страницы — быстрее
+        </option>
+        <option value="1" {% if processing_workers == 1 %}selected{% endif %}>
+          1 страница — для слабого компьютера
+        </option>
+      </select>
+      <small>
+        Если компьютер заметно тормозит или не хватает памяти, выберите одну
+        страницу. После сохранения новые загрузки используют этот режим.
+      </small>
+    </label>
+
     <label class="setting-toggle">
       <input type="checkbox" name="require_review_checkbox" value="true"
              {% if ui_preferences.require_review_checkbox %}checked{% endif %}>
@@ -61,6 +77,163 @@
 
     <button class="button button-primary" type="submit">Сохранить настройки</button>
   </form>
+
+  <section class="settings-reset outlook-diagnostic">
+    <p class="eyebrow">OUTLOOK 2013 · АВТОМАТИЧЕСКАЯ ПРОВЕРКА</p>
+    <h2>Подключение к почте</h2>
+    <p>
+      Приложение подключается к локальному Outlook, получает почту и сохраняет
+      новые PDF только от разрешённых отправителей. Уже учтённые письма
+      повторно не скачиваются.
+    </p>
+
+    <div class="outlook-status outlook-status-{{ outlook_status.state }}">
+      <strong>{{ outlook_status.message }}</strong>
+      {% if outlook_status.checked_at %}
+        <small>Последняя проверка: {{ outlook_status.checked_at }}</small>
+      {% endif %}
+    </div>
+
+    {% if outlook_status.probe %}
+      <dl class="detail-list outlook-details">
+        <div><dt>Версия Outlook</dt><dd>{{ outlook_status.probe.outlook_version or 'не определена' }}</dd></div>
+        <div><dt>Профиль</dt><dd>{{ outlook_status.probe.profile_name or 'профиль по умолчанию' }}</dd></div>
+        <div><dt>Пользователь</dt><dd>{{ outlook_status.probe.current_user or 'не определён' }}</dd></div>
+        <div><dt>Хранилище</dt><dd>{{ outlook_status.probe.default_store or 'не определено' }}</dd></div>
+        <div><dt>Папка</dt><dd>{{ outlook_status.probe.inbox_path or outlook_status.probe.inbox_name }}</dd></div>
+        <div><dt>Писем локально</dt><dd>{{ outlook_status.probe.inbox_item_count }}</dd></div>
+        <div><dt>Режим</dt><dd>{% if outlook_status.probe.offline %}автономный{% else %}в сети{% endif %}</dd></div>
+      </dl>
+      {% if outlook_status.probe.accounts %}
+        <div class="outlook-accounts">
+          <strong>Учётные записи профиля</strong>
+          <ul>
+            {% for account in outlook_status.probe.accounts %}
+              <li>
+                {{ account.display_name or account.smtp_address or 'Без названия' }}
+                · {{ account.account_type }}
+                {% if account.smtp_address %}· {{ account.smtp_address }}{% endif %}
+              </li>
+            {% endfor %}
+          </ul>
+        </div>
+      {% endif %}
+    {% endif %}
+
+    <form method="post" action="/settings/outlook/config"
+          class="outlook-config-form">
+      <label class="field setting-field">
+        <span>Почтовый ящик для получения</span>
+        <input name="outlook_mailbox"
+               value="{{ outlook_mailbox }}"
+               placeholder="mailbox@example.com">
+        <small>
+          Укажите адрес или точное имя хранилища из Outlook. Если поле пустое,
+          используется стандартная папка «Входящие».
+        </small>
+      </label>
+      <label class="field setting-field">
+        <span>Дополнительные разрешённые отправители</span>
+        <input name="outlook_allowed_senders"
+               value="{{ outlook_allowed_senders }}"
+               placeholder="sender@gmail.com">
+        <small>
+          Несколько адресов указываются через запятую. Домены sti.gov.kg и
+          salyk.kg разрешены системно. Остальные отправители пропускаются.
+        </small>
+      </label>
+      <label class="field setting-field">
+        <span>Проверять письма начиная с даты</span>
+        <input type="date" name="outlook_import_since"
+               value="{{ outlook_import_since }}" required>
+        <small>
+          Дата остаётся постоянной, поэтому после перерыва приложение повторно
+          сверяет весь период и пропускает письма из своего реестра.
+        </small>
+      </label>
+      <label class="field setting-field">
+        <span>Интервал автоматической проверки, минут</span>
+        <input type="number" name="outlook_auto_interval"
+               value="{{ outlook_auto_interval }}" min="1" max="1440" required>
+        <small>
+          Outlook получит команду синхронизации, затем приложение проверит
+          локальную папку. При ошибке следующая попытка выполнится автоматически.
+        </small>
+      </label>
+      <label class="field setting-field">
+        <span>Тема исходящего письма по умолчанию</span>
+        <input name="outlook_subject_template"
+               value="{{ outlook_subject_template }}"
+               maxlength="200" required>
+        <small>
+          Подстановки: {outgoing_number} — исходящий номер,
+          {office_name} — подразделение, {recipient_name} — адресат,
+          {date} — дата ответа.
+        </small>
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" name="outlook_auto_enabled" value="true"
+               {% if outlook_auto_enabled %}checked{% endif %}>
+        <span>Автоматически получать и загружать новые PDF</span>
+      </label>
+      <button class="button button-secondary" type="submit">
+        Сохранить правила Outlook
+      </button>
+    </form>
+
+    <div class="outlook-status outlook-status-{{ outlook_auto_status.state }}">
+      <strong>{{ outlook_auto_status.message }}</strong>
+      {% if outlook_auto_status.checked_at %}
+        <small>Последний автоматический запуск: {{ outlook_auto_status.checked_at }}</small>
+      {% endif %}
+    </div>
+
+    <dl class="detail-list outlook-import-stats">
+      <div><dt>Учтено писем</dt><dd>{{ outlook_import_stats.messages }}</dd></div>
+      <div><dt>С PDF</dt><dd>{{ outlook_import_stats.completed }}</dd></div>
+      <div><dt>Без PDF</dt><dd>{{ outlook_import_stats.no_pdf }}</dd></div>
+      <div><dt>С ошибкой</dt><dd>{{ outlook_import_stats.errors }}</dd></div>
+    </dl>
+
+    <div class="settings-reset-actions">
+      <form method="post" action="/settings/outlook/check">
+        <button class="button button-secondary" type="submit">
+          Проверить подключение
+        </button>
+      </form>
+      <form method="post" action="/settings/outlook/send-receive">
+        <button class="button button-primary" type="submit">
+          Получить почту сейчас
+        </button>
+      </form>
+      <form method="post" action="/settings/outlook/import">
+        <button class="button button-primary" type="submit">
+          Получить и загрузить новые PDF
+        </button>
+      </form>
+    </div>
+    <p class="outlook-note">
+      Команда получения почты выполняется Outlook в фоне. Успешный запуск
+      команды не означает, что все письма уже поступили. Кнопка загрузки
+      сначала запускает получение, затем проверяет уже доступные локальные
+      письма. Если письмо только что отправлено, повторите проверку через минуту.
+    </p>
+  </section>
+
+  <section class="settings-reset">
+    <p class="eyebrow">ДИАГНОСТИКА ОФИСНОГО ТЕСТА</p>
+    <h2>Журнал для разбора ошибок</h2>
+    <p>
+      После проверки Outlook, АБС и сканера скачайте архив и отправьте его
+      разработчику. В архив не входят документы, база, тексты писем, ИНН,
+      логины, пароли, cookies и токены.
+    </p>
+    <div class="settings-reset-actions">
+      <a class="button button-primary" href="/settings/diagnostics/download">
+        Скачать диагностический архив
+      </a>
+    </div>
+  </section>
 
   <section class="settings-reset">
     <h2>Сброс обработки</h2>

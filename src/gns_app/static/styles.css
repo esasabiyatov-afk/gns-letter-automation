@@ -74,7 +74,7 @@ button, input, select { font: inherit; }
   right: 0;
   min-width: 190px;
   padding: 7px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--line);
   border-radius: 12px;
   background: #fff;
   box-shadow: 0 14px 32px rgba(30, 48, 37, 0.14);
@@ -397,6 +397,37 @@ pre { white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow
 .settings-reset-actions {
   display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px;
 }
+.outlook-status {
+  display: grid; gap: 4px; margin-top: 14px; padding: 12px;
+  border: 1px solid var(--line); border-radius: 10px; background: #fafbf9;
+}
+.outlook-status small, .outlook-note, .outlook-accounts { color: var(--muted); }
+.outlook-status-ready, .outlook-status-sync_requested {
+  border-color: #a8cbb5; background: var(--green-soft); color: var(--green-dark);
+}
+.outlook-status-success {
+  border-color: #a8cbb5; background: var(--green-soft); color: var(--green-dark);
+}
+.outlook-status-warning, .outlook-status-running {
+  border-color: #e1c178; background: var(--amber-soft); color: var(--amber);
+}
+.outlook-status-error {
+  border-color: #e1aaa4; background: var(--red-soft); color: var(--red);
+}
+.outlook-status-connection_error, .outlook-status-component_missing,
+.outlook-status-timeout, .outlook-status-unsupported_platform {
+  border-color: #e1aaa4; background: var(--red-soft); color: var(--red);
+}
+.outlook-details { margin-top: 12px; }
+.outlook-config-form {
+  display: grid; gap: 10px; margin-top: 16px; padding: 12px;
+  border: 1px solid var(--line); border-radius: 10px; background: #fafbf9;
+}
+.outlook-config-form .button { justify-self: start; }
+.outlook-import-stats { margin-top: 14px; }
+.outlook-accounts { margin-top: 14px; font-size: 13px; line-height: 1.5; }
+.outlook-accounts ul { margin: 7px 0 0; padding-left: 20px; }
+.outlook-note { margin-top: 14px !important; font-size: 12px; }
 
 .case-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .detail-list { display: grid; gap: 0; margin: 12px 0 0; }
@@ -530,9 +561,81 @@ pre { white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow
   box-shadow: 0 1px 2px rgba(20, 35, 27, 0.04);
 }
 .generated-response-list article > div { display: grid; gap: 3px; }
+.generated-response-actions { display: flex; gap: 7px; align-items: center; }
+.generated-response-actions form { margin: 0; }
 .generated-response-list span, .generated-response-list small {
   color: var(--muted);
 }
+.outgoing-number-panel { border-color: #d9c58a; background: #fffdf7; }
+.outgoing-preview-form {
+  display: grid; grid-template-columns: minmax(220px, 360px) auto;
+  align-items: end; gap: 10px; margin-top: 16px;
+}
+.outgoing-preview-form .field { margin: 0; }
+.outgoing-preview {
+  margin-top: 16px; padding: 14px; border: 1px solid #dfca8d;
+  border-radius: 12px; background: white;
+}
+.outgoing-preview-heading {
+  display: flex; justify-content: space-between; gap: 16px;
+}
+.outgoing-preview-heading span { color: var(--muted); }
+.outgoing-preview-list {
+  display: grid; gap: 6px; margin: 12px 0; padding: 0; list-style: none;
+}
+.outgoing-preview-list li {
+  display: grid; grid-template-columns: 100px minmax(180px, 1fr) 1.2fr;
+  gap: 10px; align-items: center; padding: 9px 10px;
+  border: 1px solid var(--line); border-radius: 9px; background: #f7f8f5;
+}
+.outgoing-preview-list small { color: var(--muted); }
+.outgoing-preview > form { display: flex; justify-content: flex-end; }
+.generated-letter-numbers {
+  display: grid; gap: 6px; margin-top: 8px;
+}
+.generated-letter-card {
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.signed-scan-block { display: grid; gap: 8px; }
+.scan-actions, .signed-scan-status { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.scan-upload-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
+.scan-upload-form label { display: grid; gap: 3px; }
+.scan-upload-form input[type="file"] { max-width: 260px; }
+.scan-confirm-form { display: grid !important; grid-template-columns: 1fr !important; gap: 6px !important; }
+.scan-confirm-form label { display: flex; gap: 7px; align-items: center; }
+.abs-account-form {
+  display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+  margin-top: 7px;
+}
+.abs-account-form span { width: 100%; color: var(--muted); font-size: 12px; }
+.ocr-conflict {
+  margin: 0 0 12px; padding: 12px; border: 1px solid #d99a2b;
+  border-radius: 12px; background: var(--amber-soft);
+}
+.ocr-conflict legend { padding: 0 6px; font-weight: 800; }
+.ocr-conflict p { margin: 0 0 9px; color: var(--muted); font-size: 13px; }
+.ocr-conflict-options { display: flex; flex-wrap: wrap; gap: 8px; }
+.ocr-conflict-options label {
+  display: flex; gap: 7px; align-items: center; padding: 8px 10px;
+  border: 1px solid #e4c98d; border-radius: 9px; background: white;
+}
+.generated-letter-numbers form {
+  display: grid; grid-template-columns: minmax(180px, 1fr) auto;
+  gap: 8px; align-items: end;
+}
+.generated-letter-numbers label { display: grid; gap: 3px; }
+.generated-letter-numbers label > span {
+  color: var(--muted); font-size: 11px; font-weight: 700;
+}
+.generated-letter-numbers input {
+  max-width: 190px; padding: 7px 9px; border: 1px solid var(--line);
+  border-radius: 8px; background: white;
+}
+.generated-letter-numbers .button { min-height: 34px; padding: 6px 10px; }
 .registry-layout {
   display: grid; grid-template-columns: minmax(360px, .75fr) 1.25fr;
   gap: 22px;
@@ -630,6 +733,11 @@ pre { white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow
   .main-nav > a,
   .nav-more > summary { padding: 6px 8px; font-size: 12px; }
   .odb-quick-row { grid-template-columns: 1fr; gap: 6px; }
+  .outgoing-preview-form,
+  .outgoing-preview-list li,
+  .generated-letter-numbers form { grid-template-columns: 1fr; }
+  .generated-response-list article,
+  .generated-response-actions { align-items: stretch; flex-direction: column; }
   .nav-more-menu { left: 0; right: auto; }
   .page-shell { width: min(94vw, 1460px); padding-top: 24px; }
   .hero { gap: 24px; }

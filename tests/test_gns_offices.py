@@ -2,6 +2,95 @@ from gns_app.domain import ExtractedFields, ExtractedTaxpayer
 from gns_app.services.workflow import WorkflowService
 
 
+def test_official_gns_emails_are_loaded_by_exact_office_name(workflow):
+    workflow.initialize_gns_offices()
+
+    summary = workflow.initialize_gns_office_emails()
+
+    assert summary["updated"] >= 55
+    pervomaisky = next(
+        office
+        for office in workflow.list_gns_offices()
+        if office["office_name"] == "УГНС по Первомайскому району"
+    )
+    balykchy = next(
+        office
+        for office in workflow.list_gns_offices()
+        if office["office_name"] == "УГНС по г. Балыкчы"
+    )
+    assert pervomaisky["email_address"] == "004pervom@sti.gov.kg"
+    assert balykchy["email_address"] == "020balykchy@sti.gov.kg"
+    manas_city = next(
+        office
+        for office in workflow.list_gns_offices()
+        if office["office_name"] == "УГНС по г. Манас"
+    )
+    manas_district = next(
+        office
+        for office in workflow.list_gns_offices()
+        if office["office_name"] == "УГНС по Манасскому району"
+    )
+    assert manas_city["email_address"] == "048manas@sti.gov.kg"
+    assert manas_district["email_address"] == "056manas@sti.gov.kg"
+    assert "УГНС по г. Манас" not in summary["unmatched"]
+
+    repeated = workflow.initialize_gns_office_emails()
+    assert repeated == {"updated": 0, "unmatched": []}
+
+
+def test_old_jalal_abad_city_names_match_manas_but_not_manas_district(workflow):
+    workflow.initialize_gns_offices()
+    workflow.initialize_gns_office_emails()
+
+    current_city = workflow.match_gns_office(
+        "УГНС по г. Манас Джалал-Абадской области"
+    )
+    old_city_d = workflow.match_gns_office(
+        "УГНС по городу Джалал-Абад Джалал-Абадской области"
+    )
+    old_city_zh = workflow.match_gns_office(
+        "УГНС по г. Жалал-Абад"
+    )
+    manas_district = workflow.match_gns_office(
+        "УГНС по Манасскому району Таласской области"
+    )
+
+    assert current_city is not None
+    assert old_city_d is not None
+    assert old_city_zh is not None
+    assert manas_district is not None
+    assert current_city["office_name"] == "УГНС по г. Манас"
+    assert old_city_d["office_key"] == current_city["office_key"]
+    assert old_city_zh["office_key"] == current_city["office_key"]
+    assert current_city["email_address"] == "048manas@sti.gov.kg"
+    assert manas_district["office_key"] != current_city["office_key"]
+    assert manas_district["email_address"] == "056manas@sti.gov.kg"
+
+
+def test_existing_jalal_abad_case_is_migrated_to_current_city_name(workflow):
+    workflow.db.execute(
+        """
+        INSERT INTO uploads(
+            id, original_filename, stored_path, sha256,
+            page_count, status, created_at
+        ) VALUES ('jalal-abad-upload', 'scan.pdf', 'scan.pdf',
+                  'jalal-abad-hash', 1, 'ready',
+                  '2026-01-01T00:00:00+00:00')
+        """
+    )
+    case_id = workflow._create_scan_case("jalal-abad-upload", "page-1")
+    workflow.db.execute(
+        "UPDATE cases SET district_place = ? WHERE id = ?",
+        ("по г. Жалал-Абад Джалал-Абадской области", case_id),
+    )
+
+    workflow.initialize_gns_offices()
+
+    assert workflow.get_case(case_id)["district_place"] == (
+        "по г. Манас Джалал-Абадской области"
+    )
+
+
 def _offices():
     return [
         {

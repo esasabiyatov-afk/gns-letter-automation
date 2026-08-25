@@ -162,3 +162,57 @@ def test_review_page_does_not_render_duplicate_registry_button(
     # сервере вообще (она появляется в браузере после AJAX-запроса).
     assert "Использовать название из реестра" not in response.text
     assert 'class="registry-live-result"' in response.text
+
+
+def test_conflicting_ocr_inns_render_one_taxpayer_with_choices(
+    workflow, monkeypatch
+):
+    from starlette.testclient import TestClient
+
+    monkeypatch.setattr(main, "workflow", workflow)
+    now = utc_now()
+    _insert_upload(workflow, "conflict-upload", page_count=1)
+    workflow.db.execute(
+        """
+        INSERT INTO cases(
+            id, upload_id, status, source_kind,
+            fields_confirmed, created_at, updated_at
+        ) VALUES ('conflict-case', 'conflict-upload',
+                  'needs_review', 'ocr_scan', 0, ?, ?)
+        """,
+        (now, now),
+    )
+    workflow.db.executemany(
+        """
+        INSERT INTO taxpayers(
+            id, case_id, display_order, name, inn,
+            name_source, inn_source, manually_confirmed,
+            created_at, updated_at
+        ) VALUES (?, 'conflict-case', ?, ?, ?,
+                  'ocr_scan', 'ocr_scan', 0, ?, ?)
+        """,
+        [
+            ("candidate-one", 1, "", "12904195800139", now, now),
+            (
+                "candidate-two",
+                2,
+                "Мамарасулова Минохжатхон Мамиржановна",
+                "12904195890139",
+                now,
+                now,
+            ),
+        ],
+    )
+    _insert_review_page(workflow, "conflict-page", "conflict-upload", 1)
+    workflow.db.execute(
+        "UPDATE pages SET case_id = 'conflict-case' WHERE id = 'conflict-page'"
+    )
+
+    response = TestClient(main.app).get("/review/conflict-page")
+
+    assert response.status_code == 200
+    assert response.text.count('name="taxpayer_name"') == 1
+    assert response.text.count('data-ocr-inn-candidate') == 2
+    assert "12904195800139" in response.text
+    assert "12904195890139" in response.text
+    assert "OCR распознал разные варианты ИНН" in response.text

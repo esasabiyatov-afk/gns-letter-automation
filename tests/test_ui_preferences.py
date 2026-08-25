@@ -80,6 +80,22 @@ def test_registry_priority_is_persisted(workflow, tmp_path):
     assert workflow.get_registry_priority() == "reestr_kg"
 
 
+def test_processing_worker_count_is_persisted_and_bounded(workflow, tmp_path):
+    workflow.update_operational_settings(
+        period_threshold="2020-01-01",
+        inbox_dir=str(tmp_path / "incoming-pdf"),
+        processing_workers=1,
+    )
+    assert workflow.get_processing_workers() == 1
+
+    workflow.update_operational_settings(
+        period_threshold="2020-01-01",
+        inbox_dir=str(tmp_path / "incoming-pdf"),
+        processing_workers=8,
+    )
+    assert workflow.get_processing_workers() == 2
+
+
 def test_registry_priority_falls_back_to_osoo_for_unknown_value(
     workflow, tmp_path
 ):

@@ -112,6 +112,16 @@
   const taxpayerList = document.querySelector("#taxpayer-list");
   const addTaxpayer = document.querySelector("#add-taxpayer");
   if (taxpayerList) {
+    taxpayerList.querySelectorAll("[data-ocr-inn-candidate]").forEach((choice) => {
+      choice.addEventListener("change", () => {
+        const innInput = taxpayerList.querySelector("input[name='taxpayer_inn']");
+        if (innInput && choice.checked) {
+          innInput.value = choice.value || "";
+          innInput.dispatchEvent(new Event("input", { bubbles: true }));
+          innInput.focus();
+        }
+      });
+    });
     const showRegistryResult = (row, data) => {
       const result = row.querySelector(".registry-live-result");
       if (!result) return;

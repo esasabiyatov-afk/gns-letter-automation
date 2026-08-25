@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 import unicodedata
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import numpy as np
 from PIL import Image, ImageFilter, ImageOps
 
 from gns_app.domain import OcrResult, OcrStatus
+from gns_app.diagnostics import record_event, record_exception
 from gns_app.services.pdf_service import PdfService
 
 try:
@@ -29,13 +31,51 @@ class OcrService:
         self.pdf_service = pdf_service
         self.fast_data_dir = fast_data_dir
         self.best_data_dir = best_data_dir
+        self._last_health: dict[str, bool | str] = {}
+
+    def health_check(self) -> dict[str, bool | str]:
+        """Check that packaged OCR data can initialize the native engine."""
+        result: dict[str, bool | str] = {
+            "engine_imported": bool(tesserocr),
+        }
+        for model_name, data_dir in (
+            ("fast", self.fast_data_dir),
+            ("best", self.best_data_dir),
+        ):
+            files_available = self._model_available(data_dir)
+            result[f"{model_name}_files_available"] = files_available
+            initialized = False
+            error_type = ""
+            if files_available and data_dir is not None:
+                try:
+                    with tesserocr.PyTessBaseAPI(
+                        path=str(data_dir),
+                        lang="rus+kir",
+                    ):
+                        initialized = True
+                except Exception as exc:  # pragma: no cover - native runtime
+                    error_type = type(exc).__name__
+            result[f"{model_name}_initialized"] = initialized
+            result[f"{model_name}_error_type"] = error_type
+        self._last_health = result
+        return dict(result)
+
+    def last_health(self) -> dict[str, bool | str]:
+        return dict(self._last_health)
 
     def recognize(
         self,
         pdf_path: Path,
         page_number: int,
         image_path: Path | None = None,
+        model_name: str = "fast",
     ) -> OcrResult:
+        started = time.monotonic()
+        if model_name not in {"fast", "best"}:
+            raise ValueError("Неизвестная локальная OCR-модель")
+        data_dir = (
+            self.fast_data_dir if model_name == "fast" else self.best_data_dir
+        )
         text = unicodedata.normalize(
             "NFC",
             self.pdf_service.extract_embedded_text(pdf_path, page_number),
@@ -44,83 +84,28 @@ class OcrService:
         embedded_text_rejected = bool(
             cleaned and not self._embedded_text_is_reliable(cleaned)
         )
-        if image_path and self._model_available(self.fast_data_dir):
+        record_event(
+            "ocr",
+            "recognize",
+            "started",
+            details={
+                "model": model_name,
+                "image_available": bool(image_path and image_path.is_file()),
+                "model_available": self._model_available(data_dir),
+                "embedded_text_length": len(cleaned),
+                "embedded_text_rejected": embedded_text_rejected,
+            },
+        )
+        if image_path and self._model_available(data_dir):
             try:
-                fast = self._recognize_image(
+                result = self._recognize_image(
                     image_path,
-                    self.fast_data_dir,
-                    "fast",
+                    data_dir,
+                    model_name,
                     supplement_regions=bool(
                         cleaned and not embedded_text_rejected
                     ),
                 )
-                if self._model_available(self.best_data_dir):
-                    best = self._recognize_image(
-                        image_path,
-                        self.best_data_dir,
-                        "best",
-                        supplement_regions=bool(
-                            cleaned and not embedded_text_rejected
-                        ),
-                    )
-                    result = (
-                        best
-                        if self._quality_key(best) > self._quality_key(fast)
-                        else fast
-                    )
-                    fast_critical = self._critical_field_signature(fast.text)
-                    best_critical = self._critical_field_signature(best.text)
-                    result.taxpayer_fields_agree = (
-                        self._signature_components_match(
-                            fast_critical,
-                            best_critical,
-                            ("name:", "inn:"),
-                        )
-                    )
-                    result.period_fields_agree = (
-                        self._signature_components_match(
-                            fast_critical,
-                            best_critical,
-                            ("period:",),
-                        )
-                    )
-                    result.recipient_fields_agree = (
-                        self._recipient_field_signature(fast.text)
-                        == self._recipient_field_signature(best.text)
-                        != ()
-                    )
-                    if cleaned and not embedded_text_rejected:
-                        embedded_critical = self._critical_field_signature(cleaned)
-                        selected_critical = self._critical_field_signature(
-                            result.text
-                        )
-                        if self._signature_component_conflicts(
-                            embedded_critical,
-                            selected_critical,
-                            ("name:", "inn:"),
-                        ):
-                            result.taxpayer_fields_agree = False
-                        if self._signature_component_conflicts(
-                            embedded_critical,
-                            selected_critical,
-                            ("period:",),
-                        ):
-                            result.period_fields_agree = False
-                        embedded_recipient = self._recipient_field_signature(
-                            cleaned
-                        )
-                        if (
-                            embedded_recipient
-                            and embedded_recipient
-                            != self._recipient_field_signature(result.text)
-                        ):
-                            result.recipient_fields_agree = False
-                    result.critical_fields_agree = bool(
-                        result.taxpayer_fields_agree
-                        and result.period_fields_agree
-                    )
-                else:
-                    result = fast
                 issue_parts: list[str] = []
                 if embedded_text_rejected:
                     issue_parts.append(
@@ -138,46 +123,51 @@ class OcrService:
                         "дополнительно распознано изображение всей страницы. "
                         "Оба варианта показаны для ручной сверки."
                     )
-                if result.critical_fields_agree:
-                    issue_parts.append(
-                        "Два OCR-прохода одинаково прочитали наименование, "
-                        "ИНН и период. Их всё равно нужно сверить с "
-                        "изображением."
-                    )
-                else:
-                    issue_parts.append(
-                        "Два независимых OCR-прохода не подтвердили "
-                        "одинаково все критические поля. При хорошем "
-                        "качестве найденные значения показываются как "
-                        "неподтверждённые подсказки."
-                    )
-                if result.recipient_fields_agree:
-                    issue_parts.append(
-                        "Два OCR-прохода одинаково прочитали должность и "
-                        "ФИО подписанта; это только подсказка до ручной "
-                        "проверки."
-                    )
+                issue_parts.append(
+                    "Локальный OCR показан только как неподтверждённая "
+                    "подсказка. Наименование, ИНН и период необходимо "
+                    "посимвольно сверить с изображением."
+                )
                 result.issue = " ".join(issue_parts)
+                self._record_result(result, model_name, started)
                 return result
             except Exception as exc:
+                record_exception(
+                    "ocr",
+                    "recognize_image",
+                    exc,
+                    details={
+                        "model": model_name,
+                        "duration_ms": int((time.monotonic() - started) * 1000),
+                        "embedded_fallback_available": bool(
+                            cleaned and not embedded_text_rejected
+                        ),
+                    },
+                )
                 if cleaned and not embedded_text_rejected:
-                    return self._embedded_result(
+                    result = self._embedded_result(
                         cleaned,
                         "Дополнительный OCR изображения завершился "
                         "ошибкой; показан только текстовый слой PDF.",
                     )
-                return OcrResult(
+                    self._record_result(result, model_name, started)
+                    return result
+                result = OcrResult(
                     status=OcrStatus.ERROR,
                     text="",
                     confidence=0.0,
-                    language="rus+kir",
+                    language=f"rus+kir ({model_name})",
                     issue=f"Локальный OCR завершился ошибкой: {str(exc)[:300]}",
                 )
+                self._record_result(result, model_name, started)
+                return result
 
         if cleaned and not embedded_text_rejected:
-            return self._embedded_result(cleaned)
+            result = self._embedded_result(cleaned)
+            self._record_result(result, model_name, started)
+            return result
 
-        return OcrResult(
+        result = OcrResult(
             status=OcrStatus.REQUIRES_ENGINE,
             text="",
             confidence=0.0,
@@ -188,8 +178,29 @@ class OcrService:
                     if embedded_text_rejected
                     else "В PDF нет текстового слоя. "
                 )
-                + "Локальная модель rus+kir не установлена или недоступна."
+                + f"Локальная модель rus+kir {model_name} не установлена "
+                "или недоступна."
             ),
+        )
+        self._record_result(result, model_name, started)
+        return result
+
+    @staticmethod
+    def _record_result(
+        result: OcrResult,
+        model_name: str,
+        started: float,
+    ) -> None:
+        record_event(
+            "ocr",
+            "recognize",
+            str(result.status),
+            details={
+                "model": model_name,
+                "duration_ms": int((time.monotonic() - started) * 1000),
+                "text_length": len(result.text),
+                "confidence": result.confidence,
+            },
         )
 
     @staticmethod
@@ -307,10 +318,6 @@ class OcrService:
         )
 
     @staticmethod
-    def _quality_key(result: OcrResult) -> tuple[float, int]:
-        return result.confidence, len(result.text)
-
-    @staticmethod
     def _critical_field_signature(text: str) -> tuple[str, ...]:
         normalized = unicodedata.normalize("NFC", text)
         names = [
@@ -355,38 +362,6 @@ class OcrService:
                 }
             )
         )
-
-    @staticmethod
-    def _signature_components_match(
-        left: tuple[str, ...],
-        right: tuple[str, ...],
-        prefixes: tuple[str, ...],
-    ) -> bool:
-        left_values = {
-            value for value in left if value.startswith(prefixes)
-        }
-        right_values = {
-            value for value in right if value.startswith(prefixes)
-        }
-        has_every_component = all(
-            any(value.startswith(prefix) for value in left_values)
-            for prefix in prefixes
-        )
-        return bool(has_every_component and left_values == right_values)
-
-    @staticmethod
-    def _signature_component_conflicts(
-        reference: tuple[str, ...],
-        selected: tuple[str, ...],
-        prefixes: tuple[str, ...],
-    ) -> bool:
-        reference_values = {
-            value for value in reference if value.startswith(prefixes)
-        }
-        selected_values = {
-            value for value in selected if value.startswith(prefixes)
-        }
-        return bool(reference_values and reference_values != selected_values)
 
     @staticmethod
     def _recipient_field_signature(text: str) -> tuple[str, ...]:

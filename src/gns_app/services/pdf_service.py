@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import argparse
+import json
 import math
+import os
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-import pypdfium2 as pdfium
 from PIL import Image, ImageFilter, ImageOps, ImageStat
 from pypdf import PdfReader, PdfWriter
+
+from gns_app.runtime_commands import module_command
 
 
 class PdfProcessingError(ValueError):
@@ -22,6 +28,8 @@ class RenderedPage:
 
 
 class PdfService:
+    RENDER_TIMEOUT_SECONDS = 180
+
     def page_count(self, path: Path) -> int:
         try:
             reader = PdfReader(str(path))
@@ -47,27 +55,19 @@ class PdfService:
     ) -> RenderedPage:
         preview_path.parent.mkdir(parents=True, exist_ok=True)
         enhanced_path.parent.mkdir(parents=True, exist_ok=True)
-
-        try:
-            pdf = pdfium.PdfDocument(str(pdf_path))
-            try:
-                page = pdf[page_number - 1]
-                image = page.render(scale=scale).to_pil().convert("L")
-            finally:
-                pdf.close()
-        except Exception as exc:
-            raise PdfProcessingError(
-                f"Не удалось отрисовать страницу {page_number}: {exc}"
-            ) from exc
-
-        image.save(preview_path, format="JPEG", quality=90, subsampling=0)
-        enhanced = self._enhance_for_review(image)
-        enhanced.save(enhanced_path, format="JPEG", quality=92, subsampling=0)
+        payload = self._run_isolated_renderer(
+            action="preview",
+            pdf_path=pdf_path,
+            page_number=page_number,
+            output_path=preview_path,
+            secondary_output_path=enhanced_path,
+            scale=scale,
+        )
 
         return RenderedPage(
             preview_path=preview_path,
             enhanced_preview_path=enhanced_path,
-            quality_score=self._quality_score(image),
+            quality_score=float(payload.get("quality_score", 0.0)),
         )
 
     def render_page_for_qr(
@@ -78,19 +78,112 @@ class PdfService:
         scale: float = 3.2,
     ) -> Path:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            pdf = pdfium.PdfDocument(str(pdf_path))
-            try:
-                page = pdf[page_number - 1]
-                image = page.render(scale=scale).to_pil().convert("L")
-            finally:
-                pdf.close()
-        except Exception as exc:
-            raise PdfProcessingError(
-                f"Не удалось подготовить страницу {page_number} для QR: {exc}"
-            ) from exc
-        image.save(output_path, format="PNG", optimize=True)
+        self._run_isolated_renderer(
+            action="qr",
+            pdf_path=pdf_path,
+            page_number=page_number,
+            output_path=output_path,
+            scale=scale,
+        )
         return output_path
+
+    def render_page_high_resolution(
+        self,
+        pdf_path: Path,
+        page_number: int,
+        output_path: Path,
+        scale: float = 3.2,
+    ) -> Path:
+        """Render one color source shared by high-resolution QR and OCR."""
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._run_isolated_renderer(
+            action="high_resolution",
+            pdf_path=pdf_path,
+            page_number=page_number,
+            output_path=output_path,
+            scale=scale,
+        )
+        return output_path
+
+    def _run_isolated_renderer(
+        self,
+        *,
+        action: str,
+        pdf_path: Path,
+        page_number: int,
+        output_path: Path,
+        scale: float,
+        secondary_output_path: Path | None = None,
+    ) -> dict[str, object]:
+        command = module_command(
+            "gns_app.services.pdf_service",
+            "--render-action",
+            action,
+            "--pdf-path",
+            str(pdf_path),
+            "--page-number",
+            str(page_number),
+            "--output-path",
+            str(output_path),
+            "--scale",
+            str(scale),
+        )
+        if secondary_output_path is not None:
+            command.extend(
+                ["--secondary-output-path", str(secondary_output_path)]
+            )
+        outputs = [output_path]
+        if secondary_output_path is not None:
+            outputs.append(secondary_output_path)
+        for path in outputs:
+            path.unlink(missing_ok=True)
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=self.RENDER_TIMEOUT_SECONDS,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                cwd=Path.cwd(),
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            )
+        except subprocess.TimeoutExpired as exc:
+            for path in outputs:
+                path.unlink(missing_ok=True)
+            raise PdfProcessingError(
+                f"Отрисовка страницы {page_number} превысила лимит времени"
+            ) from exc
+        if completed.returncode != 0:
+            for path in outputs:
+                path.unlink(missing_ok=True)
+            raise PdfProcessingError(
+                f"Изолированный модуль PDF аварийно завершился на странице "
+                f"{page_number}; сервер продолжает работу"
+            )
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            for path in outputs:
+                path.unlink(missing_ok=True)
+            raise PdfProcessingError(
+                f"Модуль PDF не вернул результат для страницы {page_number}"
+            ) from exc
+        if not isinstance(payload, dict) or not payload.get("ok"):
+            for path in outputs:
+                path.unlink(missing_ok=True)
+            raise PdfProcessingError(
+                f"Не удалось отрисовать страницу {page_number}"
+            )
+        if not all(path.is_file() for path in outputs):
+            for path in outputs:
+                path.unlink(missing_ok=True)
+            raise PdfProcessingError(
+                f"Модуль PDF не создал изображение страницы {page_number}"
+            )
+        return payload
 
     def render_page_for_ocr(
         self,
@@ -99,21 +192,13 @@ class PdfService:
         output_path: Path,
         scale: float = 3.0,
     ) -> Path:
-        """Render a temporary high-resolution color image for local OCR."""
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            pdf = pdfium.PdfDocument(str(pdf_path))
-            try:
-                page = pdf[page_number - 1]
-                image = page.render(scale=scale).to_pil().convert("RGB")
-            finally:
-                pdf.close()
-        except Exception as exc:
-            raise PdfProcessingError(
-                f"Не удалось подготовить страницу {page_number} для OCR: {exc}"
-            ) from exc
-        image.save(output_path, format="PNG", optimize=True)
-        return output_path
+        """Compatibility wrapper for callers that only need OCR rendering."""
+        return self.render_page_high_resolution(
+            pdf_path,
+            page_number,
+            output_path,
+            scale=scale,
+        )
 
     def extract_embedded_text(self, pdf_path: Path, page_number: int) -> str:
         try:
@@ -176,3 +261,94 @@ class PdfService:
         if math.isnan(raw):
             return 0.0
         return round(max(0.0, min(1.0, raw)), 3)
+
+
+def _render_pdfium_image(
+    pdf_path: Path,
+    page_number: int,
+    scale: float,
+    mode: str,
+) -> Image.Image:
+    # PDFium загружается только в дочернем процессе. Его нативный сбой не
+    # может завершить локальный веб-сервер.
+    import pypdfium2 as pdfium
+
+    pdf = pdfium.PdfDocument(str(pdf_path))
+    try:
+        page = pdf[page_number - 1]
+        try:
+            bitmap = page.render(scale=scale)
+            try:
+                return bitmap.to_pil().convert(mode).copy()
+            finally:
+                bitmap.close()
+        finally:
+            page.close()
+    finally:
+        pdf.close()
+
+
+def _render_bridge(args: argparse.Namespace) -> dict[str, object]:
+    try:
+        pdf_path = Path(args.pdf_path)
+        output_path = Path(args.output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if args.render_action == "preview":
+            if not args.secondary_output_path:
+                raise PdfProcessingError("Не указан путь улучшенного превью")
+            secondary = Path(args.secondary_output_path)
+            secondary.parent.mkdir(parents=True, exist_ok=True)
+            image = _render_pdfium_image(
+                pdf_path,
+                args.page_number,
+                args.scale,
+                "L",
+            )
+            image.save(output_path, format="JPEG", quality=90, subsampling=0)
+            enhanced = PdfService._enhance_for_review(image)
+            enhanced.save(
+                secondary,
+                format="JPEG",
+                quality=92,
+                subsampling=0,
+            )
+            return {
+                "ok": True,
+                "quality_score": PdfService._quality_score(image),
+            }
+        mode = "L" if args.render_action == "qr" else "RGB"
+        image = _render_pdfium_image(
+            pdf_path,
+            args.page_number,
+            args.scale,
+            mode,
+        )
+        image.save(output_path, format="PNG", optimize=True)
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+
+def _run_render_bridge() -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--render-action",
+        choices=("preview", "qr", "high_resolution"),
+        required=True,
+    )
+    parser.add_argument("--pdf-path", required=True)
+    parser.add_argument("--page-number", type=int, required=True)
+    parser.add_argument("--output-path", required=True)
+    parser.add_argument("--secondary-output-path", default="")
+    parser.add_argument("--scale", type=float, required=True)
+    args = parser.parse_args()
+    sys.stdout.write(json.dumps(_render_bridge(args), ensure_ascii=False))
+    return 0
+
+
+def main() -> int:
+    return _run_render_bridge()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

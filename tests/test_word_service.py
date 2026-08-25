@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import shutil
 import zipfile
 
+import pytest
 from docx import Document
 
-from gns_app.services.word_service import WordTemplateService
+from gns_app.services.word_service import WordTemplateError, WordTemplateService
 
 
 def _all_word_text(path) -> str:
@@ -61,6 +63,65 @@ def test_render_returns_overflow_flag_alongside_path(tmp_path, project_root):
 
     assert result_path == output
     assert likely_overflow is False
+
+
+def test_outgoing_number_replaces_legacy_template_placeholder(
+    tmp_path, project_root
+):
+    service = WordTemplateService(project_root / "УГНС")
+    output = tmp_path / "numbered.docx"
+
+    service.render(
+        output,
+        {
+            "district_place": "по Ленинскому району города Бишкек",
+            "recipient_position": "Зам. начальника управления",
+            "recipient_display_name": "Телтаеву Р. З.",
+            "employee_name": "Гапарова Э.",
+            "outgoing_number": "9544",
+        },
+        [{"name": 'ОсОО "Тест"', "inn": "02312201410117"}],
+    )
+
+    text = _all_word_text(output)
+    assert "04-1/9544" in text
+    assert "[Исх.Номер]" not in text
+    assert "______" not in text
+
+
+def test_explicit_outgoing_number_tag_is_replaced(tmp_path, project_root):
+    templates = tmp_path / "templates"
+    templates.mkdir()
+    source = project_root / "УГНС" / "шаблон ответа одиночный.docx"
+    derived = templates / source.name
+    shutil.copy2(source, derived)
+    document = Document(str(derived))
+    marker = next(
+        paragraph for paragraph in document.paragraphs if "______" in paragraph.text
+    )
+    WordTemplateService._replace_across_runs(
+        marker,
+        "______",
+        WordTemplateService.TOKENS["outgoing_number"],
+    )
+    document.save(derived)
+
+    output = tmp_path / "tag-numbered.docx"
+    WordTemplateService(templates).render(
+        output,
+        {
+            "district_place": "по Ленинскому району города Бишкек",
+            "recipient_position": "Зам. начальника управления",
+            "recipient_display_name": "Телтаеву Р. З.",
+            "employee_name": "Гапарова Э.",
+            "outgoing_number": "9544",
+        },
+        [{"name": 'ОсОО "Тест"', "inn": "02312201410117"}],
+    )
+
+    text = _all_word_text(output)
+    assert "04-1/9544" in text
+    assert "[Исх.Номер]" not in text
 
 
 def test_short_letter_is_not_flagged_as_overflowing(tmp_path, project_root):
@@ -231,3 +292,56 @@ def test_split_response_repeats_full_letter_on_new_page(tmp_path, project_root):
     assert text.count("по Ленинскому району города Бишкек") >= 2
     assert text.count("Настоящим ЗАО АКБ") >= 2
     assert all(item["inn"] in text for item in taxpayers)
+
+
+def test_split_response_uses_distinct_outgoing_numbers(tmp_path, project_root):
+    service = WordTemplateService(project_root / "УГНС")
+    output = tmp_path / "split-numbered.docx"
+    case = {
+        "district_place": "по Ленинскому району города Бишкек",
+        "recipient_position": "Зам. начальника управления",
+        "recipient_display_name": "Телтаеву Р. З.",
+        "employee_name": "Гапарова Э.",
+    }
+    taxpayers = [
+        {"name": f'ОсОО "Тест {index}"', "inn": f"{index:014d}"}
+        for index in range(1, 5)
+    ]
+
+    service.render_pages(
+        output,
+        case,
+        taxpayers,
+        taxpayers_per_page=2,
+        outgoing_numbers=["9544", "9545"],
+    )
+
+    text = _all_word_text(output)
+    assert "04-1/9544" in text
+    assert "04-1/9545" in text
+
+
+def test_split_response_rejects_one_number_for_multiple_letters(
+    tmp_path, project_root
+):
+    service = WordTemplateService(project_root / "УГНС")
+    output = tmp_path / "split-invalid-number.docx"
+    case = {
+        "district_place": "по Ленинскому району города Бишкек",
+        "recipient_position": "Зам. начальника управления",
+        "recipient_display_name": "Телтаеву Р. З.",
+        "employee_name": "Гапарова Э.",
+        "outgoing_number": "9544",
+    }
+    taxpayers = [
+        {"name": f'ОсОО "Тест {index}"', "inn": f"{index:014d}"}
+        for index in range(1, 5)
+    ]
+
+    with pytest.raises(WordTemplateError, match="отдельный исходящий номер"):
+        service.render_pages(
+            output,
+            case,
+            taxpayers,
+            taxpayers_per_page=2,
+        )

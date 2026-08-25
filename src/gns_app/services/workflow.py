@@ -5,21 +5,28 @@ import csv
 import json
 import re
 import shutil
+import sqlite3
+import time as monotonic_time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 from datetime import UTC, date, datetime, time, timedelta, timezone
 from pathlib import Path
+from threading import RLock
 from typing import Any, BinaryIO
 from uuid import uuid4
 
 from docx import Document
+from PIL import Image, ImageSequence, UnidentifiedImageError
 from pypdf import PdfReader
 
 from gns_app.config import Settings
 from gns_app.database import Database, utc_now
+from gns_app.diagnostics import record_event, record_exception
 from gns_app.domain import (
     AbsStatus,
     CaseStatus,
     OdbStatus,
+    OcrResult,
     OcrStatus,
     PageStatus,
     PageType,
@@ -27,7 +34,7 @@ from gns_app.domain import (
     UploadStatus,
     ValueSource,
 )
-from gns_app.services.abs_service import FakeAbsGateway
+from gns_app.services.abs_service import create_abs_gateway
 from gns_app.services.classifier import PageClassifier
 from gns_app.services.extractor import FieldExtractor
 from gns_app.services.name_service import NameService
@@ -45,6 +52,7 @@ from gns_app.services.registry_service import (
     RegistryLookupError,
     RegistryLookupResult,
 )
+from gns_app.services.scanner_service import ScannerService
 from gns_app.services.visual_classifier import PageVisualAnalyzer
 from gns_app.services.storage import (
     ensure_within,
@@ -55,7 +63,7 @@ from gns_app.services.taxpayer_service import (
     TaxpayerKind,
     classify_taxpayer,
 )
-from gns_app.services.word_service import WordTemplateService
+from gns_app.services.word_service import WordTemplateError, WordTemplateService
 from gns_app.text_cleanup import clean_location, clean_taxpayer_name
 
 
@@ -66,9 +74,14 @@ class WorkflowValidationError(ValueError):
 class WorkflowService:
     ACTIVE_EMPLOYEE_SETTING = "active_employee_key"
     GNS_OFFICES_SOURCE_SETTING = "gns_offices_source_hash"
+    GNS_EMAILS_SOURCE_SETTING = "gns_emails_source_hash"
+    GNS_EMAILS_SOURCE_URL = (
+        "https://sti.gov.kg/section/0/electronic_appeals_of_citizens"
+    )
     PERIOD_THRESHOLD_SETTING = "period_threshold"
     INBOX_DIR_SETTING = "inbox_dir"
     REGISTRY_PRIORITY_SETTING = "registry_priority"
+    PROCESSING_WORKERS_SETTING = "processing_workers"
     UI_SETTING_DEFAULTS = {
         "allow_multiple_taxpayers": False,
         "show_recipient_salutation": True,
@@ -80,6 +93,11 @@ class WorkflowService:
         Path(__file__).resolve().parents[1]
         / "data"
         / "ugns_addresses.csv"
+    )
+    DEFAULT_GNS_EMAILS_PATH = (
+        Path(__file__).resolve().parents[1]
+        / "data"
+        / "ugns_emails.csv"
     )
 
     def __init__(self, db: Database, settings: Settings):
@@ -103,7 +121,7 @@ class WorkflowService:
             settings.allowed_qr_hosts,
             settings.allowed_qr_paths,
         )
-        self.abs = FakeAbsGateway()
+        self.abs = create_abs_gateway(settings)
         # Только оперативная память процесса: в БД и журнал не попадает.
         self._abs_session_credentials: tuple[str, str] | None = None
         self.registry = CompositeRegistryClient(
@@ -115,9 +133,20 @@ class WorkflowService:
             settings.source_templates_dir,
             self.names,
         )
+        self.scanner = ScannerService()
+        # OCR и рендер независимых страниц выполняются параллельно, а создание
+        # и связывание карточек остаётся последовательным. Это исключает две
+        # карточки для страниц с одинаковым QR.
+        self._case_lock = RLock()
 
     def abs_session_active(self) -> bool:
         return self._abs_session_credentials is not None
+
+    def abs_is_fake(self) -> bool:
+        return bool(getattr(self.abs, "is_fake", False))
+
+    def abs_session_supported(self) -> bool:
+        return bool(getattr(self.abs, "supports_session", False))
 
     def reconcile_recipient_display_names(self) -> int:
         changed = 0
@@ -178,12 +207,24 @@ class WorkflowService:
             return value
         return CompositeRegistryClient.PRIMARY_OSOO
 
+    def get_processing_workers(self) -> int:
+        row = self.db.fetch_one(
+            "SELECT value FROM settings WHERE key = ?",
+            (self.PROCESSING_WORKERS_SETTING,),
+        )
+        try:
+            value = int(row["value"]) if row else self.settings.processing_workers
+        except (TypeError, ValueError):
+            value = self.settings.processing_workers
+        return max(1, min(2, value))
+
     def update_operational_settings(
         self,
         *,
         period_threshold: str,
         inbox_dir: str,
         registry_priority: str = CompositeRegistryClient.PRIMARY_OSOO,
+        processing_workers: int = 2,
         actor: str = "Сотрудник",
     ) -> None:
         try:
@@ -202,6 +243,7 @@ class WorkflowService:
             CompositeRegistryClient.PRIMARY_REESTR_KG,
         ):
             registry_priority = CompositeRegistryClient.PRIMARY_OSOO
+        workers = max(1, min(2, int(processing_workers)))
         now = utc_now()
         self.db.executemany(
             """
@@ -214,6 +256,7 @@ class WorkflowService:
                 (self.PERIOD_THRESHOLD_SETTING, threshold.isoformat(), now),
                 (self.INBOX_DIR_SETTING, str(folder), now),
                 (self.REGISTRY_PRIORITY_SETTING, registry_priority, now),
+                (self.PROCESSING_WORKERS_SETTING, str(workers), now),
             ],
         )
         self.db.audit(
@@ -224,6 +267,7 @@ class WorkflowService:
                 "period_threshold": threshold.isoformat(),
                 "inbox_dir": str(folder),
                 "registry_priority": registry_priority,
+                "processing_workers": workers,
             },
             actor=actor,
         )
@@ -355,6 +399,15 @@ class WorkflowService:
     @staticmethod
     def _normalize_office_text(value: str) -> str:
         normalized = value.casefold().replace("ё", "е")
+        normalized = normalized.replace("ысык", "иссык")
+        # Город Джалал-Абад переименован в Манас. Заменяем только
+        # самостоятельное название города, но не «Джалал-Абадская область».
+        normalized = re.sub(
+            r"\b(?:джалал|жалал)[-\s]+абад\b",
+            "манас",
+            normalized,
+        )
+        normalized = re.sub(r"\b(?:городу|города|город)\b", "г", normalized)
         normalized = re.sub(r"[^\w\s-]", " ", normalized)
         return " ".join(normalized.split())
 
@@ -408,8 +461,12 @@ class WorkflowService:
                     now,
                 )
             )
-            if office_name.startswith("УГНС "):
-                legacy = clean_location(office_name.removeprefix("УГНС "))
+            for legacy_value in [office_name, *aliases]:
+                legacy = clean_location(
+                    legacy_value.removeprefix("УГНС ")
+                    if legacy_value.startswith("УГНС ")
+                    else legacy_value
+                )
                 if legacy and legacy != district_place:
                     legacy_locations[legacy.casefold()] = district_place
         with self.db.connect() as connection:
@@ -484,6 +541,11 @@ class WorkflowService:
             district_place = " ".join(
                 str(row.get("Район и место") or "").split()
             )
+            aliases = [
+                " ".join(alias.split())
+                for alias in str(row.get("Алиасы") or "").split(";")
+                if " ".join(alias.split())
+            ]
             if not district_place:
                 district_place = (
                     office_name.removeprefix("УГНС ")
@@ -495,7 +557,7 @@ class WorkflowService:
                     "office_name": office_name,
                     "district_place": district_place,
                     "postal_address": postal_address,
-                    "aliases": [],
+                    "aliases": aliases,
                 }
             )
         return records
@@ -503,7 +565,7 @@ class WorkflowService:
     def initialize_gns_offices(self) -> int:
         if not self.DEFAULT_GNS_OFFICES_PATH.is_file():
             return 0
-        source_hash = "district-v2:" + hashlib.sha256(
+        source_hash = "district-v3:" + hashlib.sha256(
             self.DEFAULT_GNS_OFFICES_PATH.read_bytes()
         ).hexdigest()
         row = self.db.fetch_one("SELECT COUNT(*) AS count FROM gns_offices")
@@ -532,6 +594,79 @@ class WorkflowService:
             (self.GNS_OFFICES_SOURCE_SETTING, source_hash, utc_now()),
         )
         return count
+
+    def initialize_gns_office_emails(self) -> dict[str, Any]:
+        path = self.DEFAULT_GNS_EMAILS_PATH
+        if not path.is_file():
+            return {"updated": 0, "unmatched": []}
+        source_hash = "office-alias-v2:" + hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        signature = self.db.fetch_one(
+            "SELECT value FROM settings WHERE key = ?",
+            (self.GNS_EMAILS_SOURCE_SETTING,),
+        )
+        stored_count = self.db.fetch_one(
+            "SELECT COUNT(*) AS count FROM gns_offices "
+            "WHERE email_address IS NOT NULL AND email_address != ''"
+        )
+        if (
+            signature
+            and signature["value"] == source_hash
+            and stored_count
+            and int(stored_count["count"]) >= 55
+        ):
+            return {"updated": 0, "unmatched": []}
+        offices = self.list_gns_offices()
+        by_name: dict[str, list[dict[str, Any]]] = {}
+        for office in offices:
+            keys = [office.get("office_name") or "", *(office.get("aliases") or [])]
+            for key in keys:
+                normalized_key = self._normalize_office_text(key)
+                candidates = by_name.setdefault(normalized_key, [])
+                if not any(candidate["id"] == office["id"] for candidate in candidates):
+                    candidates.append(office)
+        updated = 0
+        unmatched: list[str] = []
+        with path.open("r", encoding="utf-8-sig", newline="") as source:
+            for row in csv.DictReader(source):
+                official_name = " ".join((row.get("Наименование УГНС") or "").split())
+                email = (row.get("Email") or "").strip().casefold()
+                if not official_name or not re.fullmatch(
+                    r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", email
+                ):
+                    unmatched.append(official_name or "Пустая строка")
+                    continue
+                candidates = by_name.get(self._normalize_office_text(official_name), [])
+                if len(candidates) != 1:
+                    unmatched.append(official_name)
+                    continue
+                self.db.execute(
+                    "UPDATE gns_offices SET email_address = ?, updated_at = ? "
+                    "WHERE id = ?",
+                    (email, utc_now(), candidates[0]["id"]),
+                )
+                updated += 1
+        self.db.execute(
+            """
+            INSERT INTO settings(key, value, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE
+            SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (self.GNS_EMAILS_SOURCE_SETTING, source_hash, utc_now()),
+        )
+        self.db.audit(
+            "settings",
+            "gns_office_emails",
+            "gns_office_emails_updated",
+            {
+                "updated": updated,
+                "unmatched": unmatched,
+                "source_url": self.GNS_EMAILS_SOURCE_URL,
+            },
+            actor="Система",
+        )
+        return {"updated": updated, "unmatched": unmatched}
 
     def list_gns_offices(self) -> list[dict[str, Any]]:
         rows = self.db.fetch_all(
@@ -1076,36 +1211,59 @@ class WorkflowService:
                 "SELECT * FROM pages WHERE upload_id = ? ORDER BY page_number",
                 (upload_id,),
             )
-        for page in pages:
+        def process_page(page: dict[str, Any]) -> None:
             try:
                 self._process_page(upload, page)
             except Exception as exc:
-                self.db.execute(
-                    """
-                    UPDATE pages
-                    SET status = ?, issue_code = ?, issue_message = ?,
-                        updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        PageStatus.TECHNICAL_ERROR,
-                        "page_processing_error",
-                        str(exc)[:800],
-                        utc_now(),
-                        page["id"],
-                    ),
-                )
-                self.db.audit(
-                    "page",
-                    page["id"],
-                    "page_processing_error",
-                    {"message": str(exc)[:800]},
-                )
+                self._record_page_processing_error(page["id"], exc)
+
+        worker_count = min(self.get_processing_workers(), len(pages))
+        if worker_count > 1:
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="gns-page",
+            ) as executor:
+                futures = [executor.submit(process_page, page) for page in pages]
+                for future in as_completed(futures):
+                    future.result()
+        else:
+            for page in pages:
+                process_page(page)
         self.reconcile_official_qr_pages(upload_id)
         self._complete_qr_companions(upload_id)
         self._require_letter_for_scan_only_decisions(upload_id)
         self._remove_orphan_cases(upload_id)
         self._refresh_upload_status(upload_id)
+
+    def _record_page_processing_error(
+        self, page_id: str, exc: Exception
+    ) -> None:
+        message = str(exc)[:800]
+        self.db.execute(
+            """
+            UPDATE pages
+            SET status = ?, issue_code = ?, issue_message = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                PageStatus.TECHNICAL_ERROR,
+                "page_processing_error",
+                message,
+                utc_now(),
+                page_id,
+            ),
+        )
+        self.db.audit(
+            "page",
+            page_id,
+            "page_processing_error",
+            {"message": message},
+        )
+        record_exception(
+            "processing",
+            "page",
+            exc,
+        )
 
     def interrupted_upload_ids(self) -> list[str]:
         return [
@@ -1121,15 +1279,7 @@ class WorkflowService:
         ]
 
     def _require_letter_for_scan_only_decisions(self, upload_id: str) -> int:
-        letter = self.db.fetch_one(
-            """
-            SELECT id FROM pages
-            WHERE upload_id = ? AND page_type = ?
-            LIMIT 1
-            """,
-            (upload_id, PageType.LETTER),
-        )
-        if letter:
+        if self._upload_has_confirmed_letter(upload_id):
             return 0
         decisions = self.db.fetch_all(
             """
@@ -1178,6 +1328,34 @@ class WorkflowService:
                 {"page_number": decision["page_number"]},
             )
         return len(decisions)
+
+    def _upload_has_confirmed_letter(self, upload_id: str) -> bool:
+        return bool(
+            self.db.fetch_one(
+                """
+                SELECT pages.id
+                FROM pages
+                LEFT JOIN cases ON cases.id = pages.case_id
+                WHERE pages.upload_id = ?
+                  AND (
+                    pages.page_type = ?
+                    OR (
+                      pages.qr_status = ?
+                      AND cases.source_kind = ?
+                      AND cases.fields_confirmed = 1
+                      AND cases.official_document_path IS NOT NULL
+                    )
+                  )
+                LIMIT 1
+                """,
+                (
+                    upload_id,
+                    PageType.LETTER,
+                    QrStatus.FOUND,
+                    ValueSource.QR_OFFICIAL,
+                ),
+            )
+        )
 
     def reconcile_confident_scan_decisions(
         self,
@@ -1281,15 +1459,8 @@ class WorkflowService:
                 continue
             current_upload_id = page["upload_id"]
             if current_upload_id not in letter_cache:
-                letter_cache[current_upload_id] = bool(
-                    self.db.fetch_one(
-                        """
-                        SELECT id FROM pages
-                        WHERE upload_id = ? AND page_type = ?
-                        LIMIT 1
-                        """,
-                        (current_upload_id, PageType.LETTER),
-                    )
+                letter_cache[current_upload_id] = (
+                    self._upload_has_confirmed_letter(current_upload_id)
                 )
 
             if classification.automatic_terminal and letter_cache[
@@ -1658,11 +1829,120 @@ class WorkflowService:
         )
         return page["upload_id"]
 
+    def request_precise_ocr(self, page_id: str) -> str:
+        page = self.get_page(page_id)
+        if not page:
+            raise WorkflowValidationError("Страница не найдена")
+        if page["manual_confirmed"]:
+            raise WorkflowValidationError(
+                "Подтверждённую сотрудником страницу нельзя распознавать повторно"
+            )
+        if page["status"] != PageStatus.NEEDS_REVIEW:
+            raise WorkflowValidationError(
+                "Точный OCR доступен только для страницы ручной проверки"
+            )
+        if not self.ocr._model_available(self.settings.ocr_best_data_dir):
+            raise WorkflowValidationError(
+                "Точная локальная OCR-модель best не установлена"
+            )
+        self.db.execute(
+            "UPDATE pages SET status = ?, updated_at = ? WHERE id = ?",
+            (PageStatus.PROCESSING, utc_now(), page_id),
+        )
+        self.db.audit(
+            "page",
+            page_id,
+            "precise_ocr_requested",
+            {"page_number": page["page_number"], "model": "best"},
+        )
+        return page["upload_id"]
+
+    def process_precise_ocr(self, page_id: str) -> None:
+        page = self.get_page(page_id)
+        if not page:
+            return
+        upload = self.get_upload(page["upload_id"])
+        if not upload:
+            return
+        output_path = (
+            self.settings.previews_dir
+            / upload["id"]
+            / f".page-{page['page_number']:04d}-{page_id}-best.png"
+        )
+        try:
+            self.pdf.render_page_high_resolution(
+                Path(upload["stored_path"]),
+                page["page_number"],
+                output_path,
+            )
+            result = self.ocr.recognize(
+                Path(upload["stored_path"]),
+                page["page_number"],
+                output_path,
+                model_name="best",
+            )
+            if page.get("case_id") and result.text.strip():
+                fields = self.extractor.extract_scan_letter(result.text)
+                with self._case_lock:
+                    self._prefill_scan_case(
+                        page["case_id"],
+                        fields,
+                        office_suggestion=self.best_gns_office(result.text),
+                        allow_ocr_suggestions=True,
+                        perform_registry_check=False,
+                    )
+            self.db.execute(
+                """
+                UPDATE pages
+                SET ocr_status = ?, ocr_confidence = ?, extracted_text = ?,
+                    status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    result.status,
+                    result.confidence,
+                    result.text,
+                    PageStatus.NEEDS_REVIEW,
+                    utc_now(),
+                    page_id,
+                ),
+            )
+            self.db.audit(
+                "page",
+                page_id,
+                "precise_ocr_completed",
+                {
+                    "model": "best",
+                    "status": result.status,
+                    "confidence": result.confidence,
+                },
+            )
+        except Exception as exc:
+            self.db.execute(
+                "UPDATE pages SET status = ?, updated_at = ? WHERE id = ?",
+                (PageStatus.NEEDS_REVIEW, utc_now(), page_id),
+            )
+            self.db.audit(
+                "page",
+                page_id,
+                "precise_ocr_failed",
+                {"model": "best", "error": str(exc)[:300]},
+            )
+        finally:
+            output_path.unlink(missing_ok=True)
+
     def _process_page(
         self, upload: dict[str, Any], page: dict[str, Any]
     ) -> None:
+        processing_started = monotonic_time.monotonic()
         page_id = page["id"]
         page_number = page["page_number"]
+        record_event(
+            "processing",
+            "page",
+            "started",
+            details={"page_number": page_number},
+        )
         self.db.execute(
             "UPDATE pages SET status = ?, updated_at = ? WHERE id = ?",
             (PageStatus.PROCESSING, utc_now(), page_id),
@@ -1697,6 +1977,7 @@ class WorkflowService:
             ),
         )
 
+        source_pdf = Path(upload["stored_path"])
         qr_result = self.qr.decode(preview_path)
         if qr_result.status == QrStatus.NOT_FOUND:
             enhanced_qr = self.qr.decode(enhanced_path)
@@ -1707,59 +1988,134 @@ class WorkflowService:
                     else "enhanced"
                 )
                 qr_result = enhanced_qr
-        if qr_result.status == QrStatus.NOT_FOUND:
-            qr_render_path = preview_dir / (
-                f".page-{page_number:04d}-{page_id}-qr.png"
-            )
+        high_resolution_path = preview_dir / (
+            f".page-{page_number:04d}-{page_id}-highres.png"
+        )
+        high_resolution_ready = False
+        high_resolution_attempted = False
+
+        def ensure_high_resolution(audit_event: str) -> Path | None:
+            nonlocal high_resolution_ready, high_resolution_attempted
+            if high_resolution_ready:
+                return high_resolution_path
+            if high_resolution_attempted:
+                return None
+            high_resolution_attempted = True
             try:
-                self.pdf.render_page_for_qr(
-                    Path(upload["stored_path"]),
+                self.pdf.render_page_high_resolution(
+                    source_pdf,
                     page_number,
-                    qr_render_path,
+                    high_resolution_path,
                 )
+                high_resolution_ready = True
+                return high_resolution_path
+            except (PdfProcessingError, OSError) as exc:
+                self.db.audit(
+                    "page",
+                    page_id,
+                    audit_event,
+                    {"error": str(exc)[:300]},
+                )
+                return None
+
+        if qr_result.status == QrStatus.NOT_FOUND:
+            qr_image = ensure_high_resolution(
+                "qr_high_resolution_retry_failed"
+            )
+            if qr_image:
                 high_resolution_qr = self.qr.decode_high_resolution(
-                    qr_render_path
+                    qr_image
                 )
                 if high_resolution_qr.status != QrStatus.NOT_FOUND:
                     qr_result = high_resolution_qr
-            except (PdfProcessingError, OSError) as exc:
-                self.db.audit(
-                    "page",
-                    page_id,
-                    "qr_high_resolution_retry_failed",
-                    {"error": str(exc)[:300]},
+
+        case_id: str | None = None
+        official_complete = False
+        official_issue: str | None = None
+        if qr_result.status == QrStatus.FOUND:
+            # Карточки и официальные документы связываются под блокировкой:
+            # две страницы одного пакета могут иметь одинаковый QR.
+            with self._case_lock:
+                case_id, needs_official = self._ensure_qr_case(
+                    upload["id"], qr_result.payload_hash or ""
+                )
+                if (
+                    self.settings.auto_download_official
+                    and needs_official
+                    and qr_result.payload
+                ):
+                    try:
+                        official_path = self.official.download(
+                            qr_result.payload,
+                            self.settings.official_dir / case_id,
+                        )
+                        official_complete = self._apply_official_document(
+                            case_id, official_path
+                        )
+                        if not official_complete:
+                            official_issue = (
+                                "Официальная версия получена по QR. "
+                                "Не удалось надёжно извлечь все "
+                                "обязательные поля."
+                            )
+                    except (
+                        OfficialDocumentError,
+                        OSError,
+                        ValueError,
+                    ) as exc:
+                        official_issue = str(exc)
+                elif self.settings.auto_download_official and not needs_official:
+                    existing_case = self.get_case(case_id)
+                    if existing_case and existing_case.get(
+                        "official_document_path"
+                    ):
+                        official_complete = bool(
+                            existing_case.get("fields_confirmed")
+                        )
+                        if not official_complete:
+                            official_complete = self._apply_official_document(
+                                case_id,
+                                Path(existing_case["official_document_path"]),
+                            )
+                        if not official_complete:
+                            official_issue = (
+                                "Официальная версия уже получена по QR. "
+                                "Не удалось надёжно извлечь все "
+                                "обязательные поля."
+                            )
+                refreshed_case = self.get_case(case_id)
+                if (
+                    refreshed_case
+                    and refreshed_case.get("source_kind")
+                    == ValueSource.QR_OFFICIAL
+                    and refreshed_case.get("fields_confirmed")
+                    and refreshed_case.get("official_document_path")
+                ):
+                    official_complete = True
+                    official_issue = None
+
+        if official_complete:
+            ocr_result = OcrResult(
+                status=OcrStatus.SKIPPED_OFFICIAL,
+                text="",
+                confidence=0.0,
+                language="не требуется: официальный документ по QR",
+                issue=None,
+            )
+            high_resolution_path.unlink(missing_ok=True)
+        else:
+            ocr_image_path = ensure_high_resolution(
+                "ocr_high_resolution_render_failed"
+            ) or rendered.preview_path
+            try:
+                ocr_result = self.ocr.recognize(
+                    source_pdf,
+                    page_number,
+                    ocr_image_path,
                 )
             finally:
-                qr_render_path.unlink(missing_ok=True)
-        ocr_image_path = rendered.preview_path
-        ocr_render_path: Path | None = None
-        if qr_result.status != QrStatus.FOUND:
-            ocr_render_path = preview_dir / (
-                f".page-{page_number:04d}-{page_id}-ocr.png"
-            )
-            try:
-                self.pdf.render_page_for_ocr(
-                    Path(upload["stored_path"]),
-                    page_number,
-                    ocr_render_path,
-                )
-                ocr_image_path = ocr_render_path
-            except (PdfProcessingError, OSError) as exc:
-                self.db.audit(
-                    "page",
-                    page_id,
-                    "ocr_high_resolution_render_failed",
-                    {"error": str(exc)[:300]},
-                )
-        try:
-            ocr_result = self.ocr.recognize(
-                Path(upload["stored_path"]),
-                page_number,
-                ocr_image_path,
-            )
-        finally:
-            if ocr_render_path:
-                ocr_render_path.unlink(missing_ok=True)
+                high_resolution_path.unlink(missing_ok=True)
+
         visual_evidence = self.visual.analyze(
             rendered.enhanced_preview_path
         )
@@ -1784,92 +2140,44 @@ class WorkflowService:
                     visual_evidence,
                 )
 
-        case_id: str | None = None
-        official_complete = False
-        official_issue: str | None = None
-        if qr_result.status == QrStatus.FOUND:
-            case_id, needs_official = self._ensure_qr_case(
-                upload["id"], qr_result.payload_hash or ""
-            )
-            if (
-                self.settings.auto_download_official
-                and needs_official
-                and qr_result.payload
-            ):
-                try:
-                    official_path = self.official.download(
-                        qr_result.payload,
-                        self.settings.official_dir / case_id,
-                    )
-                    official_complete = self._apply_official_document(
-                        case_id, official_path
-                    )
-                    if not official_complete:
-                        official_issue = (
-                            "Официальная версия получена по QR. "
-                            "Не удалось надёжно извлечь все обязательные поля."
-                        )
-                except (OfficialDocumentError, OSError, ValueError) as exc:
-                    official_issue = str(exc)
-            elif self.settings.auto_download_official and not needs_official:
-                existing_case = self.get_case(case_id)
-                if existing_case and existing_case.get(
-                    "official_document_path"
-                ):
-                    official_complete = bool(
-                        existing_case.get("fields_confirmed")
-                    )
-                    if not official_complete:
-                        official_complete = self._apply_official_document(
-                            case_id,
-                            Path(existing_case["official_document_path"]),
-                        )
-                    if not official_complete:
-                        official_issue = (
-                            "Официальная версия уже получена по QR. "
-                            "Не удалось надёжно извлечь все обязательные поля."
-                        )
-            # Решение и письмо часто имеют один QR. Перед итоговым статусом
-            # повторно читаем карточку из БД: если соседняя страница уже
-            # получила и полностью разобрала официальный документ, никакое
-            # ручное подтверждение этой страницы больше не требуется.
-            refreshed_case = self.get_case(case_id)
-            if (
-                refreshed_case
-                and refreshed_case.get("source_kind")
-                == ValueSource.QR_OFFICIAL
-                and refreshed_case.get("fields_confirmed")
-                and refreshed_case.get("official_document_path")
-            ):
-                official_complete = True
-                official_issue = None
-
         extracted = None
-        ocr_suggestions_allowed = False
-        if classification.page_type == PageType.LETTER:
+        ocr_suggestions_allowed = bool(
+            ocr_result.text.strip()
+            and ocr_result.status
+            not in {
+                OcrStatus.NOT_STARTED,
+                OcrStatus.REQUIRES_ENGINE,
+                OcrStatus.ERROR,
+            }
+        )
+        if (
+            classification.page_type in {PageType.LETTER, PageType.UNKNOWN}
+            and ocr_suggestions_allowed
+        ):
             extracted = self.extractor.extract_scan_letter(ocr_result.text)
             office_suggestion = self.best_gns_office(ocr_result.text)
-            ocr_suggestions_allowed = bool(
-                ocr_result.text.strip()
-                and ocr_result.status
-                not in {
-                    OcrStatus.NOT_STARTED,
-                    OcrStatus.REQUIRES_ENGINE,
-                    OcrStatus.ERROR,
-                }
+            has_structured_hints = bool(
+                extracted.taxpayers
+                or extracted.period_start
+                or extracted.period_end
+                or extracted.recipient_position
+                or extracted.recipient_full_name
+                or office_suggestion
             )
-            if case_id is None:
-                case_id = self._create_scan_case(upload["id"], page_id)
-            self._prefill_scan_case(
-                case_id,
-                extracted,
-                ocr_result.critical_fields_agree,
-                office_suggestion,
-                recipient_fields_agree=ocr_result.recipient_fields_agree,
-                taxpayer_fields_agree=ocr_result.taxpayer_fields_agree,
-                period_fields_agree=ocr_result.period_fields_agree,
-                allow_ocr_suggestions=ocr_suggestions_allowed,
-            )
+            if classification.page_type == PageType.LETTER or has_structured_hints:
+                with self._case_lock:
+                    if case_id is None:
+                        case_id = self._create_scan_case(upload["id"], page_id)
+                    self._prefill_scan_case(
+                        case_id,
+                        extracted,
+                        ocr_result.critical_fields_agree,
+                        office_suggestion,
+                        recipient_fields_agree=ocr_result.recipient_fields_agree,
+                        taxpayer_fields_agree=ocr_result.taxpayer_fields_agree,
+                        period_fields_agree=ocr_result.period_fields_agree,
+                        allow_ocr_suggestions=ocr_suggestions_allowed,
+                    )
 
         page_status, issue_code, issue_message = self._page_outcome(
             classification.page_type,
@@ -1906,9 +2214,9 @@ class WorkflowService:
                 )
             else:
                 issue_message = (
-                    "OCR-модели не подтвердили одинаково наименование, "
-                    "ИНН и период. Критические поля нужно ввести вручную, "
-                    "сверяя с изображением."
+                    "Локальный OCR не подтверждает наименование, ИНН и "
+                    "период автоматически. Критические поля нужно "
+                    "посимвольно сверить с изображением."
                 )
         self.db.execute(
             """
@@ -1968,6 +2276,31 @@ class WorkflowService:
                     visual_evidence.vertical_line_groups
                 ),
                 "status": page_status,
+            },
+        )
+        record_event(
+            "processing",
+            "page",
+            "completed",
+            details={
+                "duration_ms": int(
+                    (monotonic_time.monotonic() - processing_started) * 1000
+                ),
+                "page_number": page_number,
+                "page_type": str(classification.page_type),
+                "page_status": str(page_status),
+                "ocr_status": str(ocr_result.status),
+                "ocr_text_length": len(ocr_result.text),
+                "ocr_confidence": ocr_result.confidence,
+                "structured_party_count": (
+                    len(extracted.taxpayers) if extracted else 0
+                ),
+                "period_hint_present": bool(
+                    extracted
+                    and extracted.period_start
+                    and extracted.period_end
+                ),
+                "case_created": bool(case_id),
             },
         )
 
@@ -2948,12 +3281,14 @@ class WorkflowService:
             raise WorkflowValidationError("Нет налогоплательщиков")
 
         username = username.strip()
+        session_reused = False
         if not username or not password:
-            if self._abs_session_credentials:
+            if self.abs_session_supported() and self._abs_session_credentials:
                 username, password = self._abs_session_credentials
+                session_reused = True
             else:
                 raise WorkflowValidationError(
-                    "Войдите в АБС один раз, чтобы начать сеанс"
+                    "Введите логин и пароль для проверки АБС"
                 )
 
         self.db.execute(
@@ -2965,25 +3300,68 @@ class WorkflowService:
                 case_id,
             ),
         )
-        result = self.abs.check(username, password, taxpayers)
+        abs_started = monotonic_time.monotonic()
+        record_event(
+            "abs",
+            "check",
+            "started",
+            details={
+                "mode": "fake" if self.abs_is_fake() else "tolubay",
+                "record_count": len(taxpayers),
+                "session_reused": session_reused,
+            },
+        )
+        try:
+            result = self.abs.check(username, password, taxpayers)
+        except Exception as exc:
+            self._abs_session_credentials = None
+            username = ""
+            password = ""
+            record_exception(
+                "abs",
+                "check",
+                exc,
+                details={
+                    "duration_ms": int(
+                        (monotonic_time.monotonic() - abs_started) * 1000
+                    ),
+                    "mode": "fake" if self.abs_is_fake() else "tolubay",
+                    "record_count": len(taxpayers),
+                },
+            )
+            raise
         failed_statuses = {
             AbsStatus.AUTH_ERROR,
             AbsStatus.UNAVAILABLE,
             AbsStatus.TECHNICAL_ERROR,
         }
-        if result.status in failed_statuses:
+        if result.status in failed_statuses or not self.abs_session_supported():
             self._abs_session_credentials = None
         else:
             self._abs_session_credentials = (username, password)
         # В БД и журнал учётные данные не передаются.
         username = ""
         password = ""
+        record_event(
+            "abs",
+            "check",
+            str(result.status),
+            details={
+                "duration_ms": int(
+                    (monotonic_time.monotonic() - abs_started) * 1000
+                ),
+                "mode": "fake" if result.is_fake else "tolubay",
+                "record_count": len(taxpayers),
+                "result_count": len(result.taxpayers),
+            },
+        )
 
         for taxpayer_result in result.taxpayers:
             self.db.execute(
                 """
                 UPDATE taxpayers
-                SET abs_result = ?, odb_result = NULL, updated_at = ?
+                SET abs_result = ?, abs_account_result = NULL,
+                    odb_result = NULL, updated_at = ?
                 WHERE case_id = ? AND inn = ?
                 """,
                 (
@@ -3002,6 +3380,11 @@ class WorkflowService:
         )
         if result.status in failed_statuses:
             next_status = CaseStatus.READY_FOR_ABS
+        elif any(
+            item.get("result") == AbsStatus.FOUND
+            for item in result.taxpayers
+        ):
+            next_status = CaseStatus.NEEDS_REVIEW
         elif case.get("period_route") == "odb" or (
             start is not None and start < threshold
         ):
@@ -3022,10 +3405,10 @@ class WorkflowService:
         self.db.audit(
             "case",
             case_id,
-            "fake_abs_checked",
+            "fake_abs_checked" if result.is_fake else "abs_checked",
             {
                 "status": result.status,
-                "is_fake": True,
+                "is_fake": result.is_fake,
                 "taxpayers": result.taxpayers,
                 "next_status": next_status,
             },
@@ -3036,7 +3419,7 @@ class WorkflowService:
         case = self.get_case(case_id)
         if not case or case.get("status") != CaseStatus.READY_FOR_ABS:
             return False
-        if isinstance(self.abs, FakeAbsGateway):
+        if self.abs_is_fake():
             self.check_abs(case_id, "local-auto", "local-auto")
             self._abs_session_credentials = None
             return True
@@ -3101,7 +3484,10 @@ class WorkflowService:
 
         refreshed = self.get_taxpayers(case_id)
         all_absent = all(
-            taxpayer.get("abs_result") == AbsStatus.NOT_FOUND
+            (
+                taxpayer.get("abs_result") == AbsStatus.NOT_FOUND
+                or taxpayer.get("abs_account_result") == "not_found"
+            )
             and taxpayer.get("odb_result") == OdbStatus.NOT_FOUND
             for taxpayer in refreshed
         )
@@ -3186,7 +3572,10 @@ class WorkflowService:
             1 for item in refreshed if not item.get("odb_result")
         )
         all_absent = all(
-            item.get("abs_result") == AbsStatus.NOT_FOUND
+            (
+                item.get("abs_result") == AbsStatus.NOT_FOUND
+                or item.get("abs_account_result") == "not_found"
+            )
             and item.get("odb_result") == OdbStatus.NOT_FOUND
             for item in refreshed
         )
@@ -3221,6 +3610,70 @@ class WorkflowService:
             "next_status": next_status,
             "manual_response": has_found,
         }
+
+    def confirm_abs_account_taxpayer(
+        self,
+        case_id: str,
+        inn: str,
+        result: str,
+        actor: str = "Сотрудник",
+    ) -> dict[str, Any]:
+        case = self.get_case(case_id)
+        taxpayer = next(
+            (item for item in self.get_taxpayers(case_id) if item["inn"] == inn),
+            None,
+        )
+        if not case or not taxpayer:
+            raise WorkflowValidationError("Налогоплательщик не найден")
+        if taxpayer.get("abs_result") != AbsStatus.FOUND:
+            raise WorkflowValidationError(
+                "Отметка счёта нужна только для найденной анкеты АБС"
+            )
+        if result not in {"found", "not_found"}:
+            raise WorkflowValidationError("Неизвестный результат проверки счёта")
+        now = utc_now()
+        self.db.execute(
+            "UPDATE taxpayers SET abs_account_result = ?, updated_at = ? "
+            "WHERE case_id = ? AND inn = ?",
+            (result, now, case_id, inn),
+        )
+        refreshed = self.get_taxpayers(case_id)
+        pending = any(
+            item.get("abs_result") == AbsStatus.FOUND
+            and not item.get("abs_account_result")
+            for item in refreshed
+        )
+        has_account = any(
+            item.get("abs_account_result") == "found" for item in refreshed
+        )
+        all_absent = all(
+            item.get("abs_result") == AbsStatus.NOT_FOUND
+            or item.get("abs_account_result") == "not_found"
+            for item in refreshed
+        )
+        threshold = self.get_period_threshold()
+        old_period = case.get("period_route") == "odb" or bool(
+            case.get("period_start")
+            and date.fromisoformat(case["period_start"]) < threshold
+        )
+        if pending or has_account or not all_absent:
+            next_status = CaseStatus.NEEDS_REVIEW
+        elif old_period:
+            next_status = CaseStatus.MANUAL_PERIOD_RULE
+        else:
+            next_status = CaseStatus.READY_FOR_RESPONSE
+        self.db.execute(
+            "UPDATE cases SET status = ?, updated_at = ? WHERE id = ?",
+            (next_status, now, case_id),
+        )
+        self.db.audit(
+            "taxpayer",
+            taxpayer["id"],
+            "abs_account_manually_checked",
+            {"result": result, "next_status": next_status},
+            actor=actor,
+        )
+        return {"result": result, "next_status": next_status}
 
     def check_abs_today(
         self,
@@ -3258,18 +3711,23 @@ class WorkflowService:
             }:
                 break
 
-        # Локальные переменные очищаются; активный сеанс остаётся только в RAM.
+        # Локальные переменные очищаются. Реальный адаптер не сохраняет их
+        # между проверками; тестовый сеанс остаётся только в RAM.
         username = ""
         password = ""
         self.db.audit(
             "settings",
             f"abs-batch-{day.isoformat()}",
-            "fake_abs_batch_checked",
+            (
+                "fake_abs_batch_checked"
+                if self.abs_is_fake()
+                else "abs_batch_checked"
+            ),
             {
                 "business_date": day.isoformat(),
                 "case_count": processed_count,
                 "results": counts,
-                "is_fake": True,
+                "is_fake": self.abs_is_fake(),
             },
         )
         return {
@@ -3320,6 +3778,59 @@ class WorkflowService:
             ORDER BY created_at DESC
             """
         )
+        generated_by_id = {group["id"]: group for group in generated}
+        generated_letters = self.db.fetch_all(
+            """
+            SELECT response_letters.*
+            FROM response_letters
+            JOIN response_groups
+              ON response_groups.id = response_letters.response_group_id
+            ORDER BY response_groups.created_at DESC,
+                     response_groups.id, response_letters.letter_order
+            """
+        )
+        for group in generated:
+            group["letters"] = []
+        active_scans = self.db.fetch_all(
+            """
+            SELECT * FROM signed_response_scans
+            WHERE status IN ('needs_confirmation', 'confirmed')
+            ORDER BY created_at DESC
+            """
+        )
+        scans_by_letter = {
+            scan["response_letter_id"]: scan for scan in active_scans
+        }
+        outgoing_messages = self.db.fetch_all(
+            """
+            SELECT * FROM outlook_outgoing_messages
+            ORDER BY created_at DESC
+            """
+        )
+        outgoing_by_scan = {
+            message["signed_scan_id"]: message
+            for message in outgoing_messages
+        }
+        for letter in generated_letters:
+            letter["signed_scan"] = scans_by_letter.get(letter["id"])
+            if letter["signed_scan"]:
+                letter["outlook_message"] = outgoing_by_scan.get(
+                    letter["signed_scan"]["id"]
+                )
+            else:
+                letter["outlook_message"] = None
+            group = generated_by_id.get(letter["response_group_id"])
+            if group is not None:
+                office = self.match_gns_office(group["district_place"])
+                letter["gns_email"] = (
+                    office.get("email_address") if office else ""
+                )
+                group["letters"].append(letter)
+        for group in generated:
+            group["letter_count"] = len(group["letters"])
+            group["numbered_letter_count"] = sum(
+                1 for letter in group["letters"] if letter["outgoing_number"]
+            )
         odb_cases = self.db.fetch_all(
             """
             SELECT cases.id, cases.recipient_display_name,
@@ -3373,6 +3884,9 @@ class WorkflowService:
                 day, AbsStatus.FOUND
             ),
             "generated_groups": generated,
+            "unnumbered_letters": self.list_outgoing_letters(
+                day, only_unnumbered=True
+            ),
         }
 
     def _daily_response_groups(
@@ -3383,11 +3897,14 @@ class WorkflowService:
         if abs_bucket == AbsStatus.NOT_FOUND:
             extra_where = (
                 "cases.status = 'ready_for_response' "
-                "AND taxpayers.abs_result = 'not_found'"
+                "AND (taxpayers.abs_result = 'not_found' "
+                "OR taxpayers.abs_account_result = 'not_found')"
             )
         else:
             extra_where = (
-                "(taxpayers.abs_result = 'found' "
+                "(taxpayers.abs_account_result = 'found' "
+                "OR (taxpayers.abs_result = 'found' "
+                "AND taxpayers.abs_account_result IS NULL) "
                 "OR taxpayers.odb_result = 'found') "
                 "AND ("
                 "cases.status != 'manual_period_rule' "
@@ -3411,6 +3928,9 @@ class WorkflowService:
                 taxpayers.name AS taxpayer_name,
                 taxpayers.inn AS taxpayer_inn,
                 taxpayers.display_order,
+                taxpayers.abs_result,
+                taxpayers.abs_account_result,
+                taxpayers.odb_result,
                 (
                     SELECT pages.id
                     FROM pages
@@ -3429,13 +3949,17 @@ class WorkflowService:
         grouped: dict[str, dict[str, Any]] = {}
         for row in rows:
             district = clean_location(row.get("district_place"))
+            office = self.match_gns_office(district)
+            office_identity = office["office_key"] if office else district
+            if office:
+                district = office["district_place"]
             recipient = " ".join(
                 (row.get("recipient_full_name") or "").split()
             )
             group_key = self._response_group_key(
                 business_date,
                 abs_bucket,
-                district,
+                office_identity,
                 recipient,
             )
             group = grouped.setdefault(
@@ -3445,6 +3969,8 @@ class WorkflowService:
                     "business_date": business_date.isoformat(),
                     "abs_bucket": str(abs_bucket),
                     "district_place": district,
+                    "gns_office_key": office["office_key"] if office else "",
+                    "gns_email": office.get("email_address") if office else "",
                     "recipient_position": row.get("recipient_position") or "",
                     "recipient_full_name": recipient,
                     "recipient_display_name": (
@@ -3483,6 +4009,9 @@ class WorkflowService:
                     "source_page_id": row.get("source_page_id"),
                     "name": name,
                     "inn": inn,
+                    "abs_result": row.get("abs_result"),
+                    "abs_account_result": row.get("abs_account_result"),
+                    "odb_result": row.get("odb_result"),
                 }
                 group["_taxpayers_by_inn"][inn] = taxpayer
                 group["taxpayers"].append(taxpayer)
@@ -3609,6 +4138,9 @@ class WorkflowService:
             group["taxpayers"],
             per_page,
         )
+        letter_count = (
+            group["taxpayer_count"] + per_page - 1
+        ) // per_page
 
         now = utc_now()
         with self.db.connect() as connection:
@@ -3618,9 +4150,10 @@ class WorkflowService:
                     id, business_date, group_key, abs_bucket, status,
                     district_place, recipient_position, recipient_full_name,
                     recipient_display_name, employee_name, taxpayer_count,
-                    response_path, response_page_overflow, created_at,
+                    taxpayers_per_letter, response_path,
+                    response_page_overflow, created_at,
                     updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     group_id,
@@ -3634,6 +4167,7 @@ class WorkflowService:
                     group["recipient_display_name"],
                     group["employee_name"],
                     group["taxpayer_count"],
+                    per_page,
                     str(output),
                     int(likely_overflow),
                     now,
@@ -3669,6 +4203,31 @@ class WorkflowService:
             )
             connection.executemany(
                 """
+                INSERT INTO response_letters(
+                    id, response_group_id, letter_order,
+                    taxpayer_start_order, taxpayer_count,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        uuid4().hex,
+                        group_id,
+                        letter_order,
+                        (letter_order - 1) * per_page + 1,
+                        min(
+                            per_page,
+                            group["taxpayer_count"]
+                            - (letter_order - 1) * per_page,
+                        ),
+                        now,
+                        now,
+                    )
+                    for letter_order in range(1, letter_count + 1)
+                ],
+            )
+            connection.executemany(
+                """
                 UPDATE cases
                 SET status = ?, response_status = ?,
                     response_path = ?, updated_at = ?
@@ -3697,6 +4256,7 @@ class WorkflowService:
                 "taxpayer_count": group["taxpayer_count"],
                 "filename": output.name,
                 "taxpayers_per_page": per_page,
+                "letter_count": letter_count,
             },
         )
         return group_id, output
@@ -3708,6 +4268,679 @@ class WorkflowService:
             "SELECT * FROM response_groups WHERE id = ?",
             (group_id,),
         )
+
+    @staticmethod
+    def _canonical_outgoing_number(
+        value: str | int | None,
+        *,
+        allow_empty: bool = False,
+    ) -> str | None:
+        text = str(value or "").strip()
+        if not text:
+            if allow_empty:
+                return None
+            raise WorkflowValidationError("Введите первый исходящий номер")
+        if not text.isdigit():
+            raise WorkflowValidationError(
+                "Исходящий номер должен состоять только из цифр"
+            )
+        number = int(text)
+        if number < 1 or number > 999_999_999:
+            raise WorkflowValidationError(
+                "Исходящий номер должен быть от 1 до 999999999"
+            )
+        return str(number)
+
+    def list_outgoing_letters(
+        self,
+        business_date: date | None = None,
+        *,
+        only_unnumbered: bool = False,
+    ) -> list[dict[str, Any]]:
+        day = business_date or datetime.now(self.BUSINESS_TIMEZONE).date()
+        unnumbered_filter = (
+            "AND response_letters.outgoing_number IS NULL"
+            if only_unnumbered
+            else ""
+        )
+        return self.db.fetch_all(
+            f"""
+            SELECT response_letters.*,
+                   response_groups.business_date,
+                   response_groups.recipient_display_name,
+                   response_groups.district_place,
+                   response_groups.response_path,
+                   response_groups.created_at AS group_created_at
+            FROM response_letters
+            JOIN response_groups
+              ON response_groups.id = response_letters.response_group_id
+            WHERE response_groups.business_date = ?
+              AND response_groups.status = 'created'
+              {unnumbered_filter}
+            ORDER BY response_groups.created_at,
+                     response_groups.rowid, response_letters.letter_order
+            """,
+            (day.isoformat(),),
+        )
+
+    def preview_outgoing_numbers(
+        self,
+        first_number: str | int,
+        business_date: date | None = None,
+    ) -> dict[str, Any]:
+        day = business_date or datetime.now(self.BUSINESS_TIMEZONE).date()
+        first = self._canonical_outgoing_number(first_number)
+        letters = self.list_outgoing_letters(day, only_unnumbered=True)
+        if letters and int(first) + len(letters) - 1 > 999_999_999:
+            raise WorkflowValidationError(
+                "Диапазон исходящих номеров превышает 999999999"
+            )
+        proposals: list[dict[str, Any]] = []
+        for offset, letter in enumerate(letters):
+            proposal = dict(letter)
+            proposal["proposed_number"] = str(int(first) + offset)
+            proposals.append(proposal)
+
+        proposed_numbers = [item["proposed_number"] for item in proposals]
+        if proposed_numbers:
+            placeholders = ",".join("?" for _ in proposed_numbers)
+            occupied = self.db.fetch_all(
+                "SELECT outgoing_number FROM response_letters "
+                f"WHERE outgoing_number IN ({placeholders})",
+                proposed_numbers,
+            )
+            if occupied:
+                raise WorkflowValidationError(
+                    "Исходящий номер "
+                    f"{occupied[0]['outgoing_number']} уже используется"
+                )
+        return {
+            "business_date": day.isoformat(),
+            "first_number": first,
+            "last_number": (
+                proposed_numbers[-1] if proposed_numbers else first
+            ),
+            "count": len(proposals),
+            "letters": proposals,
+        }
+
+    def _response_group_render_data(
+        self,
+        group_id: str,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+        group = self.get_response_group(group_id)
+        if not group:
+            raise WorkflowValidationError("Готовый ответ не найден")
+        taxpayers = self.db.fetch_all(
+            """
+            SELECT name, inn
+            FROM response_group_taxpayers
+            WHERE response_group_id = ?
+            ORDER BY display_order
+            """,
+            (group_id,),
+        )
+        letters = self.db.fetch_all(
+            """
+            SELECT * FROM response_letters
+            WHERE response_group_id = ?
+            ORDER BY letter_order
+            """,
+            (group_id,),
+        )
+        if not taxpayers or not letters:
+            raise WorkflowValidationError(
+                "Не удалось восстановить состав готового ответа"
+            )
+        return group, taxpayers, letters
+
+    def _render_group_number_update(
+        self,
+        group_id: str,
+        overrides: dict[str, str | None],
+    ) -> tuple[Path, Path, bool]:
+        group, taxpayers, letters = self._response_group_render_data(group_id)
+        output = ensure_within(
+            Path(group["response_path"]),
+            self.settings.responses_dir,
+        )
+        if not output.exists():
+            raise WorkflowValidationError("Файл готового ответа отсутствует")
+        numbers = [
+            str(overrides.get(letter["id"], letter["outgoing_number"]) or "")
+            for letter in letters
+        ]
+        temporary = output.with_name(
+            f".{output.stem}-numbering-{uuid4().hex}.docx"
+        )
+        case_snapshot = {
+            "district_place": group["district_place"],
+            "recipient_position": group["recipient_position"],
+            "recipient_display_name": group["recipient_display_name"],
+            "employee_name": group["employee_name"],
+        }
+        try:
+            _, likely_overflow = self.word.render_pages(
+                temporary,
+                case_snapshot,
+                taxpayers,
+                int(group["taxpayers_per_letter"] or len(taxpayers)),
+                outgoing_numbers=numbers,
+            )
+        except (OSError, WordTemplateError) as exc:
+            temporary.unlink(missing_ok=True)
+            raise WorkflowValidationError(
+                "Не удалось обновить исходящий номер в Word"
+            ) from exc
+        return temporary, output, likely_overflow
+
+    def _apply_outgoing_number_updates(
+        self,
+        updates: dict[str, str | None],
+        *,
+        actor: str = "Сотрудник",
+    ) -> dict[str, Any]:
+        if not updates:
+            raise WorkflowValidationError("Не выбраны письма для нумерации")
+        letter_ids = list(updates)
+        placeholders = ",".join("?" for _ in letter_ids)
+        rows = self.db.fetch_all(
+            """
+            SELECT response_letters.*, response_groups.response_path
+            FROM response_letters
+            JOIN response_groups
+              ON response_groups.id = response_letters.response_group_id
+            """
+            f"WHERE response_letters.id IN ({placeholders})",
+            letter_ids,
+        )
+        if len(rows) != len(letter_ids):
+            raise WorkflowValidationError("Одно из готовых писем не найдено")
+
+        normalized = {
+            letter_id: self._canonical_outgoing_number(
+                value, allow_empty=True
+            )
+            for letter_id, value in updates.items()
+        }
+        requested_numbers = [value for value in normalized.values() if value]
+        if len(requested_numbers) != len(set(requested_numbers)):
+            raise WorkflowValidationError(
+                "В выбранном диапазоне повторяется исходящий номер"
+            )
+        if requested_numbers:
+            number_placeholders = ",".join("?" for _ in requested_numbers)
+            id_placeholders = ",".join("?" for _ in letter_ids)
+            occupied = self.db.fetch_one(
+                "SELECT outgoing_number FROM response_letters "
+                f"WHERE outgoing_number IN ({number_placeholders}) "
+                f"AND id NOT IN ({id_placeholders}) LIMIT 1",
+                [*requested_numbers, *letter_ids],
+            )
+            if occupied:
+                raise WorkflowValidationError(
+                    "Исходящий номер "
+                    f"{occupied['outgoing_number']} уже используется"
+                )
+
+        group_ids = sorted({row["response_group_id"] for row in rows})
+        rendered: dict[str, tuple[Path, Path, bool]] = {}
+        backups: dict[str, Path] = {}
+        preserved_backups: set[str] = set()
+        before = {row["id"]: row["outgoing_number"] for row in rows}
+        try:
+            for group_id in group_ids:
+                rendered[group_id] = self._render_group_number_update(
+                    group_id, normalized
+                )
+            for group_id, (_, output, _) in rendered.items():
+                backup = output.with_name(
+                    f".{output.stem}-before-numbering-{uuid4().hex}.docx"
+                )
+                shutil.copy2(output, backup)
+                backups[group_id] = backup
+
+            now = utc_now()
+            with self.db.connect() as connection:
+                current_rows = connection.execute(
+                    "SELECT id, outgoing_number FROM response_letters "
+                    f"WHERE id IN ({placeholders})",
+                    letter_ids,
+                ).fetchall()
+                current = {
+                    row["id"]: row["outgoing_number"] for row in current_rows
+                }
+                if current != before:
+                    raise WorkflowValidationError(
+                        "Список исходящих номеров уже изменился. Обновите страницу."
+                    )
+                if requested_numbers:
+                    number_placeholders = ",".join(
+                        "?" for _ in requested_numbers
+                    )
+                    id_placeholders = ",".join("?" for _ in letter_ids)
+                    occupied = connection.execute(
+                        "SELECT outgoing_number FROM response_letters "
+                        f"WHERE outgoing_number IN ({number_placeholders}) "
+                        f"AND id NOT IN ({id_placeholders}) LIMIT 1",
+                        [*requested_numbers, *letter_ids],
+                    ).fetchone()
+                    if occupied:
+                        raise WorkflowValidationError(
+                            "Исходящий номер "
+                            f"{occupied['outgoing_number']} уже используется"
+                        )
+                for row in rows:
+                    letter_id = row["id"]
+                    new_number = normalized[letter_id]
+                    connection.execute(
+                        """
+                        UPDATE response_letters
+                        SET outgoing_number = ?, assigned_at = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            new_number,
+                            now if new_number else None,
+                            now,
+                            letter_id,
+                        ),
+                    )
+                    event_type = (
+                        "outgoing_number_assigned"
+                        if not before[letter_id] and new_number
+                        else "outgoing_number_changed"
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO audit_events(
+                            entity_type, entity_id, event_type,
+                            actor, payload_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            "response_letter",
+                            letter_id,
+                            event_type,
+                            actor,
+                            json.dumps(
+                                {
+                                    "response_group_id": row["response_group_id"],
+                                    "before": before[letter_id],
+                                    "after": new_number,
+                                },
+                                ensure_ascii=False,
+                            ),
+                            now,
+                        ),
+                    )
+                for group_id, (temporary, output, overflow) in rendered.items():
+                    temporary.replace(output)
+                    connection.execute(
+                        """
+                        UPDATE response_groups
+                        SET response_page_overflow = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (int(overflow), now, group_id),
+                    )
+        except sqlite3.IntegrityError as exc:
+            preserved_backups.update(
+                self._restore_numbering_backups(backups, rendered)
+            )
+            raise WorkflowValidationError(
+                "Один из исходящих номеров уже используется"
+            ) from exc
+        except OSError as exc:
+            preserved_backups.update(
+                self._restore_numbering_backups(backups, rendered)
+            )
+            raise WorkflowValidationError(
+                "Не удалось обновить Word. Закройте открытый файл и повторите."
+            ) from exc
+        except Exception:
+            preserved_backups.update(
+                self._restore_numbering_backups(backups, rendered)
+            )
+            raise
+        finally:
+            for temporary, _, _ in rendered.values():
+                temporary.unlink(missing_ok=True)
+            for group_id, backup in backups.items():
+                if group_id not in preserved_backups:
+                    backup.unlink(missing_ok=True)
+
+        return {
+            "letter_count": len(letter_ids),
+            "group_count": len(group_ids),
+        }
+
+    @staticmethod
+    def _restore_numbering_backups(
+        backups: dict[str, Path],
+        rendered: dict[str, tuple[Path, Path, bool]],
+    ) -> set[str]:
+        failed: set[str] = set()
+        for group_id, backup in backups.items():
+            if not backup.exists():
+                continue
+            try:
+                backup.replace(rendered[group_id][1])
+            except OSError:
+                # Не маскируем исходную ошибку и сохраняем резервную копию.
+                failed.add(group_id)
+        return failed
+
+    def assign_outgoing_numbers(
+        self,
+        first_number: str | int,
+        expected_letter_ids: list[str],
+        business_date: date | None = None,
+        *,
+        actor: str = "Сотрудник",
+    ) -> dict[str, Any]:
+        preview = self.preview_outgoing_numbers(first_number, business_date)
+        preview_ids = [letter["id"] for letter in preview["letters"]]
+        if not preview_ids:
+            raise WorkflowValidationError(
+                "Нет готовых писем без исходящего номера"
+            )
+        if expected_letter_ids != preview_ids:
+            raise WorkflowValidationError(
+                "Список готовых писем изменился. Покажите диапазон заново."
+            )
+        updates = {
+            letter["id"]: letter["proposed_number"]
+            for letter in preview["letters"]
+        }
+        summary = self._apply_outgoing_number_updates(updates, actor=actor)
+        summary.update(
+            {
+                "first_number": preview["first_number"],
+                "last_number": preview["last_number"],
+            }
+        )
+        return summary
+
+    def set_outgoing_number(
+        self,
+        letter_id: str,
+        outgoing_number: str,
+        *,
+        actor: str = "Сотрудник",
+    ) -> dict[str, Any]:
+        return self._apply_outgoing_number_updates(
+            {letter_id: outgoing_number},
+            actor=actor,
+        )
+
+    def get_response_letter(self, letter_id: str) -> dict[str, Any] | None:
+        return self.db.fetch_one(
+            """
+            SELECT response_letters.*,
+                   response_groups.recipient_display_name,
+                   response_groups.recipient_full_name,
+                   response_groups.district_place,
+                   response_groups.response_path,
+                   response_groups.business_date
+            FROM response_letters
+            JOIN response_groups
+              ON response_groups.id = response_letters.response_group_id
+            WHERE response_letters.id = ?
+            """,
+            (letter_id,),
+        )
+
+    def get_signed_response_scan(
+        self, scan_id: str
+    ) -> dict[str, Any] | None:
+        return self.db.fetch_one(
+            "SELECT * FROM signed_response_scans WHERE id = ?",
+            (scan_id,),
+        )
+
+    def get_confirmed_signed_response_scan(
+        self, letter_id: str
+    ) -> dict[str, Any] | None:
+        return self.db.fetch_one(
+            """
+            SELECT * FROM signed_response_scans
+            WHERE response_letter_id = ? AND status = 'confirmed'
+            ORDER BY confirmed_at DESC, created_at DESC
+            LIMIT 1
+            """,
+            (letter_id,),
+        )
+
+    def register_signed_response_scan(
+        self,
+        letter_id: str,
+        original_filename: str,
+        stream: BinaryIO,
+        *,
+        source: str = "upload",
+        actor: str = "Сотрудник",
+    ) -> dict[str, Any]:
+        letter = self.get_response_letter(letter_id)
+        if not letter:
+            raise WorkflowValidationError("Готовое письмо не найдено")
+        if source not in {"upload", "wia"}:
+            raise WorkflowValidationError("Неизвестный источник скана")
+        safe_name = sanitize_filename(original_filename or "scan.pdf")
+        suffix = Path(safe_name).suffix.casefold()
+        if suffix not in {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}:
+            raise WorkflowValidationError(
+                "Разрешены PDF, PNG, JPEG и TIFF"
+            )
+
+        scan_id = uuid4().hex
+        scan_dir = ensure_within(
+            self.settings.runtime_dir / "signed_scans" / letter_id / scan_id,
+            self.settings.runtime_dir,
+        )
+        scan_dir.mkdir(parents=True, exist_ok=False)
+        original = scan_dir / f"original{suffix}"
+        temporary = original.with_suffix(original.suffix + ".part")
+        digest = hashlib.sha256()
+        size_bytes = 0
+        try:
+            with temporary.open("wb") as output:
+                while chunk := stream.read(1024 * 1024):
+                    size_bytes += len(chunk)
+                    if size_bytes > self.settings.max_upload_bytes:
+                        raise WorkflowValidationError(
+                            "Скан превышает допустимый размер файла"
+                        )
+                    digest.update(chunk)
+                    output.write(chunk)
+            if not size_bytes:
+                raise WorkflowValidationError("Получен пустой файл скана")
+            temporary.replace(original)
+            pdf_path = scan_dir / "signed-response.pdf"
+            page_count = self._make_scan_pdf(original, pdf_path)
+            now = utc_now()
+            with self.db.connect() as connection:
+                connection.execute(
+                    """
+                    UPDATE signed_response_scans
+                    SET status = 'superseded', updated_at = ?
+                    WHERE response_letter_id = ?
+                      AND status IN ('needs_confirmation', 'confirmed')
+                    """,
+                    (now, letter_id),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO signed_response_scans(
+                        id, response_letter_id, status, source,
+                        original_filename, original_path, pdf_path,
+                        sha256, size_bytes, page_count,
+                        created_at, updated_at
+                    ) VALUES (?, ?, 'needs_confirmation', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        scan_id,
+                        letter_id,
+                        source,
+                        safe_name,
+                        str(original),
+                        str(pdf_path),
+                        digest.hexdigest(),
+                        size_bytes,
+                        page_count,
+                        now,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO audit_events(
+                        entity_type, entity_id, event_type,
+                        actor, payload_json, created_at
+                    ) VALUES ('signed_response_scan', ?,
+                              'signed_response_scan_registered', ?, ?, ?)
+                    """,
+                    (
+                        scan_id,
+                        actor,
+                        json.dumps(
+                            {
+                                "response_letter_id": letter_id,
+                                "source": source,
+                                "sha256": digest.hexdigest(),
+                                "page_count": page_count,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        now,
+                    ),
+                )
+        except Exception:
+            shutil.rmtree(scan_dir, ignore_errors=True)
+            raise
+        return self.get_signed_response_scan(scan_id) or {}
+
+    @staticmethod
+    def _make_scan_pdf(source: Path, destination: Path) -> int:
+        if source.suffix.casefold() == ".pdf":
+            try:
+                reader = PdfReader(str(source))
+                page_count = len(reader.pages)
+                if page_count < 1:
+                    raise WorkflowValidationError(
+                        "PDF подписанного ответа не содержит страниц"
+                    )
+            except WorkflowValidationError:
+                raise
+            except Exception as exc:
+                raise WorkflowValidationError("Не удалось открыть PDF скана") from exc
+            shutil.copy2(source, destination)
+            return page_count
+        try:
+            with Image.open(source) as image:
+                pages: list[Image.Image] = []
+                for frame in ImageSequence.Iterator(image):
+                    frame.load()
+                    if frame.mode in {"RGBA", "LA"}:
+                        background = Image.new("RGB", frame.size, "white")
+                        background.paste(frame, mask=frame.getchannel("A"))
+                        pages.append(background)
+                    else:
+                        pages.append(frame.convert("RGB"))
+                if not pages:
+                    raise WorkflowValidationError(
+                        "Изображение подписанного ответа не содержит страниц"
+                    )
+                first, *remaining = pages
+                first.save(
+                    destination,
+                    "PDF",
+                    save_all=True,
+                    append_images=remaining,
+                    resolution=300.0,
+                )
+                return len(pages)
+        except WorkflowValidationError:
+            raise
+        except (UnidentifiedImageError, OSError) as exc:
+            raise WorkflowValidationError("Не удалось открыть изображение скана") from exc
+
+    def acquire_signed_response_scan(
+        self,
+        letter_id: str,
+        *,
+        actor: str = "Сотрудник",
+    ) -> dict[str, Any]:
+        if not self.get_response_letter(letter_id):
+            raise WorkflowValidationError("Готовое письмо не найдено")
+        temporary = ensure_within(
+            self.settings.runtime_dir
+            / "signed_scans"
+            / f".wia-{uuid4().hex}.png",
+            self.settings.runtime_dir,
+        )
+        temporary.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.scanner.acquire_a4(temporary)
+            with temporary.open("rb") as stream:
+                return self.register_signed_response_scan(
+                    letter_id,
+                    "Скан WIA.png",
+                    stream,
+                    source="wia",
+                    actor=actor,
+                )
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def confirm_signed_response_scan(
+        self,
+        scan_id: str,
+        *,
+        correct_letter: bool,
+        signature_present: bool,
+        bank_seal_present: bool,
+        actor: str = "Сотрудник",
+    ) -> None:
+        scan = self.get_signed_response_scan(scan_id)
+        if not scan or scan["status"] != "needs_confirmation":
+            raise WorkflowValidationError("Скан не найден или уже проверен")
+        if not (correct_letter and signature_present and bank_seal_present):
+            raise WorkflowValidationError(
+                "Подтвердите правильное письмо, подписи и печать банка"
+            )
+        now = utc_now()
+        with self.db.connect() as connection:
+            connection.execute(
+                """
+                UPDATE signed_response_scans
+                SET status = 'confirmed',
+                    correct_letter_confirmed = 1,
+                    signature_confirmed = 1,
+                    bank_seal_confirmed = 1,
+                    confirmed_by = ?, confirmed_at = ?, updated_at = ?
+                WHERE id = ? AND status = 'needs_confirmation'
+                """,
+                (actor, now, now, scan_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO audit_events(
+                    entity_type, entity_id, event_type,
+                    actor, payload_json, created_at
+                ) VALUES ('signed_response_scan', ?,
+                          'signed_response_scan_confirmed', ?, ?, ?)
+                """,
+                (
+                    scan_id,
+                    actor,
+                    json.dumps(
+                        {"response_letter_id": scan["response_letter_id"]},
+                        ensure_ascii=False,
+                    ),
+                    now,
+                ),
+            )
 
     def repair_cleaned_responses(self) -> None:
         cases = self.db.fetch_all(

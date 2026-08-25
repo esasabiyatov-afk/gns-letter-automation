@@ -145,7 +145,7 @@ echo   To stop the server, close this window or press Ctrl+C
 echo ================================================================
 echo.
 
-"%PYEXE%" -m gns_app.main
+"%PYEXE%" -m gns_app.launcher
 
 echo.
 echo Server stopped.

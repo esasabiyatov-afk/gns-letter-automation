@@ -93,15 +93,21 @@ def test_partial_embedded_layer_is_supplemented_by_full_page_ocr(monkeypatch):
         best_data_dir=Path("best"),
     )
     monkeypatch.setattr(service, "_model_available", lambda _path: True)
-    monkeypatch.setattr(
-        service,
-        "_recognize_image",
-        lambda _image, _data, model, **_kwargs: OcrResult(
+    called_models = []
+
+    def recognize(_image, _data, model, **_kwargs):
+        called_models.append(model)
+        return OcrResult(
             status=OcrStatus.COMPLETED,
             text=image_text,
             confidence=0.8 if model == "fast" else 0.82,
             language=f"rus+kir {model}",
-        ),
+        )
+
+    monkeypatch.setattr(
+        service,
+        "_recognize_image",
+        recognize,
     )
 
     result = service.recognize(
@@ -111,8 +117,10 @@ def test_partial_embedded_layer_is_supplemented_by_full_page_ocr(monkeypatch):
     assert "=== Текстовый слой PDF ===" in result.text
     assert "=== OCR изображения всей страницы ===" in result.text
     assert "Омошев Максат Тологонович" in result.text
-    assert result.recipient_fields_agree
-    assert result.critical_fields_agree
+    assert called_models == ["fast"]
+    assert not result.recipient_fields_agree
+    assert not result.critical_fields_agree
+    assert "посимвольно сверить" in result.issue
 
 
 def test_recipient_signature_accepts_name_on_next_ocr_line():
@@ -170,7 +178,7 @@ def test_rejected_embedded_layer_falls_back_to_local_rus_kir(monkeypatch):
     assert not result.critical_fields_agree
 
 
-def test_two_local_models_must_agree_on_all_critical_fields(monkeypatch):
+def test_default_local_ocr_uses_only_fast_model(monkeypatch):
     pdf_service = SimpleNamespace(
         extract_embedded_text=lambda _path, _page: ""
     )
@@ -188,35 +196,32 @@ def test_two_local_models_must_agree_on_all_critical_fields(monkeypatch):
         confidence=0.80,
         language="rus+kir fast",
     )
-    best = OcrResult(
-        status=OcrStatus.COMPLETED,
-        text=(
-            "Наименование: ОсОО Тест ИНН: 12345678901235 "
-            "Период: с 01.01.2020 по 01.01.2026"
-        ),
-        confidence=0.82,
-        language="rus+kir best",
-    )
+    called_models = []
     monkeypatch.setattr(service, "_model_available", lambda _path: True)
+
+    def recognize(_image, _data, model, **_kwargs):
+        called_models.append(model)
+        return fast
+
     monkeypatch.setattr(
         service,
         "_recognize_image",
-        lambda _image, _data, model, **_kwargs: (
-            fast if model == "fast" else best
-        ),
+        recognize,
     )
 
     result = service.recognize(
         Path("source.pdf"), 1, Path("page.jpg")
     )
 
+    assert called_models == ["fast"]
+    assert result is fast
     assert not result.critical_fields_agree
     assert not result.taxpayer_fields_agree
-    assert result.period_fields_agree
-    assert "не подтвердили одинаково" in result.issue
+    assert not result.period_fields_agree
+    assert "неподтверждённая" in result.issue
 
 
-def test_two_local_models_can_mark_exact_critical_consensus(monkeypatch):
+def test_precise_local_ocr_uses_only_best_model(monkeypatch):
     pdf_service = SimpleNamespace(
         extract_embedded_text=lambda _path, _page: ""
     )
@@ -230,20 +235,31 @@ def test_two_local_models_can_mark_exact_critical_consensus(monkeypatch):
         "Период: с 01.01.2020 по 01.01.2026"
     )
     monkeypatch.setattr(service, "_model_available", lambda _path: True)
+    called_models = []
+
+    def recognize(_image, _data, model, **_kwargs):
+        called_models.append(model)
+        return OcrResult(
+            status=OcrStatus.COMPLETED,
+            text=text,
+            confidence=0.82,
+            language=f"rus+kir {model}",
+        )
+
     monkeypatch.setattr(
         service,
         "_recognize_image",
-        lambda _image, _data, model, **_kwargs: OcrResult(
-            status=OcrStatus.COMPLETED,
-            text=text,
-            confidence=0.80 if model == "fast" else 0.82,
-            language=f"rus+kir {model}",
-        ),
+        recognize,
     )
 
     result = service.recognize(
-        Path("source.pdf"), 1, Path("page.jpg")
+        Path("source.pdf"),
+        1,
+        Path("page.jpg"),
+        model_name="best",
     )
 
-    assert result.critical_fields_agree
-    assert "всё равно нужно сверить" in result.issue
+    assert called_models == ["best"]
+    assert result.language == "rus+kir best"
+    assert not result.critical_fields_agree
+    assert "посимвольно сверить" in result.issue

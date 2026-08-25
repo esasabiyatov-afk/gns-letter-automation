@@ -134,6 +134,52 @@ def test_confident_decision_does_not_block_packet_with_letter(workflow):
     )
 
 
+def test_confirmed_official_qr_counts_as_letter_without_scan_ocr(workflow):
+    upload_id = "official-letter-and-decision"
+    _insert_upload(workflow, upload_id)
+    _insert_page(
+        workflow,
+        "official-unknown-page",
+        upload_id,
+        1,
+        "unknown",
+        "completed",
+    )
+    _insert_page(
+        workflow,
+        "official-paired-decision",
+        upload_id,
+        2,
+        "decision",
+        "completed",
+    )
+    now = utc_now()
+    workflow.db.execute(
+        """
+        INSERT INTO cases(
+            id, upload_id, status, source_kind, official_document_path,
+            fields_confirmed, created_at, updated_at
+        ) VALUES (?, ?, 'ready_for_abs', 'qr_official', ?, 1, ?, ?)
+        """,
+        ("official-case", upload_id, "official.pdf", now, now),
+    )
+    workflow.db.execute(
+        """
+        UPDATE pages SET case_id = ?, qr_status = 'found',
+            ocr_status = 'skipped_official'
+        WHERE id = ?
+        """,
+        ("official-case", "official-unknown-page"),
+    )
+
+    changed = workflow._require_letter_for_scan_only_decisions(upload_id)
+
+    assert changed == 0
+    assert workflow.get_page("official-paired-decision")["status"] == (
+        PageStatus.COMPLETED
+    )
+
+
 def test_legacy_confident_decision_is_removed_from_review(workflow):
     decision_text = """
     РЕШЕНИЕ РАЗДЕЛ I. ИНФОРМАЦИЯ О ПРОВЕРЯЕМОМ НАЛОГОПЛАТЕЛЬЩИКЕ

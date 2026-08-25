@@ -212,6 +212,7 @@ class WordTemplateService:
         "subjects": "[Перечисления.Субьект]",
         "inns": "[ИНН.Субьект]",
         "employee": "[ФИО.Исп]",
+        "outgoing_number": "[Исх.Номер]",
     }
 
     def __init__(
@@ -241,6 +242,7 @@ class WordTemplateService:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         working_path = output_path.with_suffix(".working.docx")
         document = Document(str(template_path))
+        outgoing_number = str(case.get("outgoing_number") or "").strip()
 
         replacements = {
             self.TOKENS["today"]: self._format_date(date.today()),
@@ -250,7 +252,13 @@ class WordTemplateService:
             ),
             self.TOKENS["recipient"]: case["recipient_display_name"].strip(),
             self.TOKENS["employee"]: case["employee_name"].strip(),
+            self.TOKENS["outgoing_number"]: outgoing_number or "______",
         }
+        # Старые оригинальные шаблоны содержат подчёркивания вместо тега.
+        # Заполняем их только в создаваемой копии и сохраняем совместимость,
+        # пока производные шаблоны переводятся на [Исх.Номер].
+        if outgoing_number:
+            replacements["______"] = outgoing_number
 
         if len(taxpayers) == 1:
             taxpayer = taxpayers[0]
@@ -285,13 +293,30 @@ class WordTemplateService:
         case: dict[str, str],
         taxpayers: list[dict[str, str]],
         taxpayers_per_page: int,
+        outgoing_numbers: list[str] | None = None,
     ) -> tuple[Path, bool]:
         if taxpayers_per_page <= 0 or taxpayers_per_page >= len(taxpayers):
-            return self.render(output_path, case, taxpayers)
+            if outgoing_numbers is not None and len(outgoing_numbers) != 1:
+                raise WordTemplateError(
+                    "Для одного письма нужен один исходящий номер"
+                )
+            single_case = dict(case)
+            if outgoing_numbers is not None:
+                single_case["outgoing_number"] = outgoing_numbers[0]
+            return self.render(output_path, single_case, taxpayers)
         chunks = [
             taxpayers[index : index + taxpayers_per_page]
             for index in range(0, len(taxpayers), taxpayers_per_page)
         ]
+        if outgoing_numbers is not None and len(outgoing_numbers) != len(chunks):
+            raise WordTemplateError(
+                "Число исходящих номеров должно совпадать с числом писем"
+            )
+        if case.get("outgoing_number") and outgoing_numbers is None:
+            raise WordTemplateError(
+                "Для разделённых писем укажите отдельный исходящий номер "
+                "для каждого письма"
+            )
         temporary_paths: list[Path] = []
         any_chunk_overflows = False
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -300,7 +325,10 @@ class WordTemplateService:
                 temporary = output_path.with_name(
                     f".{output_path.stem}-page-{index}-{uuid4().hex}.docx"
                 )
-                _, chunk_overflow = self.render(temporary, case, chunk)
+                chunk_case = dict(case)
+                if outgoing_numbers is not None:
+                    chunk_case["outgoing_number"] = outgoing_numbers[index - 1]
+                _, chunk_overflow = self.render(temporary, chunk_case, chunk)
                 any_chunk_overflows = any_chunk_overflows or chunk_overflow
                 temporary_paths.append(temporary)
 
