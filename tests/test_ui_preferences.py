@@ -32,6 +32,25 @@ def test_abs_insecure_tls_warning_is_rendered(workflow, monkeypatch):
     assert "Подлинность сервера не подтверждается" in response.text
 
 
+def test_real_tolubay_mode_is_named_correctly_in_login_dialog(
+    workflow,
+    monkeypatch,
+):
+    from starlette.testclient import TestClient
+
+    from gns_app import main
+
+    workflow.abs.is_fake = False
+    monkeypatch.setattr(main, "workflow", workflow)
+
+    response = TestClient(main.app).get("/today")
+
+    assert response.status_code == 200
+    assert "АБС TOLUBAY" in response.text
+    assert "Сейчас используется реальная АБС Tolubay" in response.text
+    assert "ТЕСТОВАЯ АБС" not in response.text
+
+
 def test_outlook_office_test_warnings_are_rendered(workflow, monkeypatch):
     from starlette.testclient import TestClient
 

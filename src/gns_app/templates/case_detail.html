@@ -227,12 +227,22 @@
 <dialog id="abs-dialog" class="modal">
   <form method="post" action="/cases/{{ case.id }}/abs" autocomplete="off">
     <div class="modal-heading">
-      <div><p class="eyebrow">ТЕСТОВАЯ АБС</p><h2>Введите учётные данные</h2></div>
+      <div>
+        <p class="eyebrow">
+          {% if abs_is_fake %}ТЕСТОВАЯ АБС{% else %}АБС TOLUBAY{% endif %}
+        </p>
+        <h2>Введите учётные данные</h2>
+      </div>
       <button type="button" class="modal-close" data-close-dialog>×</button>
     </div>
     <p class="warning-note">
       Данные остаются только в памяти активного сеанса и не записываются в БД
-      или журнал. При ошибке потребуется войти снова. Используется фейковая база.
+      или журнал. При ошибке потребуется войти снова.
+      {% if abs_is_fake %}
+        Используется фейковая база.
+      {% else %}
+        Используется реальная АБС Tolubay.
+      {% endif %}
     </p>
     <label class="field"><span>Логин АБС</span><input name="username" autocomplete="off" required></label>
     <label class="field"><span>Пароль АБС</span><input name="password" type="password" autocomplete="new-password" required></label>

@@ -540,14 +540,21 @@
   <form method="post" action="/today/abs" autocomplete="off">
     <div class="modal-heading">
       <div>
-        <p class="eyebrow">ТЕСТОВАЯ АБС</p>
+        <p class="eyebrow">
+          {% if abs_is_fake %}ТЕСТОВАЯ АБС{% else %}АБС TOLUBAY{% endif %}
+        </p>
         <h2>Войти и проверить все готовые письма</h2>
       </div>
       <button type="button" class="modal-close" data-close-dialog>×</button>
     </div>
     <p class="warning-note">
       Учётные данные хранятся только в оперативной памяти активного сеанса.
-      При ошибке АБС сеанс автоматически завершается. Сейчас используется тестовая база.
+      При ошибке АБС сеанс автоматически завершается.
+      {% if abs_is_fake %}
+        Сейчас используется тестовая база.
+      {% else %}
+        Сейчас используется реальная АБС Tolubay.
+      {% endif %}
     </p>
     <label class="field">
       <span>Логин АБС</span>

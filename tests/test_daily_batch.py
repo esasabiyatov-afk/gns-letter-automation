@@ -109,6 +109,7 @@ def test_today_batch_checks_and_groups_by_recipient(workflow):
     overview = workflow.today_overview()
 
     assert summary["case_count"] == 2
+    assert not workflow.abs_session_active()
     assert len(overview["not_found_groups"]) == 1
     group = overview["not_found_groups"][0]
     assert group["case_count"] == 2

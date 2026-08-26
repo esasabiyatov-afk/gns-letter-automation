@@ -3706,22 +3706,24 @@ class WorkflowService:
 
         counts: dict[str, int] = {}
         processed_count = 0
-        for case in cases:
-            result = self.check_abs(case["id"], username, password)
-            processed_count += 1
-            key = str(result.status)
-            counts[key] = counts.get(key, 0) + 1
-            if result.status in {
-                AbsStatus.AUTH_ERROR,
-                AbsStatus.UNAVAILABLE,
-                AbsStatus.TECHNICAL_ERROR,
-            }:
-                break
-
-        # Локальные переменные очищаются. Реальный адаптер не сохраняет их
-        # между проверками; тестовый сеанс остаётся только в RAM.
-        username = ""
-        password = ""
+        try:
+            for case in cases:
+                result = self.check_abs(case["id"], username, password)
+                processed_count += 1
+                key = str(result.status)
+                counts[key] = counts.get(key, 0) + 1
+                if result.status in {
+                    AbsStatus.AUTH_ERROR,
+                    AbsStatus.UNAVAILABLE,
+                    AbsStatus.TECHNICAL_ERROR,
+                }:
+                    break
+        finally:
+            # Пакетный вход действует только на одну операцию. Не оставляем
+            # учётные данные даже в оперативной памяти процесса.
+            username = ""
+            password = ""
+            self._abs_session_credentials = None
         self.db.audit(
             "settings",
             f"abs-batch-{day.isoformat()}",
