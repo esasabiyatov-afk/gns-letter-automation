@@ -22,9 +22,9 @@ def _all_word_text(path) -> str:
 
 
 def test_renders_single_response_without_placeholders(
-    tmp_path, project_root
+    tmp_path, templates_dir
 ):
-    service = WordTemplateService(project_root / "УГНС")
+    service = WordTemplateService(templates_dir)
     output = tmp_path / "single.docx"
     service.render(
         output,
@@ -46,8 +46,8 @@ def test_renders_single_response_without_placeholders(
     assert "[ФИО.Исп]" not in text
 
 
-def test_render_returns_overflow_flag_alongside_path(tmp_path, project_root):
-    service = WordTemplateService(project_root / "УГНС")
+def test_render_returns_overflow_flag_alongside_path(tmp_path, templates_dir):
+    service = WordTemplateService(templates_dir)
     output = tmp_path / "single.docx"
 
     result_path, likely_overflow = service.render(
@@ -66,9 +66,9 @@ def test_render_returns_overflow_flag_alongside_path(tmp_path, project_root):
 
 
 def test_outgoing_number_replaces_legacy_template_placeholder(
-    tmp_path, project_root
+    tmp_path, templates_dir
 ):
-    service = WordTemplateService(project_root / "УГНС")
+    service = WordTemplateService(templates_dir)
     output = tmp_path / "numbered.docx"
 
     service.render(
@@ -89,10 +89,10 @@ def test_outgoing_number_replaces_legacy_template_placeholder(
     assert "______" not in text
 
 
-def test_explicit_outgoing_number_tag_is_replaced(tmp_path, project_root):
-    templates = tmp_path / "templates"
+def test_explicit_outgoing_number_tag_is_replaced(tmp_path, templates_dir):
+    templates = tmp_path / "derived-templates"
     templates.mkdir()
-    source = project_root / "УГНС" / "шаблон ответа одиночный.docx"
+    source = templates_dir / "шаблон ответа одиночный.docx"
     derived = templates / source.name
     shutil.copy2(source, derived)
     document = Document(str(derived))
@@ -124,8 +124,8 @@ def test_explicit_outgoing_number_tag_is_replaced(tmp_path, project_root):
     assert "[Исх.Номер]" not in text
 
 
-def test_short_letter_is_not_flagged_as_overflowing(tmp_path, project_root):
-    service = WordTemplateService(project_root / "УГНС")
+def test_short_letter_is_not_flagged_as_overflowing(tmp_path, templates_dir):
+    service = WordTemplateService(templates_dir)
     output = tmp_path / "short.docx"
 
     _, likely_overflow = service.render(
@@ -143,14 +143,14 @@ def test_short_letter_is_not_flagged_as_overflowing(tmp_path, project_root):
 
 
 def test_long_taxpayer_list_is_flagged_as_likely_overflowing(
-    tmp_path, project_root
+    tmp_path, templates_dir
 ):
     # Откалибровано по реальным замерам: при рендере через LibreOffice
     # именно на 14-м налогоплательщике письмо реально перестаёт помещаться
     # на одну страницу (13 - ещё влезает, 14 - уже нет). Берём заведомо
     # длинный список, чтобы не зависеть от точной границы в один
     # налогоплательщик.
-    service = WordTemplateService(project_root / "УГНС")
+    service = WordTemplateService(templates_dir)
     output = tmp_path / "long.docx"
     taxpayers = [
         {"name": f'ОсОО "Тестовая Компания Номер {i}"', "inn": f"{i:014d}"}
@@ -172,9 +172,9 @@ def test_long_taxpayer_list_is_flagged_as_likely_overflowing(
 
 
 def test_render_pages_reports_overflow_when_a_chunk_itself_overflows(
-    tmp_path, project_root
+    tmp_path, templates_dir
 ):
-    service = WordTemplateService(project_root / "УГНС")
+    service = WordTemplateService(templates_dir)
     output = tmp_path / "chunked.docx"
     taxpayers = [
         {"name": f'ОсОО "Тестовая Компания Номер {i}"', "inn": f"{i:014d}"}
@@ -199,9 +199,9 @@ def test_render_pages_reports_overflow_when_a_chunk_itself_overflows(
 
 
 def test_render_pages_does_not_flag_overflow_when_split_keeps_each_chunk_short(
-    tmp_path, project_root
+    tmp_path, templates_dir
 ):
-    service = WordTemplateService(project_root / "УГНС")
+    service = WordTemplateService(templates_dir)
     output = tmp_path / "chunked_short.docx"
     taxpayers = [
         {"name": f'ОсОО "Тестовая Компания Номер {i}"', "inn": f"{i:014d}"}
@@ -226,9 +226,9 @@ def test_render_pages_does_not_flag_overflow_when_split_keeps_each_chunk_short(
 
 
 def test_renders_multiple_taxpayers_on_separate_lines(
-    tmp_path, project_root
+    tmp_path, templates_dir
 ):
-    service = WordTemplateService(project_root / "УГНС")
+    service = WordTemplateService(templates_dir)
     output = tmp_path / "multi.docx"
     service.render(
         output,
@@ -252,8 +252,8 @@ def test_renders_multiple_taxpayers_on_separate_lines(
     assert "[ИНН.Субьект]" not in text
 
 
-def test_response_adds_ip_prefix_for_person(tmp_path, project_root):
-    service = WordTemplateService(project_root / "УГНС")
+def test_response_adds_ip_prefix_for_person(tmp_path, templates_dir):
+    service = WordTemplateService(templates_dir)
     output = tmp_path / "person.docx"
 
     service.render(
@@ -272,8 +272,8 @@ def test_response_adds_ip_prefix_for_person(tmp_path, project_root):
     assert "ИП ИП" not in text
 
 
-def test_split_response_repeats_full_letter_on_new_page(tmp_path, project_root):
-    service = WordTemplateService(project_root / "УГНС")
+def test_split_response_repeats_full_letter_on_new_page(tmp_path, templates_dir):
+    service = WordTemplateService(templates_dir)
     output = tmp_path / "split.docx"
     case = {
         "district_place": "по Ленинскому району города Бишкек",
@@ -294,8 +294,8 @@ def test_split_response_repeats_full_letter_on_new_page(tmp_path, project_root):
     assert all(item["inn"] in text for item in taxpayers)
 
 
-def test_split_response_uses_distinct_outgoing_numbers(tmp_path, project_root):
-    service = WordTemplateService(project_root / "УГНС")
+def test_split_response_uses_distinct_outgoing_numbers(tmp_path, templates_dir):
+    service = WordTemplateService(templates_dir)
     output = tmp_path / "split-numbered.docx"
     case = {
         "district_place": "по Ленинскому району города Бишкек",
@@ -322,9 +322,9 @@ def test_split_response_uses_distinct_outgoing_numbers(tmp_path, project_root):
 
 
 def test_split_response_rejects_one_number_for_multiple_letters(
-    tmp_path, project_root
+    tmp_path, templates_dir
 ):
-    service = WordTemplateService(project_root / "УГНС")
+    service = WordTemplateService(templates_dir)
     output = tmp_path / "split-invalid-number.docx"
     case = {
         "district_place": "по Ленинскому району города Бишкек",

@@ -240,7 +240,9 @@ class WordTemplateService:
             raise WordTemplateError(f"Не найден шаблон: {template_name}")
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        working_path = output_path.with_suffix(".working.docx")
+        working_path = output_path.with_name(
+            f".gns-working-{uuid4().hex}.docx"
+        )
         document = Document(str(template_path))
         outgoing_number = str(case.get("outgoing_number") or "").strip()
 
@@ -323,7 +325,7 @@ class WordTemplateService:
         try:
             for index, chunk in enumerate(chunks, 1):
                 temporary = output_path.with_name(
-                    f".{output_path.stem}-page-{index}-{uuid4().hex}.docx"
+                    f".gns-page-{index}-{uuid4().hex}.docx"
                 )
                 chunk_case = dict(case)
                 if outgoing_numbers is not None:
@@ -341,7 +343,9 @@ class WordTemplateService:
                         continue
                     combined.element.body.insert(-1, deepcopy(element))
 
-            working_path = output_path.with_suffix(".working.docx")
+            working_path = output_path.with_name(
+                f".gns-combined-{uuid4().hex}.docx"
+            )
             combined.save(working_path)
             os.replace(working_path, output_path)
             return output_path, any_chunk_overflows
@@ -467,7 +471,7 @@ class WordTemplateService:
         self, docx_path: Path, replacements: dict[str, str]
     ) -> None:
         temporary = docx_path.with_name(
-            f"{docx_path.stem}.{uuid4().hex}.zip"
+            f".gns-xml-{uuid4().hex}.zip"
         )
         namespace = {
             "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"

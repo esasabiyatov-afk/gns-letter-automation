@@ -33,12 +33,11 @@ def test_official_timeout_becomes_reviewable_error(tmp_path: Path):
 
 def test_preview_survives_later_page_processing_error(
     workflow,
-    project_root: Path,
+    sample_pdf: Path,
     monkeypatch,
 ):
-    sample = project_root / "УГНС" / "пример письма.pdf"
-    with sample.open("rb") as stream:
-        upload_id = workflow.create_upload(sample.name, stream)
+    with sample_pdf.open("rb") as stream:
+        upload_id = workflow.create_upload(sample_pdf.name, stream)
 
     def fail_after_render(_preview_path):
         raise RuntimeError("ошибка после сохранения превью")

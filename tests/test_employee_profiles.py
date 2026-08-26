@@ -7,7 +7,7 @@ from gns_app.services.workflow import WorkflowValidationError
 
 def test_employee_can_be_added_selected_and_applied_to_open_cases(
     workflow,
-    project_root: Path,
+    sample_pdf: Path,
 ):
     workflow.initialize_employee_profiles()
     assert workflow.get_active_employee() == "Гапарова Э."
@@ -15,9 +15,8 @@ def test_employee_can_be_added_selected_and_applied_to_open_cases(
         "Гапарова Э."
     ]
 
-    sample = project_root / "УГНС" / "пример письма.pdf"
-    with sample.open("rb") as stream:
-        upload_id = workflow.create_upload(sample.name, stream)
+    with sample_pdf.open("rb") as stream:
+        upload_id = workflow.create_upload(sample_pdf.name, stream)
     case_id, _ = workflow._ensure_qr_case(upload_id, "employee-test-qr")
     assert workflow.get_case(case_id)["employee_name"] == "Гапарова Э."
 

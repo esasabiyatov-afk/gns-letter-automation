@@ -2,15 +2,54 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from gns_app.domain import CaseStatus
+from gns_app.domain import (
+    CaseStatus,
+    ClassificationResult,
+    OcrResult,
+    OcrStatus,
+    PageType,
+    QrDecodeResult,
+    QrStatus,
+)
 
 
 def test_sample_pdf_end_to_end_without_guessing(
-    workflow, project_root: Path
+    workflow,
+    sample_pdf: Path,
+    monkeypatch,
 ):
-    sample = project_root / "УГНС" / "пример письма.pdf"
-    with sample.open("rb") as stream:
-        upload_id = workflow.create_upload(sample.name, stream)
+    with sample_pdf.open("rb") as stream:
+        upload_id = workflow.create_upload(sample_pdf.name, stream)
+
+    monkeypatch.setattr(
+        workflow.qr,
+        "decode",
+        lambda _path: QrDecodeResult(
+            status=QrStatus.FOUND,
+            payload="https://qr.salyk.kg/getsti010decission?id=synthetic",
+            payload_hash="synthetic-workflow-case",
+            safe_url="https://qr.salyk.kg/getsti010decission",
+            method="synthetic-test",
+        ),
+    )
+    monkeypatch.setattr(
+        workflow.ocr,
+        "recognize",
+        lambda *_args, **_kwargs: OcrResult(
+            status=OcrStatus.COMPLETED,
+            text="Тестовое письмо ГНС",
+            confidence=0.99,
+            language="synthetic",
+        ),
+    )
+    monkeypatch.setattr(
+        workflow.classifier,
+        "classify",
+        lambda *_args, **_kwargs: ClassificationResult(
+            page_type=PageType.LETTER,
+            confidence=0.99,
+        ),
+    )
 
     workflow.process_upload(upload_id)
     upload = workflow.get_upload(upload_id)

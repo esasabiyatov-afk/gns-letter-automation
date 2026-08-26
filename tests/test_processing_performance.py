@@ -19,7 +19,7 @@ from gns_app.services.workflow import WorkflowService
 
 def test_complete_official_qr_skips_ocr_and_high_resolution_render(
     test_settings,
-    project_root: Path,
+    sample_pdf: Path,
     monkeypatch,
 ):
     settings = replace(
@@ -30,9 +30,8 @@ def test_complete_official_qr_skips_ocr_and_high_resolution_render(
     database = Database(settings.database_path)
     database.initialize()
     workflow = WorkflowService(database, settings)
-    sample = project_root / "УГНС" / "пример письма.pdf"
-    with sample.open("rb") as stream:
-        upload_id = workflow.create_upload(sample.name, stream)
+    with sample_pdf.open("rb") as stream:
+        upload_id = workflow.create_upload(sample_pdf.name, stream)
     upload = workflow.get_upload(upload_id)
     page = workflow.get_upload_pages(upload_id)[0]
 
@@ -47,7 +46,11 @@ def test_complete_official_qr_skips_ocr_and_high_resolution_render(
             method="test",
         ),
     )
-    monkeypatch.setattr(workflow.official, "download", lambda *_args: sample)
+    monkeypatch.setattr(
+        workflow.official,
+        "download",
+        lambda *_args: sample_pdf,
+    )
     monkeypatch.setattr(
         workflow,
         "_apply_official_document",
@@ -78,12 +81,11 @@ def test_complete_official_qr_skips_ocr_and_high_resolution_render(
 
 def test_failed_qr_and_ocr_share_one_high_resolution_color_render(
     workflow,
-    project_root: Path,
+    sample_pdf: Path,
     monkeypatch,
 ):
-    sample = project_root / "УГНС" / "пример письма.pdf"
-    with sample.open("rb") as stream:
-        upload_id = workflow.create_upload(sample.name, stream)
+    with sample_pdf.open("rb") as stream:
+        upload_id = workflow.create_upload(sample_pdf.name, stream)
     upload = workflow.get_upload(upload_id)
     page = workflow.get_upload_pages(upload_id)[0]
     high_resolution_calls: list[Path] = []
@@ -138,12 +140,11 @@ def test_failed_qr_and_ocr_share_one_high_resolution_color_render(
 
 def test_unknown_page_keeps_structured_ocr_fields_as_manual_hints(
     workflow,
-    project_root: Path,
+    sample_pdf: Path,
     monkeypatch,
 ):
-    sample = project_root / "УГНС" / "пример письма.pdf"
-    with sample.open("rb") as stream:
-        upload_id = workflow.create_upload(sample.name, stream)
+    with sample_pdf.open("rb") as stream:
+        upload_id = workflow.create_upload(sample_pdf.name, stream)
     upload = workflow.get_upload(upload_id)
     page = workflow.get_upload_pages(upload_id)[0]
     inn = "12345678901234"
@@ -200,16 +201,15 @@ def test_unknown_page_keeps_structured_ocr_fields_as_manual_hints(
 
 def test_two_page_workers_run_concurrently_and_keep_terminal_statuses(
     test_settings,
-    project_root: Path,
+    sample_pdf: Path,
     monkeypatch,
 ):
     settings = replace(test_settings, processing_workers=2)
     database = Database(settings.database_path)
     database.initialize()
     workflow = WorkflowService(database, settings)
-    sample = project_root / "УГНС" / "пример письма.pdf"
-    with sample.open("rb") as stream:
-        upload_id = workflow.create_upload(sample.name, stream)
+    with sample_pdf.open("rb") as stream:
+        upload_id = workflow.create_upload(sample_pdf.name, stream)
 
     barrier = Barrier(2, timeout=5)
     state_lock = Lock()
@@ -240,12 +240,11 @@ def test_two_page_workers_run_concurrently_and_keep_terminal_statuses(
 
 def test_precise_ocr_is_explicit_and_keeps_page_in_manual_review(
     workflow,
-    project_root: Path,
+    sample_pdf: Path,
     monkeypatch,
 ):
-    sample = project_root / "УГНС" / "пример письма.pdf"
-    with sample.open("rb") as stream:
-        upload_id = workflow.create_upload(sample.name, stream)
+    with sample_pdf.open("rb") as stream:
+        upload_id = workflow.create_upload(sample_pdf.name, stream)
     page = workflow.get_upload_pages(upload_id)[0]
     workflow.db.execute(
         "UPDATE pages SET status = ? WHERE id = ?",

@@ -18,7 +18,7 @@ from gns_app.services.workflow import WorkflowValidationError
 
 def test_complete_official_qr_needs_no_manual_confirmation(
     test_settings,
-    project_root: Path,
+    sample_pdf: Path,
     monkeypatch,
 ):
     settings = replace(test_settings, employee_name="")
@@ -26,9 +26,8 @@ def test_complete_official_qr_needs_no_manual_confirmation(
     database.initialize()
     workflow = WorkflowService(database, settings)
 
-    sample = project_root / "УГНС" / "пример письма.pdf"
-    with sample.open("rb") as stream:
-        upload_id = workflow.create_upload(sample.name, stream)
+    with sample_pdf.open("rb") as stream:
+        upload_id = workflow.create_upload(sample_pdf.name, stream)
     case_id, _ = workflow._ensure_qr_case(upload_id, "verified-qr-hash")
 
     fields = ExtractedFields(
@@ -53,7 +52,7 @@ def test_complete_official_qr_needs_no_manual_confirmation(
         lambda _text: fields,
     )
 
-    complete = workflow._apply_official_document(case_id, sample)
+    complete = workflow._apply_official_document(case_id, sample_pdf)
     workflow._prefill_scan_case(
         case_id,
         ExtractedFields(
@@ -87,12 +86,11 @@ def test_complete_official_qr_needs_no_manual_confirmation(
 
 def test_stale_review_page_is_completed_when_official_qr_is_complete(
     workflow,
-    project_root: Path,
+    sample_pdf: Path,
 ):
     workflow.initialize_employee_profiles()
-    sample = project_root / "УГНС" / "пример письма.pdf"
-    with sample.open("rb") as stream:
-        upload_id = workflow.create_upload(sample.name, stream)
+    with sample_pdf.open("rb") as stream:
+        upload_id = workflow.create_upload(sample_pdf.name, stream)
     page = workflow.get_upload_pages(upload_id)[0]
     case_id, _ = workflow._ensure_qr_case(upload_id, "complete-official-qr")
 
@@ -105,7 +103,7 @@ def test_stale_review_page_is_completed_when_official_qr_is_complete(
         """,
         (
             ValueSource.QR_OFFICIAL,
-            str(sample),
+            str(sample_pdf),
             CaseStatus.READY_FOR_ABS,
             case_id,
         ),
