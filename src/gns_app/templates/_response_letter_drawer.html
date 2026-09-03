@@ -99,7 +99,7 @@
             action="/response-letters/{{ active_letter.id }}/outlook-draft">
         <input type="hidden" name="group_id" value="{{ active_group.id }}">
         <button class="button button-primary" type="submit">
-          {% if active_letter.outlook_message and active_letter.outlook_message.status == 'draft_created' %}Открыть письмо{% else %}Отправить по почте{% endif %}
+          {% if active_letter.outlook_message and active_letter.outlook_message.status == 'draft_created' %}Открыть письмо{% else %}Подготовить письмо в Outlook{% endif %}
         </button>
       </form>
     {% endif %}

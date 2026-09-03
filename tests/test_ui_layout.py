@@ -514,7 +514,7 @@ def test_created_response_actions_are_reachable_without_card_expansion():
     assert 'class="created-letter-line"' in template
     assert "Исх. №" in template
     assert "Сканировать" in template
-    assert "Отправить по почте" in template
+    assert "Подготовить письмо в Outlook" in template
     assert "Открыть Word для печати" in template
     assert "Скачать копию Word" in template
     assert "Подробнее" not in template

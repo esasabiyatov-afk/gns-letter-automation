@@ -177,7 +177,7 @@
                             action="/response-letters/{{ letter.id }}/outlook-draft">
                         <input type="hidden" name="group_id" value="{{ group.id }}">
                         <button class="button button-primary button-compact" type="submit">
-                          {% if letter.outlook_message and letter.outlook_message.status == 'draft_created' %}Открыть письмо{% else %}Отправить по почте{% endif %}
+                          {% if letter.outlook_message and letter.outlook_message.status == 'draft_created' %}Открыть письмо{% else %}Подготовить письмо в Outlook{% endif %}
                         </button>
                       </form>
                     {% elif not letter.outgoing_number %}
