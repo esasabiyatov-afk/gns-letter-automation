@@ -34,19 +34,6 @@
   </header>
 
   <main class="page-shell">
-    {% if abs_tls_verification_disabled %}
-      <div class="alert alert-error">
-        Проверка сертификата АБС отключена для ob.tolubay.kg.
-        Подлинность сервера не подтверждается; используйте режим только
-        в согласованной офисной сети.
-      </div>
-    {% endif %}
-    {% if outlook_insecure_certificate_confirmation %}
-      <div class="alert alert-error">
-        Outlook автоматически подтверждает только предупреждение о
-        недействительном сертификате. Режим согласован для офисного теста.
-      </div>
-    {% endif %}
     {% if outlook_test_mode %}
       <div class="alert alert-success">
         Почта работает в тестовом режиме: входящие PDF принимаются только от

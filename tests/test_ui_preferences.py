@@ -17,7 +17,7 @@ def test_abs_insecure_tls_state_is_exposed_for_global_warning(workflow):
     assert workflow.abs_tls_verification_disabled()
 
 
-def test_abs_insecure_tls_warning_is_rendered(workflow, monkeypatch):
+def test_abs_insecure_tls_warning_is_not_rendered(workflow, monkeypatch):
     from starlette.testclient import TestClient
 
     from gns_app import main
@@ -28,8 +28,8 @@ def test_abs_insecure_tls_warning_is_rendered(workflow, monkeypatch):
     response = TestClient(main.app).get("/cases")
 
     assert response.status_code == 200
-    assert "Проверка сертификата АБС отключена" in response.text
-    assert "Подлинность сервера не подтверждается" in response.text
+    assert "Проверка сертификата АБС отключена" not in response.text
+    assert "Подлинность сервера не подтверждается" not in response.text
 
 
 def test_real_tolubay_mode_is_named_correctly_in_login_dialog(
@@ -59,7 +59,31 @@ def test_real_tolubay_mode_is_named_correctly_in_login_dialog(
     assert "ТЕСТОВАЯ АБС" not in response.text
 
 
-def test_outlook_office_test_warnings_are_rendered(workflow, monkeypatch):
+def test_abs_login_dialog_auto_opens_after_session_error(workflow, monkeypatch):
+    from starlette.testclient import TestClient
+
+    from gns_app import main
+
+    overview = workflow.today_overview(view="prepare")
+    overview["ready_abs"] = 1
+    monkeypatch.setattr(
+        workflow,
+        "today_overview",
+        lambda *, view="all": overview,
+    )
+    monkeypatch.setattr(main, "workflow", workflow)
+
+    response = TestClient(main.app).get(
+        "/?tab=responses&response_view=prepare&abs_login=1"
+    )
+
+    assert response.status_code == 200
+    assert 'id="today-abs-dialog" class="modal"' in response.text
+    assert "data-auto-open" in response.text
+    assert "Войдите один раз" in response.text
+
+
+def test_outlook_test_mode_is_shown_without_certificate_warning(workflow, monkeypatch):
     from starlette.testclient import TestClient
 
     from gns_app import main
@@ -89,7 +113,7 @@ def test_outlook_office_test_warnings_are_rendered(workflow, monkeypatch):
     response = TestClient(main.app).get("/cases")
 
     assert response.status_code == 200
-    assert "Outlook автоматически подтверждает" in response.text
+    assert "Outlook автоматически подтверждает" not in response.text
     assert "esasabiyatov@gmail.com" in response.text
     assert "отправка разрешена только" in response.text
 

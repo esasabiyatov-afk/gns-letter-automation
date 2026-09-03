@@ -172,6 +172,7 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS outlook_messages (
     source_key TEXT PRIMARY KEY,
     sender_smtp TEXT NOT NULL,
+    original_sender_smtp TEXT,
     received_at TEXT NOT NULL,
     status TEXT NOT NULL,
     attachment_count INTEGER NOT NULL DEFAULT 0,
@@ -433,6 +434,7 @@ class Database:
             self._ensure_case_columns(connection)
             self._ensure_response_group_columns(connection)
             self._ensure_gns_office_columns(connection)
+            self._ensure_outlook_message_columns(connection)
             self._ensure_outlook_outgoing_columns(connection)
             self._clean_legacy_district_places(connection)
             self._normalize_legacy_taxpayer_names(connection)
@@ -521,6 +523,20 @@ class Database:
         if "email_address" not in existing:
             connection.execute(
                 "ALTER TABLE gns_offices ADD COLUMN email_address TEXT"
+            )
+
+    @staticmethod
+    def _ensure_outlook_message_columns(connection: sqlite3.Connection) -> None:
+        existing = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(outlook_messages)"
+            ).fetchall()
+        }
+        if "original_sender_smtp" not in existing:
+            connection.execute(
+                "ALTER TABLE outlook_messages "
+                "ADD COLUMN original_sender_smtp TEXT"
             )
 
     @staticmethod

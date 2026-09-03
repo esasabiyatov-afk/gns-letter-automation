@@ -66,17 +66,33 @@ def sample_probe(*, sync_requested: bool = False) -> OutlookProbe:
 class FakeGateway:
     def __init__(self):
         self.requests: list[bool] = []
+        self.mailboxes: list[str] = []
 
-    def inspect(self, *, request_sync: bool = False) -> OutlookProbe:
+    def inspect(
+        self,
+        *,
+        request_sync: bool = False,
+        mailbox: str = "",
+    ) -> OutlookProbe:
         self.requests.append(request_sync)
+        self.mailboxes.append(mailbox)
         return sample_probe(sync_requested=request_sync)
 
 
 class FakeImportGateway(FakeGateway):
-    def __init__(self, source_pdf: Path):
+    def __init__(
+        self,
+        source_pdf: Path,
+        *,
+        sender_smtp: str = "esasabiyatov@gmail.com",
+        original_sender_smtp: str = "",
+    ):
         super().__init__()
         self.source_pdf = source_pdf
+        self.sender_smtp = sender_smtp
+        self.original_sender_smtp = original_sender_smtp
         self.scan_requests: list[frozenset[str]] = []
+        self.staging_dirs: list[Path] = []
 
     def scan_inbox(
         self,
@@ -87,19 +103,36 @@ class FakeImportGateway(FakeGateway):
         known_message_keys,
         staging_dir,
         max_attachment_bytes,
+        forwarding_senders=frozenset(),
         mailbox="",
     ):
         assert mailbox in {"", "esasabiyatov@gmail.com"}
         assert staging_dir.is_dir()
+        assert (staging_dir / ".gns-ready").is_file()
         self.scan_requests.append(known_message_keys)
+        self.staging_dirs.append(staging_dir)
         message_key = "a" * 64
         if message_key in known_message_keys:
+            known_messages = ()
+            if self.original_sender_smtp:
+                known_messages = (
+                    OutlookScannedMessage(
+                        source_key=message_key,
+                        sender_smtp=self.sender_smtp,
+                        received_at="2026-08-21T09:00:00+06:00",
+                        attachment_count=0,
+                        pdf_attachment_count=0,
+                        attachments=(),
+                        original_sender_smtp=self.original_sender_smtp,
+                    ),
+                )
             return OutlookInboxScan(
                 inspected_mail_count=1,
                 eligible_message_count=1,
                 known_message_count=1,
                 scan_error_count=0,
                 messages=(),
+                known_messages=known_messages,
             )
         message_dir = staging_dir / message_key
         message_dir.mkdir(parents=True, exist_ok=True)
@@ -123,11 +156,12 @@ class FakeImportGateway(FakeGateway):
             messages=(
                 OutlookScannedMessage(
                     source_key=message_key,
-                    sender_smtp="esasabiyatov@gmail.com",
+                    sender_smtp=self.sender_smtp,
                     received_at="2026-08-21T09:00:00+06:00",
                     attachment_count=2,
                     pdf_attachment_count=2,
                     attachments=tuple(attachments),
+                    original_sender_smtp=self.original_sender_smtp,
                 ),
             ),
         )
@@ -148,6 +182,14 @@ def test_outlook_diagnostic_reports_profile_without_requesting_sync():
     assert service.last_result() == result
 
 
+def test_outlook_diagnostic_uses_configured_mailbox():
+    gateway = FakeGateway()
+
+    OutlookService(gateway).diagnose(mailbox="esasabiyatov@gmail.com")
+
+    assert gateway.mailboxes == ["esasabiyatov@gmail.com"]
+
+
 def test_outlook_send_receive_is_reported_only_as_requested():
     gateway = FakeGateway()
     service = OutlookService(gateway)
@@ -163,7 +205,12 @@ def test_outlook_send_receive_is_reported_only_as_requested():
 
 def test_outlook_connection_error_has_explicit_non_success_state():
     class FailingGateway:
-        def inspect(self, *, request_sync: bool = False) -> OutlookProbe:
+        def inspect(
+            self,
+            *,
+            request_sync: bool = False,
+            mailbox: str = "",
+        ) -> OutlookProbe:
             raise OutlookConnectionError("Outlook недоступен")
 
     result = OutlookService(FailingGateway()).diagnose()
@@ -176,7 +223,12 @@ def test_outlook_connection_error_has_explicit_non_success_state():
 
 def test_outlook_timeout_has_separate_status():
     class TimeoutGateway:
-        def inspect(self, *, request_sync: bool = False) -> OutlookProbe:
+        def inspect(
+            self,
+            *,
+            request_sync: bool = False,
+            mailbox: str = "",
+        ) -> OutlookProbe:
             raise OutlookProbeTimeoutError("Outlook не ответил")
 
     result = OutlookService(TimeoutGateway()).diagnose()
@@ -210,6 +262,9 @@ def test_subprocess_gateway_reads_structured_probe(monkeypatch):
     }
 
     def fake_run(*args, **kwargs):
+        assert json.loads(kwargs["input"])["mailbox"] == (
+            "esasabiyatov@gmail.com"
+        )
         return subprocess.CompletedProcess(
             args=args[0],
             returncode=0,
@@ -219,11 +274,110 @@ def test_subprocess_gateway_reads_structured_probe(monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    probe = SubprocessOutlookGateway().inspect(request_sync=True)
+    probe = SubprocessOutlookGateway().inspect(
+        request_sync=True,
+        mailbox="esasabiyatov@gmail.com",
+    )
 
     assert probe.sync_requested
     assert probe.accounts[0].account_type == "Exchange"
     assert probe.accounts[0].smtp_address == "employee@example.test"
+
+
+def test_subprocess_sync_keeps_late_certificate_watcher_in_main_process(
+    monkeypatch,
+):
+    from gns_app.services import outlook_service
+
+    calls: list[float] = []
+    monkeypatch.setattr(
+        outlook_service,
+        "start_outlook_certificate_dialog_watcher",
+        lambda *, timeout_seconds=20.0: calls.append(timeout_seconds),
+    )
+    gateway = SubprocessOutlookGateway(allow_insecure_certificate=True)
+    monkeypatch.setattr(
+        gateway,
+        "_call_bridge",
+        lambda action, *, input_payload: {
+            "probe": {
+                "outlook_version": "15.0",
+                "sync_requested": True,
+            }
+        },
+    )
+
+    probe = gateway.inspect(request_sync=True)
+
+    assert probe.sync_requested
+    assert calls == [20.0]
+
+
+def test_subprocess_diagnose_keeps_certificate_watcher_during_com_start(
+    monkeypatch,
+):
+    from gns_app.services import outlook_service
+
+    calls: list[float] = []
+    monkeypatch.setattr(
+        outlook_service,
+        "start_outlook_certificate_dialog_watcher",
+        lambda *, timeout_seconds=20.0: calls.append(timeout_seconds),
+    )
+    gateway = SubprocessOutlookGateway(allow_insecure_certificate=True)
+    monkeypatch.setattr(
+        gateway,
+        "_call_bridge",
+        lambda action, *, input_payload: {
+            "probe": {
+                "outlook_version": "15.0",
+                "sync_requested": False,
+            }
+        },
+    )
+
+    probe = gateway.inspect(request_sync=False)
+
+    assert not probe.sync_requested
+    assert calls == [20.0]
+
+
+def test_com_gateway_reuses_active_outlook_before_dispatch():
+    application = object()
+
+    class Client:
+        @staticmethod
+        def GetActiveObject(name):
+            assert name == "Outlook.Application"
+            return application
+
+        @staticmethod
+        def Dispatch(_name):
+            raise AssertionError("Dispatch should not start a second Outlook")
+
+    assert (
+        PyWin32OutlookGateway._connect_outlook_application(Client())
+        is application
+    )
+
+
+def test_com_gateway_starts_outlook_when_active_object_is_unavailable():
+    application = object()
+
+    class Client:
+        @staticmethod
+        def GetActiveObject(_name):
+            raise RuntimeError("Outlook is closed")
+
+        @staticmethod
+        def Dispatch(name):
+            assert name == "Outlook.Application"
+            return application
+
+    assert (
+        PyWin32OutlookGateway._connect_outlook_application(Client())
+        is application
+    )
 
 
 def test_com_gateway_reads_metadata_and_requests_send_receive(monkeypatch):
@@ -281,6 +435,49 @@ def test_com_gateway_reads_metadata_and_requests_send_receive(monkeypatch):
     assert probe.profile_name == "Рабочий профиль"
     assert probe.inbox_item_count == 42
     assert probe.accounts[0].account_type == "Exchange"
+
+
+def test_com_gateway_diagnostic_reads_configured_mailbox_not_default(
+    monkeypatch,
+):
+    configured_inbox = SimpleNamespace(
+        Name="Входящие",
+        FolderPath="\\\\esasabiyatov@gmail.com\\Входящие",
+        Items=SimpleNamespace(Count=501),
+        Store=SimpleNamespace(DisplayName="esasabiyatov@gmail.com"),
+    )
+    configured_store = SimpleNamespace(
+        DisplayName="esasabiyatov@gmail.com",
+        GetDefaultFolder=lambda folder_id: configured_inbox,
+    )
+    namespace = SimpleNamespace(
+        Accounts=SimpleNamespace(Count=0),
+        CurrentProfileName="Outlook",
+        CurrentUser=SimpleNamespace(Name="esasabiyatov@gmail.com"),
+        DefaultStore=SimpleNamespace(DisplayName="Файл данных Outlook"),
+        SyncObjects=SimpleNamespace(Count=1),
+        Offline=False,
+        Stores=SimpleNamespace(Count=1, Item=lambda index: configured_store),
+        GetDefaultFolder=lambda _folder_id: (_ for _ in ()).throw(
+            AssertionError("Нельзя подменять настроенный ящик стандартным")
+        ),
+    )
+    application = SimpleNamespace(
+        Version="16.0",
+        GetNamespace=lambda name: namespace,
+    )
+    pythoncom = SimpleNamespace(CoInitialize=lambda: None, CoUninitialize=lambda: None)
+    client = SimpleNamespace(Dispatch=lambda name: application)
+    monkeypatch.setitem(sys.modules, "pythoncom", pythoncom)
+    monkeypatch.setitem(sys.modules, "win32com", SimpleNamespace(client=client))
+
+    probe = PyWin32OutlookGateway().inspect(
+        mailbox="esasabiyatov@gmail.com"
+    )
+
+    assert probe.inbox_path == "\\\\esasabiyatov@gmail.com\\Входящие"
+    assert probe.inbox_item_count == 501
+    assert probe.default_store == "esasabiyatov@gmail.com"
 
 
 def test_com_gateway_opens_inbox_only_when_outlook_has_no_window():
@@ -713,8 +910,11 @@ def test_com_gateway_filters_sender_and_exports_only_pdf(
     monkeypatch.setitem(sys.modules, "pythoncom", pythoncom)
     monkeypatch.setitem(sys.modules, "win32com", SimpleNamespace(client=client))
 
-    staging_dir = tmp_path / "staging"
-    staging_dir.mkdir()
+    from gns_app.services import outlook_service
+
+    staging_dir = outlook_service._prepare_outlook_staging_dir(
+        tmp_path / "staging"
+    )
     scan = PyWin32OutlookGateway().scan_inbox(
         allowed_senders=frozenset({"esasabiyatov@gmail.com"}),
         allowed_domains=frozenset({"sti.gov.kg", "salyk.kg"}),
@@ -731,10 +931,347 @@ def test_com_gateway_filters_sender_and_exports_only_pdf(
     assert len(scan.messages) == 1
     assert scan.messages[0].pdf_attachment_count == 1
     assert len(scan.messages[0].attachments) == 1
+    assert scan.messages[0].original_sender_smtp == ""
     assert Path(scan.messages[0].attachments[0].temporary_path).is_file()
+    assert (staging_dir / ".gns-ready").is_file()
     assert allowed_mail.Attachments.values[0].saved
     assert not allowed_mail.Attachments.values[1].saved
     assert not blocked_mail.Attachments.values[0].saved
+
+
+def test_com_gateway_accepts_direct_gns_domain_sender():
+    allowed_domains = frozenset({"sti.gov.kg", "salyk.kg"})
+    direct_test_senders = frozenset()
+    forwarding_senders = frozenset({"reception@bank.kg"})
+
+    for sender in ("inspector@sti.gov.kg", "executor@salyk.kg"):
+        mail = SimpleNamespace(
+            SenderEmailType="SMTP",
+            SenderEmailAddress=sender,
+            Body="",
+            HTMLBody="",
+        )
+
+        assert PyWin32OutlookGateway._is_allowed_sender(
+            mail,
+            direct_test_senders,
+            allowed_domains,
+            forwarding_senders,
+        )
+        assert PyWin32OutlookGateway._allowed_sender_with_original(
+            mail,
+            direct_test_senders,
+            allowed_domains,
+            forwarding_senders,
+        ) == (True, "")
+
+
+def test_com_gateway_accepts_reception_with_forwarded_gns_sender():
+    allowed_domains = frozenset({"sti.gov.kg", "salyk.kg"})
+    direct_test_senders = frozenset()
+    forwarding_senders = frozenset({"reception@bank.kg"})
+    mail = SimpleNamespace(
+        SenderEmailType="SMTP",
+        SenderEmailAddress="reception@bank.kg",
+        Body=(
+            "-----Original Message-----\n"
+            "From: УГНС Первомайского района <inspector@sti.gov.kg>"
+        ),
+        HTMLBody="",
+    )
+
+    assert (
+        PyWin32OutlookGateway._forwarded_gns_sender(mail, allowed_domains)
+        == "inspector@sti.gov.kg"
+    )
+    assert PyWin32OutlookGateway._is_allowed_sender(
+        mail,
+        direct_test_senders,
+        allowed_domains,
+        forwarding_senders,
+    )
+    assert PyWin32OutlookGateway._allowed_sender_with_original(
+        mail,
+        direct_test_senders,
+        allowed_domains,
+        forwarding_senders,
+    ) == (True, "inspector@sti.gov.kg")
+
+
+def test_com_gateway_accepts_reception_with_cyrillic_forwarded_sender_label():
+    allowed_domains = frozenset({"sti.gov.kg", "salyk.kg"})
+    direct_test_senders = frozenset()
+    forwarding_senders = frozenset({"reception@bank.kg"})
+    mail = SimpleNamespace(
+        SenderEmailType="SMTP",
+        SenderEmailAddress="reception@bank.kg",
+        Body="От: Исполнитель УГНС <executor@salyk.kg>",
+        HTMLBody="",
+    )
+
+    assert (
+        PyWin32OutlookGateway._forwarded_gns_sender(mail, allowed_domains)
+        == "executor@salyk.kg"
+    )
+    assert PyWin32OutlookGateway._is_allowed_sender(
+        mail,
+        direct_test_senders,
+        allowed_domains,
+        forwarding_senders,
+    )
+
+
+def test_com_gateway_accepts_reception_with_multiple_forwarded_gns_senders():
+    allowed_domains = frozenset({"sti.gov.kg", "salyk.kg"})
+    direct_test_senders = frozenset()
+    forwarding_senders = frozenset({"reception@bank.kg"})
+    mail = SimpleNamespace(
+        SenderEmailType="SMTP",
+        SenderEmailAddress="reception@bank.kg",
+        Body=(
+            "From: Первый отправитель <first@sti.gov.kg>\n"
+            "От: Второй отправитель <second@salyk.kg>"
+        ),
+        HTMLBody="",
+    )
+
+    assert PyWin32OutlookGateway._forwarded_gns_sender(
+        mail,
+        allowed_domains,
+    ) == "first@sti.gov.kg"
+    assert PyWin32OutlookGateway._is_allowed_sender(
+        mail,
+        direct_test_senders,
+        allowed_domains,
+        forwarding_senders,
+    )
+
+
+def test_com_gateway_skips_reception_without_reliable_forwarded_sender():
+    allowed_domains = frozenset({"sti.gov.kg", "salyk.kg"})
+    direct_test_senders = frozenset()
+    forwarding_senders = frozenset({"reception@bank.kg"})
+    mail = SimpleNamespace(
+        SenderEmailType="SMTP",
+        SenderEmailAddress="reception@bank.kg",
+        Body="Просьба проверить письмо от inspector@sti.gov.kg.",
+        HTMLBody="",
+    )
+
+    assert (
+        PyWin32OutlookGateway._forwarded_gns_sender(mail, allowed_domains)
+        == ""
+    )
+    assert not PyWin32OutlookGateway._is_allowed_sender(
+        mail,
+        direct_test_senders,
+        allowed_domains,
+        forwarding_senders,
+    )
+
+
+def test_com_gateway_skips_reception_with_non_gns_forwarded_sender():
+    allowed_domains = frozenset({"sti.gov.kg", "salyk.kg"})
+    direct_test_senders = frozenset()
+    forwarding_senders = frozenset({"reception@bank.kg"})
+    mail = SimpleNamespace(
+        SenderEmailType="SMTP",
+        SenderEmailAddress="reception@bank.kg",
+        Body=(
+            "From: External organisation <sender@example.com>"
+        ),
+        HTMLBody="",
+    )
+
+    assert (
+        PyWin32OutlookGateway._forwarded_gns_sender(mail, allowed_domains)
+        == ""
+    )
+    assert not PyWin32OutlookGateway._is_allowed_sender(
+        mail,
+        direct_test_senders,
+        allowed_domains,
+        forwarding_senders,
+    )
+
+
+def test_subprocess_gateway_receives_existing_writable_staging_dir(
+    monkeypatch,
+    tmp_path,
+):
+    from gns_app.services import outlook_service
+
+    gateway = SubprocessOutlookGateway()
+    staging_dir = outlook_service._prepare_outlook_staging_dir(
+        tmp_path / "prepared-by-main-process"
+    )
+
+    def fake_call_bridge(action, *, input_payload, timeout_seconds=None):
+        assert action == "scan"
+        assert timeout_seconds == 120
+        assert Path(input_payload["staging_dir"]) == staging_dir
+        assert staging_dir.is_dir()
+        worker_probe = staging_dir / "worker-write-probe"
+        worker_probe.write_text("ready", encoding="ascii")
+        assert worker_probe.read_text(encoding="ascii") == "ready"
+        return {
+            "ok": True,
+            "scan": {
+                "inspected_mail_count": 0,
+                "eligible_message_count": 0,
+                "known_message_count": 0,
+                "scan_error_count": 0,
+                "messages": [],
+            },
+        }
+
+    monkeypatch.setattr(gateway, "_call_bridge", fake_call_bridge)
+
+    scan = gateway.scan_inbox(
+        allowed_senders=frozenset(),
+        allowed_domains=frozenset({"sti.gov.kg", "salyk.kg"}),
+        received_since=date(2026, 1, 1),
+        known_message_keys=frozenset(),
+        staging_dir=staging_dir,
+        max_attachment_bytes=1024,
+    )
+
+    assert scan.messages == ()
+
+
+def test_subprocess_scan_passes_certificate_mode_to_worker(
+    monkeypatch,
+    tmp_path,
+):
+    from gns_app.services import outlook_service
+
+    class Watcher:
+        def __init__(self):
+            self.finished: list[float] = []
+
+        def finish(self, grace_seconds=5.0):
+            self.finished.append(grace_seconds)
+            return False
+
+    staging_dir = outlook_service._prepare_outlook_staging_dir(
+        tmp_path / "prepared-certificate-scan"
+    )
+    watcher = Watcher()
+    calls: list[float] = []
+    monkeypatch.setattr(
+        outlook_service,
+        "start_outlook_certificate_dialog_watcher",
+        lambda *, timeout_seconds=20.0: (
+            calls.append(timeout_seconds) or watcher
+        ),
+    )
+    gateway = SubprocessOutlookGateway(allow_insecure_certificate=True)
+
+    def fake_call_bridge(action, *, input_payload, timeout_seconds=None):
+        assert action == "scan"
+        assert input_payload["allow_insecure_certificate"] is True
+        return {
+            "ok": True,
+            "scan": {
+                "inspected_mail_count": 0,
+                "eligible_message_count": 0,
+                "known_message_count": 0,
+                "scan_error_count": 0,
+                "messages": [],
+            },
+        }
+
+    monkeypatch.setattr(gateway, "_call_bridge", fake_call_bridge)
+    gateway.scan_inbox(
+        allowed_senders=frozenset(),
+        allowed_domains=frozenset({"sti.gov.kg", "salyk.kg"}),
+        received_since=date(2026, 1, 1),
+        known_message_keys=frozenset(),
+        staging_dir=staging_dir,
+        max_attachment_bytes=1024,
+    )
+
+    assert calls == [20.0]
+    assert watcher.finished == [0.0]
+
+
+def test_outlook_staging_uses_short_ascii_path_for_cyrillic_directory(
+    monkeypatch,
+    tmp_path,
+):
+    from gns_app.services import outlook_service
+
+    cyrillic_root = tmp_path / "временные_письма"
+    # The real Windows API guarantees that this path is another spelling of
+    # the same directory.  Mock the API boundary so the test does not depend
+    # on whether 8.3 names are enabled on the CI volume.
+    short_alias = tmp_path / "GNSO~1" / "run"
+    short_alias.mkdir(parents=True)
+    monkeypatch.setattr(outlook_service.sys, "platform", "win32")
+    monkeypatch.setattr(
+        outlook_service,
+        "_get_windows_short_path",
+        lambda path: short_alias,
+    )
+
+    staging = outlook_service._create_outlook_staging_directory(
+        (cyrillic_root,),
+        run_id="run",
+    )
+
+    assert "временные_письма" in str(staging.canonical_dir)
+    assert staging.worker_dir == short_alias
+    assert str(staging.worker_dir).isascii()
+
+
+def test_outlook_staging_uses_next_root_when_cyrillic_path_has_no_83_alias(
+    monkeypatch,
+    tmp_path,
+):
+    from gns_app.services import outlook_service
+
+    cyrillic_root = tmp_path / "нет_короткого_пути"
+    ascii_fallback = tmp_path / "GNSO"
+    monkeypatch.setattr(outlook_service.sys, "platform", "win32")
+    monkeypatch.setattr(
+        outlook_service,
+        "_get_windows_short_path",
+        lambda path: None,
+    )
+
+    staging = outlook_service._create_outlook_staging_directory(
+        (cyrillic_root, ascii_fallback),
+        run_id="run",
+    )
+
+    assert staging.canonical_root == ascii_fallback.resolve()
+    assert staging.worker_dir == staging.canonical_dir
+    assert staging.worker_dir.is_dir()
+    assert str(staging.worker_dir).isascii()
+
+
+def test_outlook_staging_skips_unavailable_candidate_for_writable_fallback(
+    monkeypatch,
+    tmp_path,
+):
+    from gns_app.services import outlook_service
+
+    unavailable = tmp_path / "not-a-directory"
+    unavailable.write_text("blocked", encoding="ascii")
+    fallback = tmp_path / "GNSO"
+    monkeypatch.setattr(outlook_service.sys, "platform", "linux")
+
+    staging = outlook_service._create_outlook_staging_directory(
+        (unavailable, fallback),
+        run_id="run",
+    )
+
+    assert staging.canonical_root == fallback.resolve()
+    assert staging.canonical_dir.is_dir()
+    assert (
+        staging.canonical_dir
+        / outlook_service.OUTLOOK_STAGING_READY_MARKER
+    ).read_bytes()
 
 
 def test_settings_routes_use_outlook_result(monkeypatch):
@@ -872,6 +1409,7 @@ def test_outlook_import_saves_message_once_and_reuses_duplicate_content(
     )
     assert message is not None
     assert message["status"] == "completed"
+    assert message["original_sender_smtp"] is None
     assert len(attachments) == 2
     assert {row["status"] for row in attachments} == {
         "imported",
@@ -889,6 +1427,210 @@ def test_outlook_import_saves_message_once_and_reuses_duplicate_content(
     assert all(Path(row["stored_path"]).exists() for row in preserved)
 
 
+def test_outlook_import_stores_and_shows_original_sender_from_relay(
+    workflow,
+    tmp_path,
+    monkeypatch,
+):
+    from starlette.testclient import TestClient
+
+    from gns_app import main
+
+    workflow.initialize_employee_profiles()
+    gateway = FakeImportGateway(
+        write_test_pdf(tmp_path / "relay-source.pdf"),
+        sender_smtp="reception@bank.kg",
+        original_sender_smtp="first@sti.gov.kg",
+    )
+    importer = OutlookInboxImporter(
+        workflow.db,
+        workflow.settings,
+        OutlookService(gateway),
+    )
+    importer.update_settings(
+        allowed_senders="reception@bank.kg",
+        import_since="2026-08-20",
+    )
+
+    result = importer.import_new(workflow)
+
+    message = workflow.db.fetch_one(
+        """
+        SELECT sender_smtp, original_sender_smtp
+        FROM outlook_messages
+        WHERE source_key = ?
+        """,
+        ("a" * 64,),
+    )
+    assert message == {
+        "sender_smtp": "reception@bank.kg",
+        "original_sender_smtp": "first@sti.gov.kg",
+    }
+    incoming = workflow.list_incoming_work()
+    assert incoming[0]["sender_smtp"] == "reception@bank.kg"
+    assert incoming[0]["original_sender_smtp"] == "first@sti.gov.kg"
+
+    now = utc_now()
+    workflow.db.execute(
+        """
+        INSERT INTO cases(id, upload_id, status, created_at, updated_at)
+        VALUES ('relay-history-case', ?, 'needs_review', ?, ?)
+        """,
+        (result["imported"][0], now, now),
+    )
+    history = workflow.list_letter_history("first@sti.gov.kg")
+    assert history["total"] == 1
+    assert history["items"][0]["sender_smtp"] == "reception@bank.kg"
+    assert history["items"][0]["original_sender_smtp"] == "first@sti.gov.kg"
+
+    monkeypatch.setattr(main, "workflow", workflow)
+    client = TestClient(main.app)
+    incoming_response = client.get("/")
+    history_response = client.get("/history?query=first%40sti.gov.kg")
+
+    assert incoming_response.status_code == 200
+    assert "Транспортный: reception@bank.kg" in incoming_response.text
+    assert "Исходный: first@sti.gov.kg" in incoming_response.text
+    assert history_response.status_code == 200
+    assert "Транспортный: reception@bank.kg" in history_response.text
+    assert "Исходный: first@sti.gov.kg" in history_response.text
+
+
+def test_outlook_import_backfills_known_relay_metadata_without_reimporting(
+    workflow,
+    tmp_path,
+):
+    workflow.initialize_employee_profiles()
+    gateway = FakeImportGateway(
+        write_test_pdf(tmp_path / "known-relay-source.pdf"),
+        sender_smtp="reception@bank.kg",
+    )
+    importer = OutlookInboxImporter(
+        workflow.db,
+        workflow.settings,
+        OutlookService(gateway),
+    )
+    importer.update_settings(
+        allowed_senders="reception@bank.kg",
+        import_since="2026-08-20",
+    )
+
+    first = importer.import_new(workflow)
+    workflow.db.execute(
+        """
+        UPDATE outlook_messages
+        SET original_sender_smtp = NULL
+        WHERE source_key = ?
+        """,
+        ("a" * 64,),
+    )
+    gateway.original_sender_smtp = "first@sti.gov.kg"
+
+    second = importer.import_new(workflow)
+
+    message = workflow.db.fetch_one(
+        """
+        SELECT sender_smtp, original_sender_smtp, status
+        FROM outlook_messages
+        WHERE source_key = ?
+        """,
+        ("a" * 64,),
+    )
+    assert first["saved_attachments"] == 2
+    assert second["saved_attachments"] == 0
+    assert not second["imported"]
+    assert message == {
+        "sender_smtp": "reception@bank.kg",
+        "original_sender_smtp": "first@sti.gov.kg",
+        "status": "completed",
+    }
+
+
+def test_outlook_import_uses_local_staging_when_portable_runtime_is_unwritable(
+    workflow,
+    tmp_path,
+    monkeypatch,
+):
+    from gns_app.services import outlook_service
+
+    workflow.initialize_employee_profiles()
+    blocked_runtime = tmp_path / "read-only-portable-runtime"
+    blocked_runtime.write_text("not a directory", encoding="utf-8")
+    local_app_data = tmp_path / "local-app-data"
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+    # This test verifies candidate order only; 8.3 hand-off representation is
+    # covered separately and would otherwise obscure the selected root.
+    monkeypatch.setattr(
+        outlook_service,
+        "_get_windows_short_path",
+        lambda path: None,
+    )
+    gateway = FakeImportGateway(write_test_pdf(tmp_path / "source.pdf"))
+    importer = OutlookInboxImporter(
+        workflow.db,
+        replace(workflow.settings, runtime_dir=blocked_runtime),
+        OutlookService(gateway),
+    )
+    importer.update_settings(
+        allowed_senders="esasabiyatov@gmail.com",
+        import_since="2026-08-20",
+        mailbox="esasabiyatov@gmail.com",
+    )
+
+    result = importer.import_new(workflow)
+
+    expected_root = (local_app_data / "GNSO").resolve()
+    assert result["saved_attachments"] == 2
+    assert gateway.staging_dirs[0].parent == expected_root
+    assert not gateway.staging_dirs[0].exists()
+
+
+def test_outlook_import_falls_back_to_configured_inbox_staging(
+    workflow,
+    tmp_path,
+    monkeypatch,
+):
+    from gns_app.services import outlook_service
+
+    workflow.initialize_employee_profiles()
+    blocked_root = tmp_path / "blocked-root"
+    blocked_root.write_text("not a directory", encoding="utf-8")
+    inbox_root = workflow.get_inbox_dir()
+    gateway = FakeImportGateway(write_test_pdf(tmp_path / "source.pdf"))
+    importer = OutlookInboxImporter(
+        workflow.db,
+        workflow.settings,
+        OutlookService(gateway),
+    )
+    importer.update_settings(
+        allowed_senders="esasabiyatov@gmail.com",
+        import_since="2026-08-20",
+        mailbox="esasabiyatov@gmail.com",
+    )
+    monkeypatch.setattr(
+        outlook_service,
+        "_outlook_staging_roots",
+        lambda runtime_dir, inbox_dir=None: (
+            blocked_root,
+            inbox_root / ".gns_outlook_staging",
+        ),
+    )
+    # Isolate candidate selection from the Windows 8.3 worker representation.
+    monkeypatch.setattr(
+        outlook_service,
+        "_get_windows_short_path",
+        lambda path: None,
+    )
+
+    result = importer.import_new(workflow)
+
+    assert result["saved_attachments"] == 2
+    assert gateway.staging_dirs[0].parent == (
+        inbox_root / ".gns_outlook_staging"
+    ).resolve()
+    assert not gateway.staging_dirs[0].exists()
+
+
 def test_outlook_import_settings_validate_sender_and_date(workflow):
     importer = OutlookInboxImporter(
         workflow.db,
@@ -902,9 +1644,10 @@ def test_outlook_import_settings_validate_sender_and_date(workflow):
         mailbox="esasabiyatov@gmail.com",
     )
 
-    assert importer.get_allowed_senders() == frozenset(
+    assert importer.get_forwarding_senders() == frozenset(
         {"first@example.test", "second@example.test"}
     )
+    assert importer.get_allowed_senders() == frozenset()
     assert importer.get_import_since() == date.today()
     assert importer.get_mailbox() == "esasabiyatov@gmail.com"
     assert not importer.get_auto_enabled()
@@ -920,6 +1663,19 @@ def test_outlook_import_settings_validate_sender_and_date(workflow):
 
     assert importer.get_auto_enabled()
     assert importer.get_auto_interval_minutes() == 7
+
+
+def test_outlook_production_mode_defaults_to_gns_domains_only(workflow):
+    importer = OutlookInboxImporter(
+        workflow.db,
+        workflow.settings,
+        OutlookService(FakeGateway()),
+    )
+
+    assert importer.get_allowed_senders() == frozenset()
+    assert importer.get_allowed_domains() == frozenset(
+        {"sti.gov.kg", "salyk.kg"}
+    )
 
 
 def test_outlook_test_mode_ignores_all_other_sender_rules(workflow):
@@ -1033,6 +1789,32 @@ def test_automatic_outlook_error_is_recorded_for_next_retry(monkeypatch):
         "error",
     ]
     assert "временно недоступен" in importer.statuses[-1]["message"]
+
+
+def test_settings_outlook_actions_use_saved_mailbox(workflow, monkeypatch):
+    from gns_app import main
+
+    gateway = FakeGateway()
+    importer = OutlookInboxImporter(
+        workflow.db,
+        workflow.settings,
+        OutlookService(gateway),
+    )
+    importer.update_settings(
+        allowed_senders="",
+        import_since=date.today().isoformat(),
+        mailbox="esasabiyatov@gmail.com",
+    )
+    monkeypatch.setattr(main, "outlook", OutlookService(gateway))
+    monkeypatch.setattr(main, "outlook_importer", importer)
+
+    main.check_outlook_connection()
+    main.request_outlook_send_receive()
+
+    assert gateway.mailboxes == [
+        "esasabiyatov@gmail.com",
+        "esasabiyatov@gmail.com",
+    ]
 
 
 def test_settings_page_renders_outlook_diagnostic(workflow, monkeypatch):

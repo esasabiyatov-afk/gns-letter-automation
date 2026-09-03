@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from threading import RLock
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -85,7 +86,7 @@ class TolubayAbsGateway:
     """Read-only адаптер поиска клиентов и счетов в Tolubay ABS."""
 
     is_fake = False
-    supports_session = False
+    supports_session = True
 
     def __init__(
         self,
@@ -108,6 +109,20 @@ class TolubayAbsGateway:
         self.config = config
         self.tls_verification_disabled = not config.verify_tls
         self._client_factory = client_factory
+        # Сеанс АБС живёт только в памяти запущенного приложения. Один клиент
+        # сохраняет cookie между автоматическими проверками, а любая ошибка
+        # АБС немедленно завершает сеанс.
+        self._session_client: TolubayClient | None = None
+        self._session_username = ""
+        self._session_lock = RLock()
+
+    def _reset_session_unlocked(self) -> None:
+        self._session_client = None
+        self._session_username = ""
+
+    def reset_session(self) -> None:
+        with self._session_lock:
+            self._reset_session_unlocked()
 
     @staticmethod
     def _failure(status: AbsStatus, message: str) -> AbsCheckResult:
@@ -165,91 +180,103 @@ class TolubayAbsGateway:
                     "АБС получила неподтверждённый ИНН. Проверка остановлена.",
                 )
 
-        try:
-            client = self._client_factory(self.config)
-            client.login(username.strip(), password)
-            taxpayer_results: list[dict[str, Any]] = []
-            for taxpayer in taxpayers:
-                inn = taxpayer["inn"]
-                matches = client.search_customers(
-                    {"SearchIdentificationNo": inn},
-                    page_size=100,
-                )
-                if not matches:
-                    taxpayer_result = AbsStatus.NOT_FOUND
-                    active_account_count = None
-                    closed_account_count = None
-                elif len(matches) != 1:
-                    taxpayer_result = AbsStatus.MULTIPLE
-                    active_account_count = None
-                    closed_account_count = None
-                else:
-                    # Анкета и агрегированные сведения о счетах читаются
-                    # только для одного кандидата. Бизнес-решение о наличии
-                    # счета по-прежнему подтверждает сотрудник.
-                    customer = matches[0]
-                    summary_inn = self._normalized_inn(customer.identity)
-                    questionnaire = client.get_customer_questionnaire(
-                        customer.customer_id
+        username = username.strip()
+        with self._session_lock:
+            try:
+                client = self._session_client
+                if client is None or self._session_username != username:
+                    self._reset_session_unlocked()
+                    client = self._client_factory(self.config)
+                    client.login(username, password)
+                    self._session_client = client
+                    self._session_username = username
+
+                taxpayer_results: list[dict[str, Any]] = []
+                for taxpayer in taxpayers:
+                    inn = taxpayer["inn"]
+                    matches = client.search_customers(
+                        {"SearchIdentificationNo": inn},
+                        page_size=100,
                     )
-                    questionnaire_inn = self._questionnaire_inn(questionnaire)
-                    identity_confirmed = (
-                        summary_inn == inn or questionnaire_inn == inn
-                    )
-                    identity_conflict = (
-                        bool(questionnaire_inn and questionnaire_inn != inn)
-                        or bool(
-                            len(summary_inn) == 14 and summary_inn != inn
-                        )
-                    )
-                    if not identity_confirmed or identity_conflict:
+                    if not matches:
+                        taxpayer_result = AbsStatus.NOT_FOUND
+                        active_account_count = None
+                        closed_account_count = None
+                    elif len(matches) != 1:
                         taxpayer_result = AbsStatus.MULTIPLE
                         active_account_count = None
                         closed_account_count = None
                     else:
-                        accounts = client.get_accounts(
-                            customer.customer_id,
-                            include_closed=True,
+                        # Анкета и агрегированные сведения о счетах читаются
+                        # только для одного кандидата. Бизнес-решение о наличии
+                        # счета по-прежнему подтверждает сотрудник.
+                        customer = matches[0]
+                        summary_inn = self._normalized_inn(customer.identity)
+                        questionnaire = client.get_customer_questionnaire(
+                            customer.customer_id
                         )
-                        closed_account_count = sum(
-                            1 for account in accounts if account.is_closed
+                        questionnaire_inn = self._questionnaire_inn(questionnaire)
+                        identity_confirmed = (
+                            summary_inn == inn or questionnaire_inn == inn
                         )
-                        active_account_count = (
-                            len(accounts) - closed_account_count
+                        identity_conflict = (
+                            bool(questionnaire_inn and questionnaire_inn != inn)
+                            or bool(
+                                len(summary_inn) == 14 and summary_inn != inn
+                            )
                         )
-                        taxpayer_result = AbsStatus.FOUND
-                taxpayer_results.append({
-                    "inn": inn,
-                    "name": taxpayer["name"],
-                    "result": str(taxpayer_result),
-                    "active_account_count": active_account_count,
-                    "closed_account_count": closed_account_count,
-                })
-        except AuthenticationError:
-            return self._failure(
-                AbsStatus.AUTH_ERROR,
-                "АБС отклонила логин или пароль.",
-            )
-        except ProtocolError as exc:
-            status = self._protocol_status(exc)
-            return self._failure(
-                status,
-                (
-                    "АБС недоступна. Отсутствие клиента не подтверждено."
-                    if status == AbsStatus.UNAVAILABLE
-                    else "АБС вернула неизвестный ответ. Проверка остановлена."
-                ),
-            )
-        except (TimeoutError, OSError):
-            return self._failure(
-                AbsStatus.UNAVAILABLE,
-                "АБС недоступна. Отсутствие клиента не подтверждено.",
-            )
-        except (TolubayError, ValueError, TypeError, KeyError):
-            return self._failure(
-                AbsStatus.TECHNICAL_ERROR,
-                "Проверка АБС завершилась технической ошибкой.",
-            )
+                        if not identity_confirmed or identity_conflict:
+                            taxpayer_result = AbsStatus.MULTIPLE
+                            active_account_count = None
+                            closed_account_count = None
+                        else:
+                            accounts = client.get_accounts(
+                                customer.customer_id,
+                                include_closed=True,
+                            )
+                            closed_account_count = sum(
+                                1 for account in accounts if account.is_closed
+                            )
+                            active_account_count = (
+                                len(accounts) - closed_account_count
+                            )
+                            taxpayer_result = AbsStatus.FOUND
+                    taxpayer_results.append({
+                        "inn": inn,
+                        "name": taxpayer["name"],
+                        "result": str(taxpayer_result),
+                        "active_account_count": active_account_count,
+                        "closed_account_count": closed_account_count,
+                    })
+            except AuthenticationError:
+                self._reset_session_unlocked()
+                return self._failure(
+                    AbsStatus.AUTH_ERROR,
+                    "Сеанс АБС завершён или логин/пароль отклонены. Войдите снова.",
+                )
+            except ProtocolError as exc:
+                self._reset_session_unlocked()
+                status = self._protocol_status(exc)
+                return self._failure(
+                    status,
+                    (
+                        "АБС недоступна. Войдите снова после восстановления связи."
+                        if status == AbsStatus.UNAVAILABLE
+                        else "АБС вернула неизвестный ответ. Войдите снова."
+                    ),
+                )
+            except (TimeoutError, OSError):
+                self._reset_session_unlocked()
+                return self._failure(
+                    AbsStatus.UNAVAILABLE,
+                    "АБС недоступна. Войдите снова после восстановления связи.",
+                )
+            except (TolubayError, ValueError, TypeError, KeyError):
+                self._reset_session_unlocked()
+                return self._failure(
+                    AbsStatus.TECHNICAL_ERROR,
+                    "Проверка АБС завершилась ошибкой. Войдите снова.",
+                )
 
         result_values = {item["result"] for item in taxpayer_results}
         if str(AbsStatus.MULTIPLE) in result_values:

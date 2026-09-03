@@ -116,11 +116,30 @@
     <div class="response-list" data-testid="created-response-list">
       {% for group in overview.generated_groups %}
         <article class="response-row created-response-row" id="group-{{ group.id }}">
-          <div class="response-person">
-            <strong>{{ group.recipient_display_name }}</strong>
-            <span>УГНС {{ group.district_place }}</span>
-            <small>Лиц: {{ group.taxpayer_count }}</small>
-          </div>
+          {% if group.taxpayers %}
+            <details class="response-person response-taxpayer-disclosure"
+                     data-testid="created-response-taxpayer-disclosure">
+              <summary>
+                <strong>{{ group.recipient_display_name }}</strong>
+                <span>УГНС {{ group.district_place }}</span>
+                <small>Лиц: {{ group.taxpayer_count }}</small>
+              </summary>
+              <ol class="response-taxpayer-list" aria-label="Лица готового ответа">
+                {% for taxpayer in group.taxpayers %}
+                  <li>
+                    <span>{{ taxpayer.name }}</span>
+                    <small>ИНН {{ taxpayer.inn }}</small>
+                  </li>
+                {% endfor %}
+              </ol>
+            </details>
+          {% else %}
+            <div class="response-person">
+              <strong>{{ group.recipient_display_name }}</strong>
+              <span>УГНС {{ group.district_place }}</span>
+              <small>Лиц: {{ group.taxpayer_count }}</small>
+            </div>
+          {% endif %}
           <div class="created-letter-list">
             {% for letter in group.letters %}
               <div class="created-letter-line" id="letter-{{ letter.id }}">
@@ -276,7 +295,8 @@
 </section>
 
 {% if response_view == 'prepare' and overview.ready_abs and not abs_session_active %}
-<dialog id="today-abs-dialog" class="modal">
+<dialog id="today-abs-dialog" class="modal"
+        {% if abs_login_required %}data-auto-open{% endif %}>
   <form method="post" action="/today/abs" autocomplete="off">
     <div class="modal-heading">
       <div>
@@ -285,7 +305,10 @@
       </div>
       <button type="button" class="modal-close" data-close-dialog>×</button>
     </div>
-    <p class="warning-note">Логин и пароль используются только для этой проверки и не сохраняются.</p>
+    <p class="warning-note">
+      Войдите один раз. Все следующие готовые письма проверяются автоматически.
+      После ошибки АБС приложение попросит войти снова.
+    </p>
     <label class="field"><span>Логин</span><input name="username" autocomplete="off" required></label>
     <label class="field"><span>Пароль</span><input name="password" type="password" autocomplete="new-password" required></label>
     <button class="button button-primary button-block" type="submit">

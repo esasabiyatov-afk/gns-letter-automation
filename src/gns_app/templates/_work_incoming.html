@@ -69,8 +69,13 @@
       <article class="compact-list-row incoming-row">
         <div class="incoming-source">
           <time>{{ (upload.received_at or upload.created_at)[:16].replace('T', ' ') }}</time>
-          <small title="{{ upload.sender_smtp or '' }}">
-            {{ upload.sender_smtp or 'Ручная загрузка' }}
+          <small title="{{ upload.sender_smtp or '' }}{% if upload.original_sender_smtp %} · исходный: {{ upload.original_sender_smtp }}{% endif %}">
+            {% if upload.original_sender_smtp %}
+              Транспортный: {{ upload.sender_smtp }}<br>
+              Исходный: {{ upload.original_sender_smtp }}
+            {% else %}
+              {{ upload.sender_smtp or 'Ручная загрузка' }}
+            {% endif %}
             {% if upload.source_count > 1 %} · копий: {{ upload.source_count }}{% endif %}
           </small>
         </div>

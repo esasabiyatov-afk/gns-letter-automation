@@ -100,6 +100,49 @@ def test_initialize_adds_abs_account_summary_columns_to_legacy_database(tmp_path
     assert "abs_closed_account_count" in columns
 
 
+def test_initialize_adds_original_sender_to_legacy_outlook_messages(tmp_path):
+    path = tmp_path / "legacy-outlook.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE outlook_messages (
+                source_key TEXT PRIMARY KEY,
+                sender_smtp TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attachment_count INTEGER NOT NULL DEFAULT 0,
+                pdf_attachment_count INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO outlook_messages(
+                source_key, sender_smtp, received_at, status,
+                created_at, updated_at
+            ) VALUES ('legacy-message', 'reception@bank.kg',
+                      '2026-08-28T09:00:00+00:00', 'completed',
+                      '2026-08-28T09:00:00+00:00',
+                      '2026-08-28T09:00:00+00:00')
+            """
+        )
+
+    db = Database(path)
+    db.initialize()
+
+    message = db.fetch_one(
+        "SELECT sender_smtp, original_sender_smtp "
+        "FROM outlook_messages WHERE source_key = 'legacy-message'"
+    )
+    assert message == {
+        "sender_smtp": "reception@bank.kg",
+        "original_sender_smtp": None,
+    }
+
+
 def test_initialize_cleans_edge_quote_and_audits_change(tmp_path):
     db = Database(tmp_path / "cleanup.sqlite3")
     db.initialize()

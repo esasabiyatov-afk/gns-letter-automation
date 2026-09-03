@@ -210,12 +210,16 @@
             <small>Пустое поле означает стандартную папку «Входящие».</small>
           </label>
           <label class="field setting-field">
-            <span>Разрешённые отправители</span>
+            <span>Почта приёмной</span>
             <input name="outlook_allowed_senders"
                    value="{{ outlook_allowed_senders }}"
                    {% if outlook_test_mode %}readonly{% endif %}
-                   placeholder="sender@gmail.com">
-            <small>Несколько адресов — через запятую.</small>
+                   placeholder="reception@bank.kg">
+            <small>
+              Почта УГНС @sti.gov.kg и @salyk.kg уже принимается. Отсюда
+              берутся только пересылки, где в строке «From/От» указан адрес УГНС.
+              Несколько адресов — через запятую.
+            </small>
           </label>
           <label class="field setting-field">
             <span>Проверять начиная с</span>
@@ -262,8 +266,8 @@
           <div><dt>Версия</dt><dd>{{ outlook_status.probe.outlook_version or 'не определена' }}</dd></div>
           <div><dt>Профиль</dt><dd>{{ outlook_status.probe.profile_name or 'по умолчанию' }}</dd></div>
           <div><dt>Пользователь</dt><dd>{{ outlook_status.probe.current_user or 'не определён' }}</dd></div>
-          <div><dt>Хранилище</dt><dd>{{ outlook_status.probe.default_store or 'не определено' }}</dd></div>
-          <div><dt>Папка</dt><dd>{{ outlook_status.probe.inbox_path or outlook_status.probe.inbox_name }}</dd></div>
+          <div><dt>Хранилище выбранного ящика</dt><dd>{{ outlook_status.probe.default_store or 'не определено' }}</dd></div>
+          <div><dt>Проверенная папка</dt><dd>{{ outlook_status.probe.inbox_path or outlook_status.probe.inbox_name }}</dd></div>
           <div><dt>Режим</dt><dd>{% if outlook_status.probe.offline %}автономный{% else %}в сети{% endif %}</dd></div>
         </dl>
       {% else %}

@@ -153,10 +153,8 @@
       <p>
         {% if abs_session_active %}
           Сеанс АБС активен. Проверка запускается без повторного входа.
-        {% elif abs_session_supported %}
-          Войдите один раз; сеанс действует до ошибки АБС или перезапуска приложения.
         {% else %}
-          Логин и пароль используются только для этой проверки и сразу очищаются.
+          Войдите один раз; сеанс действует до ошибки АБС или перезапуска приложения.
         {% endif %}
       </p>
     {% elif case.status == 'ready_for_response' %}
@@ -266,7 +264,8 @@
   </section>
 </div>
 
-<dialog id="abs-dialog" class="modal">
+<dialog id="abs-dialog" class="modal"
+        {% if abs_login_required %}data-auto-open{% endif %}>
   <form method="post" action="/cases/{{ case.id }}/abs" autocomplete="off">
     <div class="modal-heading">
       <div>
@@ -278,8 +277,8 @@
       <button type="button" class="modal-close" data-close-dialog>×</button>
     </div>
     <p class="warning-note">
-      Данные остаются только в памяти активного сеанса и не записываются в БД
-      или журнал. При ошибке потребуется войти снова.
+      Войдите один раз. Следующие готовые письма проверяются автоматически.
+      После ошибки АБС приложение попросит войти снова.
       {% if abs_is_fake %}
         Используется фейковая база.
       {% else %}

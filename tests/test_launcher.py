@@ -33,12 +33,19 @@ def test_source_module_command_uses_python_module(monkeypatch):
     ]
 
 
-def test_frozen_commands_reenter_the_executable(monkeypatch):
+def test_frozen_commands_use_hidden_app_and_separate_worker(
+    monkeypatch,
+    tmp_path,
+):
+    app_executable = tmp_path / "GNS-Portable.exe"
+    worker_executable = tmp_path / "GNS-Worker.exe"
+    worker_executable.write_bytes(b"worker")
     monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(app_executable))
 
-    assert _server_command() == [sys.executable, "--server"]
+    assert _server_command() == [str(app_executable), "--server"]
     assert module_command("gns_app.services.scanner_service", "--wia-worker") == [
-        sys.executable,
+        str(worker_executable),
         "--worker-module",
         "gns_app.services.scanner_service",
         "--wia-worker",

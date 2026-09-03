@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -8,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
@@ -38,6 +40,7 @@ OL_FOLDER_DRAFTS = 16
 OL_MAIL_ITEM = 0
 OL_BY_VALUE = 1
 OL_TEXT = 1
+OL_EMBEDDED_ITEM = 5
 GNS_DRAFT_KEY_PROPERTY = "GNS App Draft Key"
 ACCOUNT_TYPE_LABELS = {
     0: "Exchange",
@@ -48,11 +51,26 @@ ACCOUNT_TYPE_LABELS = {
     5: "Другой",
 }
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+EMAIL_IN_TEXT_RE = re.compile(
+    r"(?i)(?<![a-z0-9._%+-])"
+    r"([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})"
+    r"(?![a-z0-9._%+-])"
+)
+FORWARDED_HEADER_LINE_RE = re.compile(
+    r"(?im)^[ \t]*(?P<label>from|от|sent|отправлено|to|кому|"
+    r"subject|тема)\s*:"
+)
+FORWARDED_FROM_LABELS = frozenset({"from", "от"})
 OUTLOOK_TEST_SEND_RECIPIENT = "esasabiyatov@gmail.com"
 PR_INTERNET_MESSAGE_ID = (
     "http://schemas.microsoft.com/mapi/proptag/0x1035001E"
 )
 PR_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x39FE001E"
+OUTLOOK_STAGING_READY_MARKER = ".gns-ready"
+# Outlook 2013 still uses legacy file APIs in several attachment paths. The
+# worker's file name is deliberately short; leave room below MAX_PATH for it.
+OUTLOOK_WORKER_MAX_PATH = 240
+OUTLOOK_WORKER_FILE_PROBE = ("x" * 20) + "_000.pdf.part"
 
 
 class OutlookIntegrationError(RuntimeError):
@@ -73,6 +91,209 @@ class OutlookConnectionError(OutlookIntegrationError):
 
 class OutlookProbeTimeoutError(OutlookIntegrationError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class OutlookStagingDirectory:
+    """One staging directory in its main-process and worker representations."""
+
+    canonical_root: Path
+    canonical_dir: Path
+    worker_dir: Path
+
+
+def _prepare_outlook_staging_dir(staging_dir: Path) -> Path:
+    """Create and prove a main-process staging directory is usable."""
+
+    try:
+        canonical_dir = staging_dir.resolve()
+        canonical_dir.mkdir(parents=True, exist_ok=True)
+        # Не ограничиваемся is_dir(): в офисных профилях каталог иногда
+        # существует, но запись в него запрещена. Чтение сразу после записи
+        # проверяет именно доступ, который нужен COM-worker.
+        marker = canonical_dir / OUTLOOK_STAGING_READY_MARKER
+        marker_value = uuid4().hex.encode("ascii")
+        marker.write_bytes(marker_value)
+        if marker.read_bytes() != marker_value:
+            raise OSError("staging marker read-back failed")
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise OutlookConnectionError(
+            "Не удалось подготовить временную папку импорта Outlook."
+        ) from exc
+    if not canonical_dir.is_dir():
+        raise OutlookConnectionError(
+            "Не удалось подготовить временную папку импорта Outlook."
+        )
+    return canonical_dir
+
+
+def _require_outlook_worker_staging_dir(staging_dir: Path) -> Path:
+    """Require the directory prepared by the main process without creating it."""
+
+    try:
+        if not staging_dir.is_absolute() or not staging_dir.is_dir():
+            raise OSError("staging directory is missing")
+        marker = staging_dir / OUTLOOK_STAGING_READY_MARKER
+        if not marker.is_file() or not marker.read_bytes():
+            raise OSError("staging directory was not prepared")
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise OutlookConnectionError(
+            "Временная папка импорта Outlook недоступна."
+        ) from exc
+    # Preserve the representation supplied to the worker: it may be a 8.3
+    # alias, and all returned attachment paths must use that same root.
+    return staging_dir
+
+
+def _get_windows_short_path(path: Path) -> Path | None:
+    """Return an existing ASCII 8.3 path, if Windows provides one."""
+
+    if sys.platform != "win32":
+        return None
+    try:
+        get_short_path = ctypes.windll.kernel32.GetShortPathNameW
+        required = int(get_short_path(str(path), None, 0) or 0)
+        if required <= 0:
+            return None
+        buffer = ctypes.create_unicode_buffer(required + 1)
+        written = int(get_short_path(str(path), buffer, len(buffer)) or 0)
+        if written <= 0 or written >= len(buffer):
+            return None
+        candidate = Path(buffer.value)
+        if not candidate.is_dir() or not str(candidate).isascii():
+            return None
+        return candidate
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _worker_staging_path(canonical_dir: Path) -> Path | None:
+    """Choose a short, ASCII representation that Outlook COM can receive."""
+
+    if sys.platform != "win32":
+        return canonical_dir
+    short_path = _get_windows_short_path(canonical_dir)
+    for candidate in (short_path, canonical_dir):
+        if candidate is None:
+            continue
+        worker_file = candidate / OUTLOOK_WORKER_FILE_PROBE
+        if (
+            candidate.is_dir()
+            and str(candidate).isascii()
+            and len(str(worker_file)) <= OUTLOOK_WORKER_MAX_PATH
+        ):
+            return candidate
+    return None
+
+
+def _create_outlook_staging_directory(
+    roots: tuple[Path, ...],
+    *,
+    run_id: str,
+) -> OutlookStagingDirectory:
+    """Allocate a checked staging directory and worker-safe path representation."""
+
+    last_error: Exception | None = None
+    for root in roots:
+        canonical_dir: Path | None = None
+        try:
+            canonical_root = root.resolve()
+            canonical_dir = canonical_root / run_id
+            ensure_within(canonical_dir, canonical_root)
+            canonical_dir = _prepare_outlook_staging_dir(canonical_dir)
+            worker_dir = _worker_staging_path(canonical_dir)
+            if worker_dir is None:
+                raise OutlookConnectionError(
+                    "Временная папка не имеет безопасный путь для Outlook."
+                )
+            return OutlookStagingDirectory(
+                canonical_root=canonical_root,
+                canonical_dir=canonical_dir,
+                worker_dir=worker_dir,
+            )
+        except (
+            OutlookConnectionError,
+            StorageError,
+            OSError,
+            RuntimeError,
+            ValueError,
+        ) as exc:
+            last_error = exc
+            if canonical_dir is not None and canonical_dir.exists():
+                shutil.rmtree(canonical_dir, ignore_errors=True)
+            continue
+    raise OutlookIntegrationError(
+        "Не удалось подготовить временную папку Outlook. "
+        "Проверьте доступ к локальной папке пользователя."
+    ) from last_error
+
+
+def _canonical_staging_attachment_path(
+    temporary_path: Path,
+    staging: OutlookStagingDirectory,
+) -> Path:
+    """Validate a worker-returned path against its own path representation."""
+
+    worker_source = ensure_within(temporary_path, staging.worker_dir)
+    worker_root = staging.worker_dir.resolve()
+    try:
+        relative_path = worker_source.relative_to(worker_root)
+    except ValueError as exc:
+        raise StorageError("Вложение Outlook находится вне временной папки") from exc
+    canonical_source = ensure_within(
+        staging.canonical_dir / relative_path,
+        staging.canonical_dir,
+    )
+    if not canonical_source.is_file():
+        raise StorageError("Outlook не сохранил PDF во временную папку")
+    return canonical_source
+
+
+def _outlook_staging_roots(
+    runtime_dir: Path,
+    inbox_dir: Path | None = None,
+) -> tuple[Path, ...]:
+    """Return local, writable candidates for short-lived Outlook attachments.
+
+    A portable EXE can be launched from a read-only or removable location.
+    Outlook's hand-off files are temporary, so they belong in the current
+    Windows user's local storage rather than beside the executable.  The
+    runtime location remains a last-resort compatibility fallback.
+    """
+
+    roots: list[Path] = []
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if local_app_data:
+        roots.append(Path(local_app_data) / "GNSO")
+    roots.extend(
+        (
+            Path(tempfile.gettempdir()) / "GNSO",
+            runtime_dir / "outlook_staging",
+        )
+    )
+    if inbox_dir is not None:
+        # Папка входящих уже выбрана сотрудником и проверена основным
+        # приложением на запись. Это последний резерв для компьютеров, где
+        # корпоративная политика закрывает LOCALAPPDATA и TEMP дочерним
+        # процессам Outlook.
+        roots.append(inbox_dir / ".gns_outlook_staging")
+    public_dir = os.environ.get("PUBLIC", "").strip()
+    if public_dir:
+        # PUBLIC задаёт Windows, поэтому путь не зависит от имени текущего
+        # пользователя, системного диска или локализованного имени папки.
+        roots.append(Path(public_dir) / "GNSO")
+    unique_roots: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        try:
+            resolved = root.resolve()
+        except (OSError, RuntimeError, ValueError):
+            continue
+        key = str(resolved).casefold()
+        if key not in seen:
+            unique_roots.append(resolved)
+            seen.add(key)
+    return tuple(unique_roots)
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +323,9 @@ class OutlookScannedMessage:
     attachment_count: int
     pdf_attachment_count: int
     attachments: tuple[OutlookScannedAttachment, ...]
+    # Filled only when a trusted reception mailbox relays a confirmed GNS
+    # sender.  Direct messages keep their transport sender only.
+    original_sender_smtp: str = ""
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "OutlookScannedMessage":
@@ -116,6 +340,9 @@ class OutlookScannedMessage:
                 for item in payload.get("attachments", [])
                 if isinstance(item, dict)
             ),
+            original_sender_smtp=str(
+                payload.get("original_sender_smtp") or ""
+            ),
         )
 
 
@@ -126,6 +353,9 @@ class OutlookInboxScan:
     known_message_count: int
     scan_error_count: int
     messages: tuple[OutlookScannedMessage, ...]
+    # Metadata-only relay records for messages already in the permanent
+    # deduplication registry. They never trigger attachment handling.
+    known_messages: tuple[OutlookScannedMessage, ...] = ()
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "OutlookInboxScan":
@@ -137,6 +367,11 @@ class OutlookInboxScan:
             messages=tuple(
                 OutlookScannedMessage.from_dict(item)
                 for item in payload.get("messages", [])
+                if isinstance(item, dict)
+            ),
+            known_messages=tuple(
+                OutlookScannedMessage.from_dict(item)
+                for item in payload.get("known_messages", [])
                 if isinstance(item, dict)
             ),
         )
@@ -238,7 +473,12 @@ class OutlookSendResult:
 
 
 class OutlookGateway(Protocol):
-    def inspect(self, *, request_sync: bool = False) -> OutlookProbe: ...
+    def inspect(
+        self,
+        *,
+        request_sync: bool = False,
+        mailbox: str = "",
+    ) -> OutlookProbe: ...
 
     def create_draft(
         self,
@@ -295,6 +535,28 @@ class PyWin32OutlookGateway:
         self.allow_insecure_certificate = allow_insecure_certificate
 
     @staticmethod
+    def _connect_outlook_application(client: Any) -> Any:
+        """Attach to the already opened Outlook before asking COM to start it.
+
+        Outlook 2013 can block ``Dispatch`` while its UI is waiting on a
+        profile or connection dialog.  In normal office use Outlook is already
+        open, so using the active COM object avoids a second startup request.
+        ``Dispatch`` remains the fallback for a closed Outlook.
+        """
+
+        get_active = getattr(client, "GetActiveObject", None)
+        if callable(get_active):
+            try:
+                application = get_active("Outlook.Application")
+                if application is not None:
+                    return application
+            except Exception:
+                # Outlook is not running or has not registered its automation
+                # object yet.  The normal COM activation below handles that.
+                pass
+        return client.Dispatch("Outlook.Application")
+
+    @staticmethod
     def _ensure_outlook_window(application: Any, inbox: Any) -> None:
         explorers = _safe_attribute(application, "Explorers", None)
         if explorers is None:
@@ -347,7 +609,12 @@ class PyWin32OutlookGateway:
                 "Outlook не открыл папку «Входящие» выбранного ящика."
             ) from exc
 
-    def inspect(self, *, request_sync: bool = False) -> OutlookProbe:
+    def inspect(
+        self,
+        *,
+        request_sync: bool = False,
+        mailbox: str = "",
+    ) -> OutlookProbe:
         if sys.platform != "win32":
             raise OutlookUnsupportedPlatformError(
                 "Интеграция Outlook доступна только в Windows."
@@ -362,10 +629,18 @@ class PyWin32OutlookGateway:
             ) from exc
 
         pythoncom.CoInitialize()
+        # The warning may appear while Outlook itself is starting, before the
+        # MAPI call or SendAndReceive below.  Start the watcher before the COM
+        # connection rather than only after it.
+        certificate_watcher = (
+            start_outlook_certificate_dialog_watcher()
+            if self.allow_insecure_certificate
+            else None
+        )
         try:
-            application = client.Dispatch("Outlook.Application")
+            application = self._connect_outlook_application(client)
             namespace = application.GetNamespace("MAPI")
-            inbox = namespace.GetDefaultFolder(OL_FOLDER_INBOX)
+            inbox = self._select_inbox(namespace, mailbox)
             self._ensure_outlook_window(application, inbox)
 
             accounts: list[OutlookAccountInfo] = []
@@ -401,19 +676,11 @@ class PyWin32OutlookGateway:
             if request_sync:
                 # Outlook выполняет SendAndReceive асинхронно. На этом этапе
                 # фиксируется только успешная передача команды приложению.
-                certificate_watcher = (
-                    start_outlook_certificate_dialog_watcher()
-                    if self.allow_insecure_certificate
-                    else None
-                )
-                try:
-                    namespace.SendAndReceive(False)
-                finally:
-                    if certificate_watcher is not None:
-                        certificate_watcher.finish()
+                namespace.SendAndReceive(False)
 
             current_user = _safe_attribute(namespace, "CurrentUser", None)
             default_store = _safe_attribute(namespace, "DefaultStore", None)
+            selected_store = _safe_attribute(inbox, "Store", None)
             sync_objects = _safe_attribute(namespace, "SyncObjects", None)
             items = _safe_attribute(inbox, "Items", None)
             return OutlookProbe(
@@ -427,7 +694,10 @@ class PyWin32OutlookGateway:
                     _safe_attribute(current_user, "Name")
                 ),
                 default_store=_safe_text(
-                    _safe_attribute(default_store, "DisplayName")
+                    _safe_attribute(
+                        selected_store or default_store,
+                        "DisplayName",
+                    )
                 ),
                 inbox_name=_safe_text(_safe_attribute(inbox, "Name")),
                 inbox_path=_safe_text(_safe_attribute(inbox, "FolderPath")),
@@ -447,6 +717,8 @@ class PyWin32OutlookGateway:
                 "убедитесь, что выбран рабочий профиль, и повторите проверку."
             ) from exc
         finally:
+            if certificate_watcher is not None:
+                certificate_watcher.finish(grace_seconds=0.0)
             pythoncom.CoUninitialize()
 
     @staticmethod
@@ -509,7 +781,7 @@ class PyWin32OutlookGateway:
         pythoncom.CoInitialize()
         stage = "connect"
         try:
-            application = client.Dispatch("Outlook.Application")
+            application = self._connect_outlook_application(client)
             stage = "open_mapi"
             namespace = application.GetNamespace("MAPI")
             stage = "find_existing_draft"
@@ -610,7 +882,7 @@ class PyWin32OutlookGateway:
         pythoncom.CoInitialize()
         stage = "connect"
         try:
-            application = client.Dispatch("Outlook.Application")
+            application = self._connect_outlook_application(client)
             stage = "open_mapi"
             namespace = application.GetNamespace("MAPI")
             stage = "find_existing_draft"
@@ -736,6 +1008,114 @@ class PyWin32OutlookGateway:
                 return primary.casefold()
         return cls._mapi_property(mail, PR_SMTP_ADDRESS).casefold()
 
+    @staticmethod
+    def _has_allowed_domain(
+        sender_smtp: str,
+        allowed_domains: frozenset[str],
+    ) -> bool:
+        return (
+            sender_smtp.rpartition("@")[2].casefold()
+            in allowed_domains
+        )
+
+    @classmethod
+    def _forwarded_gns_sender(
+        cls,
+        mail: Any,
+        allowed_domains: frozenset[str],
+    ) -> str:
+        """Return a GNS sender named in a relay message's From/От field.
+
+        A direct sender is available through Outlook's MAPI fields.  A normal
+        Outlook forward has no separate original-sender field.  For a trusted
+        reception mailbox, the sender line in the forwarded text is therefore
+        treated like the direct sender: any `sti.gov.kg` or `salyk.kg` address
+        there is accepted.  A bare address elsewhere in the text is ignored.
+        """
+
+        candidates: list[str] = []
+        attachments = _safe_attribute(mail, "Attachments", None)
+        attachment_count = int(_safe_attribute(attachments, "Count", 0) or 0)
+        for attachment_index in range(1, attachment_count + 1):
+            try:
+                attachment = attachments.Item(attachment_index)
+                if int(_safe_attribute(attachment, "Type", 0) or 0) != (
+                    OL_EMBEDDED_ITEM
+                ):
+                    continue
+                original_mail = attachment.GetEmbeddedItem()
+                sender_smtp = cls._sender_smtp(original_mail)
+                if cls._has_allowed_domain(sender_smtp, allowed_domains):
+                    candidates.append(sender_smtp)
+            except Exception:
+                continue
+
+        body = _safe_text(_safe_attribute(mail, "Body"))
+        headers = list(FORWARDED_HEADER_LINE_RE.finditer(body))
+        for header_index, from_header in enumerate(headers):
+            label = from_header.group("label").casefold()
+            if label not in FORWARDED_FROM_LABELS:
+                continue
+            next_headers = headers[header_index + 1 :]
+            value_end = (
+                next_headers[0].start()
+                if next_headers
+                else body.find("\n", from_header.end())
+            )
+            if value_end < 0:
+                value_end = len(body)
+            from_value = body[from_header.end() : value_end]
+            for value in EMAIL_IN_TEXT_RE.findall(from_value):
+                sender_smtp = value.casefold()
+                if cls._has_allowed_domain(sender_smtp, allowed_domains):
+                    candidates.append(sender_smtp)
+
+        return candidates[0] if candidates else ""
+
+    @classmethod
+    def _allowed_sender_with_original(
+        cls,
+        mail: Any,
+        direct_senders: frozenset[str],
+        allowed_domains: frozenset[str],
+        forwarding_senders: frozenset[str],
+        *,
+        sender_smtp: str | None = None,
+    ) -> tuple[bool, str]:
+        """Return acceptance and the original sender for a trusted relay.
+
+        A direct message is deliberately not inspected as a forward: its
+        transport sender remains the only recorded sender.  Only a configured
+        reception mailbox can supply a separately stored original GNS address.
+        """
+
+        transport_sender = sender_smtp or cls._sender_smtp(mail)
+        if (
+            transport_sender in direct_senders
+            or cls._has_allowed_domain(transport_sender, allowed_domains)
+        ):
+            return True, ""
+        if transport_sender not in forwarding_senders:
+            return False, ""
+        original_sender = cls._forwarded_gns_sender(mail, allowed_domains)
+        return bool(original_sender), original_sender
+
+    @classmethod
+    def _is_allowed_sender(
+        cls,
+        mail: Any,
+        direct_senders: frozenset[str],
+        allowed_domains: frozenset[str],
+        forwarding_senders: frozenset[str],
+    ) -> bool:
+        accepted, _original_sender = cls._allowed_sender_with_original(
+            mail,
+            direct_senders,
+            allowed_domains,
+            forwarding_senders,
+        )
+        return accepted
+
     @classmethod
     def _source_key(cls, mail: Any) -> str:
         parent = _safe_attribute(mail, "Parent", None)
@@ -759,6 +1139,7 @@ class PyWin32OutlookGateway:
         known_message_keys: frozenset[str],
         staging_dir: Path,
         max_attachment_bytes: int,
+        forwarding_senders: frozenset[str] = frozenset(),
         mailbox: str = "",
     ) -> OutlookInboxScan:
         if sys.platform != "win32":
@@ -780,13 +1161,21 @@ class PyWin32OutlookGateway:
         normalized_domains = frozenset(
             value.casefold().lstrip("@") for value in allowed_domains
         )
-        if not staging_dir.is_dir():
-            raise OutlookConnectionError(
-                "Временная папка импорта Outlook не подготовлена."
-            )
+        normalized_forwarding_senders = frozenset(
+            value.casefold() for value in forwarding_senders
+        )
+        # Каталог создаёт и проверяет основной процесс до старта worker.
+        # Worker только принимает уже существующий путь и не создаёт ни его,
+        # ни родительские каталоги: это важно для офисной политики Windows.
+        staging_dir = _require_outlook_worker_staging_dir(staging_dir)
         pythoncom.CoInitialize()
+        certificate_watcher = (
+            start_outlook_certificate_dialog_watcher()
+            if self.allow_insecure_certificate
+            else None
+        )
         try:
-            application = client.Dispatch("Outlook.Application")
+            application = self._connect_outlook_application(client)
             namespace = application.GetNamespace("MAPI")
             inbox = self._select_inbox(namespace, mailbox)
             self._ensure_outlook_window(application, inbox)
@@ -796,6 +1185,7 @@ class PyWin32OutlookGateway:
             known = 0
             scan_errors = 0
             messages: list[OutlookScannedMessage] = []
+            known_messages: list[OutlookScannedMessage] = []
             item_count = int(_safe_attribute(items, "Count", 0) or 0)
             for item_index in range(1, item_count + 1):
                 try:
@@ -807,11 +1197,16 @@ class PyWin32OutlookGateway:
                     if received_time is None or received_time.date() < received_since:
                         continue
                     sender_smtp = self._sender_smtp(mail)
-                    sender_domain = sender_smtp.rpartition("@")[2]
-                    if (
-                        sender_smtp not in normalized_senders
-                        and sender_domain not in normalized_domains
-                    ):
+                    accepted, original_sender_smtp = (
+                        self._allowed_sender_with_original(
+                            mail,
+                            normalized_senders,
+                            normalized_domains,
+                            normalized_forwarding_senders,
+                            sender_smtp=sender_smtp,
+                        )
+                    )
+                    if not accepted:
                         continue
                     source_key = self._source_key(mail)
                     if not source_key:
@@ -819,6 +1214,22 @@ class PyWin32OutlookGateway:
                     eligible += 1
                     if source_key in known_message_keys:
                         known += 1
+                        # A previous version did not retain the confirmed
+                        # original sender. Return metadata only, so the main
+                        # process can fill that field without re-saving a PDF
+                        # or changing the completed/no_pdf status.
+                        if original_sender_smtp:
+                            known_messages.append(
+                                OutlookScannedMessage(
+                                    source_key=source_key,
+                                    sender_smtp=sender_smtp,
+                                    received_at=received_time.isoformat(),
+                                    attachment_count=0,
+                                    pdf_attachment_count=0,
+                                    attachments=(),
+                                    original_sender_smtp=original_sender_smtp,
+                                )
+                            )
                         continue
                     attachment_collection = mail.Attachments
                     attachment_count = int(
@@ -837,12 +1248,11 @@ class PyWin32OutlookGateway:
                         size_bytes = int(
                             _safe_attribute(attachment, "Size", 0) or 0
                         )
-                        safe_name = sanitize_filename(original_name)
                         temporary_path = (
                             staging_dir
                             / (
                                 f"{source_key[:20]}_"
-                                f"{attachment_index:03d}_{safe_name}.part"
+                                f"{attachment_index:03d}.pdf.part"
                             )
                         )
                         temporary_path_text = str(temporary_path)
@@ -872,6 +1282,7 @@ class PyWin32OutlookGateway:
                             attachment_count=attachment_count,
                             pdf_attachment_count=pdf_count,
                             attachments=tuple(attachments),
+                            original_sender_smtp=original_sender_smtp,
                         )
                     )
                 except Exception:
@@ -886,6 +1297,7 @@ class PyWin32OutlookGateway:
                 known_message_count=known,
                 scan_error_count=scan_errors,
                 messages=tuple(messages),
+                known_messages=tuple(known_messages),
             )
         except OutlookIntegrationError:
             raise
@@ -894,6 +1306,8 @@ class PyWin32OutlookGateway:
                 "Не удалось проверить папку входящих Outlook."
             ) from exc
         finally:
+            if certificate_watcher is not None:
+                certificate_watcher.finish(grace_seconds=0.0)
             pythoncom.CoUninitialize()
 
 
@@ -909,14 +1323,32 @@ class SubprocessOutlookGateway:
         self.timeout_seconds = timeout_seconds
         self.allow_insecure_certificate = allow_insecure_certificate
 
-    def inspect(self, *, request_sync: bool = False) -> OutlookProbe:
+    def inspect(
+        self,
+        *,
+        request_sync: bool = False,
+        mailbox: str = "",
+    ) -> OutlookProbe:
         action = "sync" if request_sync else "diagnose"
-        payload = self._call_bridge(
-            action,
-            input_payload={
-                "allow_insecure_certificate": self.allow_insecure_certificate,
-            },
+        # Outlook can show the certificate dialog while its COM object starts,
+        # not only after SendAndReceive.  Keep the main-process watcher alive
+        # for the complete worker call.
+        certificate_watcher = (
+            start_outlook_certificate_dialog_watcher(timeout_seconds=20.0)
+            if self.allow_insecure_certificate
+            else None
         )
+        try:
+            payload = self._call_bridge(
+                action,
+                input_payload={
+                    "allow_insecure_certificate": self.allow_insecure_certificate,
+                    "mailbox": mailbox,
+                },
+            )
+        finally:
+            if certificate_watcher is not None:
+                certificate_watcher.finish(grace_seconds=0.0)
         probe_payload = payload.get("probe")
         if not isinstance(probe_payload, dict):
             raise OutlookConnectionError(
@@ -933,21 +1365,37 @@ class SubprocessOutlookGateway:
         known_message_keys: frozenset[str],
         staging_dir: Path,
         max_attachment_bytes: int,
+        forwarding_senders: frozenset[str] = frozenset(),
         mailbox: str = "",
     ) -> OutlookInboxScan:
-        payload = self._call_bridge(
-            "scan",
-            input_payload={
-                "allowed_senders": sorted(allowed_senders),
-                "allowed_domains": sorted(allowed_domains),
-                "received_since": received_since.isoformat(),
-                "known_message_keys": sorted(known_message_keys),
-                "staging_dir": str(staging_dir),
-                "max_attachment_bytes": max_attachment_bytes,
-                "mailbox": mailbox,
-            },
-            timeout_seconds=max(120, self.timeout_seconds),
+        staging_dir = _require_outlook_worker_staging_dir(staging_dir)
+        # Outlook can show the same certificate dialog while COM starts to
+        # enumerate mail. Keep a watcher in the main process as well as in the
+        # worker, mirroring the SendAndReceive path.
+        certificate_watcher = (
+            start_outlook_certificate_dialog_watcher(timeout_seconds=20.0)
+            if self.allow_insecure_certificate
+            else None
         )
+        try:
+            payload = self._call_bridge(
+                "scan",
+                input_payload={
+                    "allow_insecure_certificate": self.allow_insecure_certificate,
+                    "allowed_senders": sorted(allowed_senders),
+                    "allowed_domains": sorted(allowed_domains),
+                    "forwarding_senders": sorted(forwarding_senders),
+                    "received_since": received_since.isoformat(),
+                    "known_message_keys": sorted(known_message_keys),
+                    "staging_dir": str(staging_dir),
+                    "max_attachment_bytes": max_attachment_bytes,
+                    "mailbox": mailbox,
+                },
+                timeout_seconds=max(120, self.timeout_seconds),
+            )
+        finally:
+            if certificate_watcher is not None:
+                certificate_watcher.finish(grace_seconds=0.0)
         scan_payload = payload.get("scan")
         if not isinstance(scan_payload, dict):
             raise OutlookConnectionError(
@@ -1085,11 +1533,15 @@ class OutlookService:
         with self._lock:
             return self._last_result
 
-    def diagnose(self) -> OutlookDiagnosticResult:
-        return self._run(request_sync=False)
+    def diagnose(self, *, mailbox: str = "") -> OutlookDiagnosticResult:
+        return self._run(request_sync=False, mailbox=mailbox)
 
-    def request_send_receive(self) -> OutlookDiagnosticResult:
-        return self._run(request_sync=True)
+    def request_send_receive(
+        self,
+        *,
+        mailbox: str = "",
+    ) -> OutlookDiagnosticResult:
+        return self._run(request_sync=True, mailbox=mailbox)
 
     def scan_inbox(
         self,
@@ -1100,6 +1552,7 @@ class OutlookService:
         known_message_keys: frozenset[str],
         staging_dir: Path,
         max_attachment_bytes: int,
+        forwarding_senders: frozenset[str] = frozenset(),
         mailbox: str = "",
     ) -> OutlookInboxScan:
         scanner = getattr(self.gateway, "scan_inbox", None)
@@ -1114,6 +1567,7 @@ class OutlookService:
             known_message_keys=known_message_keys,
             staging_dir=staging_dir,
             max_attachment_bytes=max_attachment_bytes,
+            forwarding_senders=forwarding_senders,
             mailbox=mailbox,
         )
 
@@ -1159,11 +1613,19 @@ class OutlookService:
             sending_account=sending_account,
         )
 
-    def _run(self, *, request_sync: bool) -> OutlookDiagnosticResult:
+    def _run(
+        self,
+        *,
+        request_sync: bool,
+        mailbox: str = "",
+    ) -> OutlookDiagnosticResult:
         started = time.monotonic()
         checked_at = datetime.now().astimezone().strftime("%d.%m.%Y %H:%M:%S")
         try:
-            probe = self.gateway.inspect(request_sync=request_sync)
+            probe = self.gateway.inspect(
+                request_sync=request_sync,
+                mailbox=mailbox,
+            )
             if request_sync:
                 state = "sync_requested"
                 message = (
@@ -1680,7 +2142,9 @@ class OutlookInboxImporter:
     DEFAULT_AUTO_INTERVAL_MINUTES = 5
     MIN_AUTO_INTERVAL_MINUTES = 1
     MAX_AUTO_INTERVAL_MINUTES = 1440
-    DEFAULT_ALLOWED_SENDERS = frozenset({"esasabiyatov@gmail.com"})
+    # В рабочем режиме письма принимаются по доменам ГНС. Точный тестовый
+    # адрес добавляется только явным GNS_OUTLOOK_TEST_EMAIL.
+    DEFAULT_ALLOWED_SENDERS = frozenset()
     DEFAULT_ALLOWED_DOMAINS = frozenset({"sti.gov.kg", "salyk.kg"})
 
     def __init__(
@@ -1698,6 +2162,17 @@ class OutlookInboxImporter:
         test_email = self.settings.outlook_test_email.strip().casefold()
         if test_email:
             return frozenset({test_email})
+        return self.DEFAULT_ALLOWED_SENDERS
+
+    def get_forwarding_senders(self) -> frozenset[str]:
+        """Return trusted relay addresses configured by the employee.
+
+        These addresses are not direct sources of requests: they can only
+        relay a message with one confirmed original sender from a GNS domain.
+        """
+
+        if self.settings.outlook_test_email.strip():
+            return frozenset()
         row = self.db.fetch_one(
             "SELECT value FROM settings WHERE key = ?",
             (self.ALLOWED_SENDERS_SETTING,),
@@ -1830,6 +2305,15 @@ class OutlookInboxImporter:
             Path(value).resolve()
             if value
             else self.settings.inbox_dir.resolve()
+        )
+
+    def _create_staging_run_dir(self) -> OutlookStagingDirectory:
+        return _create_outlook_staging_directory(
+            _outlook_staging_roots(
+                self.settings.runtime_dir,
+                self.get_inbox_dir(),
+            ),
+            run_id=f"gns-{uuid4().hex}",
         )
 
     def update_settings(
@@ -1966,12 +2450,13 @@ class OutlookInboxImporter:
         self.db.execute(
             """
             INSERT INTO outlook_messages(
-                source_key, sender_smtp, received_at, status,
+                source_key, sender_smtp, original_sender_smtp, received_at, status,
                 attachment_count, pdf_attachment_count, error_message,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(source_key) DO UPDATE SET
                 sender_smtp = excluded.sender_smtp,
+                original_sender_smtp = excluded.original_sender_smtp,
                 received_at = excluded.received_at,
                 status = excluded.status,
                 attachment_count = excluded.attachment_count,
@@ -1982,6 +2467,7 @@ class OutlookInboxImporter:
             (
                 message.source_key,
                 message.sender_smtp,
+                message.original_sender_smtp or None,
                 message.received_at,
                 status,
                 message.attachment_count,
@@ -1989,6 +2475,29 @@ class OutlookInboxImporter:
                 error_message or None,
                 now,
                 now,
+            ),
+        )
+
+    def _fill_known_message_original_sender(
+        self,
+        message: OutlookScannedMessage,
+    ) -> None:
+        """Backfill only missing relay metadata for an already known mail."""
+
+        if not message.original_sender_smtp:
+            return
+        self.db.execute(
+            """
+            UPDATE outlook_messages
+            SET original_sender_smtp = ?, updated_at = ?
+            WHERE source_key = ?
+              AND status IN ('completed', 'no_pdf')
+              AND COALESCE(original_sender_smtp, '') = ''
+            """,
+            (
+                message.original_sender_smtp,
+                utc_now(),
+                message.source_key,
             ),
         )
 
@@ -2086,13 +2595,7 @@ class OutlookInboxImporter:
                 """
             )
         )
-        staging_root = (self.settings.runtime_dir / "outlook_staging").resolve()
-        staging_root.mkdir(parents=True, exist_ok=True)
-        run_dir = (staging_root / uuid4().hex).resolve()
-        ensure_within(run_dir, staging_root)
-        # Папку создаёт основной процесс. На офисном ПК политика безопасности
-        # запрещала дочернему Outlook-COM процессу создавать этот каталог.
-        run_dir.mkdir(parents=False, exist_ok=False)
+        staging = self._create_staging_run_dir()
         imported_uploads: list[str] = []
         duplicate_attachments = 0
         saved_attachments = 0
@@ -2103,15 +2606,20 @@ class OutlookInboxImporter:
                 allowed_domains=self.get_allowed_domains(),
                 received_since=self.get_import_since(),
                 known_message_keys=known,
-                staging_dir=run_dir,
+                staging_dir=staging.worker_dir,
                 max_attachment_bytes=self.settings.max_upload_bytes,
+                forwarding_senders=self.get_forwarding_senders(),
                 mailbox=self.get_mailbox(),
             )
             # Чтение текущей локальной папки выполняется до SendAndReceive.
             # Поэтому зависшая синхронизация не скрывает уже полученные письма,
             # а новые письма учитываются следующим полным проходом реестра.
-            sync_result = self.outlook.request_send_receive()
+            sync_result = self.outlook.request_send_receive(
+                mailbox=self.get_mailbox()
+            )
             sync_error = "" if sync_result.successful else sync_result.message
+            for message in scan.known_messages:
+                self._fill_known_message_original_sender(message)
             for message in scan.messages:
                 self._upsert_message(message, status="processing")
                 if message.pdf_attachment_count == 0:
@@ -2147,9 +2655,9 @@ class OutlookInboxImporter:
                         )
                         continue
                     try:
-                        source = ensure_within(
+                        source = _canonical_staging_attachment_path(
                             Path(attachment.temporary_path),
-                            run_dir,
+                            staging,
                         )
                         safe_name = sanitize_filename(attachment.original_filename)
                         destination = (
@@ -2253,9 +2761,9 @@ class OutlookInboxImporter:
             )
             return summary
         finally:
-            if run_dir.exists():
-                ensure_within(run_dir, staging_root)
-                shutil.rmtree(run_dir, ignore_errors=True)
+            if staging.canonical_dir.exists():
+                ensure_within(staging.canonical_dir, staging.canonical_root)
+                shutil.rmtree(staging.canonical_dir, ignore_errors=True)
 
 
 def _bridge_payload(
@@ -2296,6 +2804,10 @@ def _bridge_payload(
                 allowed_domains=frozenset(
                     str(value) for value in payload.get("allowed_domains", [])
                 ),
+                forwarding_senders=frozenset(
+                    str(value)
+                    for value in payload.get("forwarding_senders", [])
+                ),
                 received_since=date.fromisoformat(
                     str(payload.get("received_since") or "")
                 ),
@@ -2310,7 +2822,10 @@ def _bridge_payload(
                 mailbox=str(payload.get("mailbox") or ""),
             )
             return {"ok": True, "scan": asdict(scan)}
-        probe = gateway.inspect(request_sync=action == "sync")
+        probe = gateway.inspect(
+            request_sync=action == "sync",
+            mailbox=str(payload.get("mailbox") or ""),
+        )
         return {"ok": True, "probe": asdict(probe)}
     except (TypeError, ValueError) as exc:
         return {

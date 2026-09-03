@@ -168,6 +168,33 @@ class WorkflowService:
     def abs_session_active(self) -> bool:
         return self._abs_session_credentials is not None
 
+    def _clear_abs_session(self) -> None:
+        self._abs_session_credentials = None
+        reset_session = getattr(self.abs, "reset_session", None)
+        if callable(reset_session):
+            reset_session()
+
+    def abs_login_required(self) -> bool:
+        if self.abs_session_active():
+            return False
+        return bool(
+            self.db.fetch_one(
+                """
+                SELECT id
+                FROM cases
+                WHERE status = ?
+                  AND abs_status IN (?, ?, ?)
+                LIMIT 1
+                """,
+                (
+                    CaseStatus.READY_FOR_ABS,
+                    AbsStatus.AUTH_ERROR,
+                    AbsStatus.UNAVAILABLE,
+                    AbsStatus.TECHNICAL_ERROR,
+                ),
+            )
+        )
+
     def abs_is_fake(self) -> bool:
         return bool(getattr(self.abs, "is_fake", False))
 
@@ -1417,7 +1444,7 @@ class WorkflowService:
                 except OSError:
                     cleanup_errors.append(str(child))
 
-        self._abs_session_credentials = None
+        self._clear_abs_session()
         self.db.audit(
             "settings",
             "processing_data",
@@ -3692,7 +3719,20 @@ class WorkflowService:
         try:
             result = self.abs.check(username, password, taxpayers)
         except Exception as exc:
-            self._abs_session_credentials = None
+            self._clear_abs_session()
+            self.db.execute(
+                """
+                UPDATE cases
+                SET status = ?, abs_status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    CaseStatus.READY_FOR_ABS,
+                    AbsStatus.TECHNICAL_ERROR,
+                    utc_now(),
+                    case_id,
+                ),
+            )
             username = ""
             password = ""
             record_exception(
@@ -3714,7 +3754,7 @@ class WorkflowService:
             AbsStatus.TECHNICAL_ERROR,
         }
         if result.status in failed_statuses or not self.abs_session_supported():
-            self._abs_session_credentials = None
+            self._clear_abs_session()
         else:
             self._abs_session_credentials = (username, password)
         # В БД и журнал учётные данные не передаются.
@@ -3803,7 +3843,7 @@ class WorkflowService:
             return False
         if self.abs_is_fake():
             self.check_abs(case_id, "local-auto", "local-auto")
-            self._abs_session_credentials = None
+            self._clear_abs_session()
             return True
         if self.abs_session_active():
             self.check_abs(case_id)
@@ -4081,24 +4121,25 @@ class WorkflowService:
 
         counts: dict[str, int] = {}
         processed_count = 0
-        try:
-            for case in cases:
-                result = self.check_abs(case["id"], username, password)
-                processed_count += 1
-                key = str(result.status)
-                counts[key] = counts.get(key, 0) + 1
-                if result.status in {
-                    AbsStatus.AUTH_ERROR,
-                    AbsStatus.UNAVAILABLE,
-                    AbsStatus.TECHNICAL_ERROR,
-                }:
-                    break
-        finally:
-            # Пакетный вход действует только на одну операцию. Не оставляем
-            # учётные данные даже в оперативной памяти процесса.
-            username = ""
-            password = ""
-            self._abs_session_credentials = None
+        requires_login = False
+        error_message = ""
+        for case in cases:
+            result = self.check_abs(case["id"], username, password)
+            processed_count += 1
+            key = str(result.status)
+            counts[key] = counts.get(key, 0) + 1
+            if result.status in {
+                AbsStatus.AUTH_ERROR,
+                AbsStatus.UNAVAILABLE,
+                AbsStatus.TECHNICAL_ERROR,
+            }:
+                requires_login = True
+                error_message = result.message
+                break
+        # Локальные параметры больше не нужны. Успешный сеанс продолжает
+        # работать через защищённое состояние объектов только в памяти.
+        username = ""
+        password = ""
         self.db.audit(
             "settings",
             f"abs-batch-{day.isoformat()}",
@@ -4118,6 +4159,8 @@ class WorkflowService:
             "business_date": day.isoformat(),
             "case_count": processed_count,
             "results": counts,
+            "requires_login": requires_login,
+            "error_message": error_message,
         }
 
     def today_overview(
@@ -4243,6 +4286,21 @@ class WorkflowService:
         )
         for group in generated:
             group["letters"] = []
+            group["taxpayers"] = []
+
+        generated_taxpayers = self.db.fetch_all(
+            f"""
+            SELECT response_group_id, display_order, source_case_id, name, inn
+            FROM response_group_taxpayers
+            WHERE response_group_id IN ({placeholders})
+            ORDER BY response_group_id, display_order
+            """,
+            group_ids,
+        )
+        for taxpayer in generated_taxpayers:
+            group = generated_by_id.get(taxpayer["response_group_id"])
+            if group is not None:
+                group["taxpayers"].append(taxpayer)
 
         letter_ids = tuple(letter["id"] for letter in generated_letters)
         scans_by_letter: dict[str, dict[str, Any]] = {}
@@ -6582,6 +6640,9 @@ class WorkflowService:
                    GROUP_CONCAT(
                        DISTINCT outlook_messages.sender_smtp
                    ) AS sender_smtp,
+                   GROUP_CONCAT(
+                       DISTINCT outlook_messages.original_sender_smtp
+                   ) AS original_sender_smtp,
                    COUNT(
                        DISTINCT outlook_messages.source_key
                    ) AS source_count
@@ -7866,6 +7927,14 @@ class WorkflowService:
                      WHERE outlook_attachments.upload_id = cases.upload_id
                      ORDER BY outlook_messages.received_at
                      LIMIT 1) AS sender_smtp,
+                    (SELECT outlook_messages.original_sender_smtp
+                     FROM outlook_attachments
+                     JOIN outlook_messages
+                       ON outlook_messages.source_key =
+                          outlook_attachments.message_key
+                     WHERE outlook_attachments.upload_id = cases.upload_id
+                     ORDER BY outlook_messages.received_at
+                     LIMIT 1) AS original_sender_smtp,
                     (SELECT outlook_messages.received_at
                      FROM outlook_attachments
                      JOIN outlook_messages
@@ -7950,11 +8019,12 @@ class WorkflowService:
                    OR taxpayer_names LIKE ?
                    OR taxpayer_inns LIKE ?
                    OR sender_smtp LIKE ?
+                   OR original_sender_smtp LIKE ?
                    OR outgoing_numbers LIKE ?
                    OR status LIKE ?
             """
             pattern = f"%{search}%"
-            search_parameters = (pattern,) * 8
+            search_parameters = (pattern,) * 9
         total_row = self.db.fetch_one(
             history_cte
             + f"SELECT COUNT(*) AS count FROM letter_history {where}",

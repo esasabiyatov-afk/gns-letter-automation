@@ -16,8 +16,13 @@ from gns_app.services.windows_focus import (
 
 
 WIA_SCANNER_DEVICE = 1
-WIA_TEXT_INTENT = 4
-WIA_MAXIMIZE_QUALITY = 131072
+# Не навязываем профиль поверх выбора в штатном окне WIA: цвет, DPI, лоток и
+# другие аппаратные параметры остаются за настройками драйвера.
+WIA_UNSPECIFIED_INTENT = 0
+# У WIA нет настройки физической скорости сканирования. Это единственный bias
+# в сторону меньшего (и обычно быстрее передаваемого) результата; фактическую
+# скорость всё равно определяет драйвер.
+WIA_MINIMIZE_SIZE = 65536
 WIA_FORMAT_PNG = "{B96B3CAF-0728-11D3-9D7B-0000F81EF32E}"
 
 
@@ -117,8 +122,8 @@ def _wia_worker(destination: Path) -> int:
         focus_next_dialog_for_current_process()
         image = dialog.ShowAcquireImage(
             WIA_SCANNER_DEVICE,
-            WIA_TEXT_INTENT,
-            WIA_MAXIMIZE_QUALITY,
+            WIA_UNSPECIFIED_INTENT,
+            WIA_MINIMIZE_SIZE,
             WIA_FORMAT_PNG,
             False,
             True,

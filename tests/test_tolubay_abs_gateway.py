@@ -99,6 +99,52 @@ def test_tolubay_gateway_distinguishes_questionnaire_from_absent_customer():
     assert client.account_requests == [("42", True)]
 
 
+def test_tolubay_gateway_reuses_one_authenticated_session():
+    client = StubTolubayClient()
+    adapter = gateway(client)
+    taxpayer = {"inn": "12345678901234", "name": "Клиент"}
+
+    first = adapter.check("employee", "one-time-secret", [taxpayer])
+    second = adapter.check("employee", "one-time-secret", [taxpayer])
+
+    assert first.status == AbsStatus.NOT_FOUND
+    assert second.status == AbsStatus.NOT_FOUND
+    assert client.login_count == 1
+
+
+def test_tolubay_gateway_clears_session_after_abs_error():
+    class ExpiringClient(StubTolubayClient):
+        def __init__(self):
+            super().__init__()
+            self.search_count = 0
+
+        def search_customers(self, criteria, *, page_size=50):
+            self.search_count += 1
+            if self.search_count > 1:
+                raise AuthenticationError("session expired")
+            return super().search_customers(criteria, page_size=page_size)
+
+    expired = ExpiringClient()
+    fresh = StubTolubayClient()
+    clients = iter([expired, fresh])
+    adapter = TolubayAbsGateway(
+        TolubayConfig(base_url="https://abs.example.test"),
+        client_factory=lambda config: next(clients),
+    )
+    taxpayer = {"inn": "12345678901234", "name": "Клиент"}
+
+    assert adapter.check(
+        "employee", "one-time-secret", [taxpayer]
+    ).status == AbsStatus.NOT_FOUND
+    failed = adapter.check("employee", "one-time-secret", [taxpayer])
+    recovered = adapter.check("employee", "one-time-secret", [taxpayer])
+
+    assert failed.status == AbsStatus.AUTH_ERROR
+    assert recovered.status == AbsStatus.NOT_FOUND
+    assert expired.login_count == 1
+    assert fresh.login_count == 1
+
+
 def test_tolubay_gateway_requires_one_exact_identity_match():
     inn = "12345678901234"
     client = StubTolubayClient(

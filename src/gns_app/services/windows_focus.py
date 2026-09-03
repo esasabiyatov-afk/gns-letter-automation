@@ -45,6 +45,14 @@ OUTLOOK_CERTIFICATE_PROBLEM_MARKERS = (
     "отсутствует отношение доверия",
     "корневом сертификате",
 )
+OUTLOOK_CERTIFICATE_YES_BUTTONS = frozenset(
+    {
+        "да",
+        "yes",
+        "продолжить",
+        "continue",
+    }
+)
 
 
 def focus_window_handle(hwnd: int) -> bool:
@@ -101,6 +109,14 @@ def _looks_like_outlook_certificate_warning(
         any(marker in normalized_title for marker in OUTLOOK_CERTIFICATE_TITLE_MARKERS)
         and any(marker in normalized_text for marker in OUTLOOK_CERTIFICATE_TEXT_MARKERS)
         and any(marker in normalized_text for marker in OUTLOOK_CERTIFICATE_PROBLEM_MARKERS)
+    )
+
+
+def _is_outlook_certificate_yes_button(text: str, control_id: int) -> bool:
+    normalized_text = text.replace("&", "").strip().casefold()
+    return (
+        control_id == IDYES
+        or normalized_text in OUTLOOK_CERTIFICATE_YES_BUTTONS
     )
 
 
@@ -168,7 +184,10 @@ def confirm_outlook_certificate_dialog_once() -> bool:
                 child_texts.append(text)
             if (
                 _window_class(user32, child).casefold() == "button"
-                and int(user32.GetDlgCtrlID(wintypes.HWND(child))) == IDYES
+                and _is_outlook_certificate_yes_button(
+                    text,
+                    int(user32.GetDlgCtrlID(wintypes.HWND(child))),
+                )
             ):
                 yes_buttons.append(int(child))
             return True

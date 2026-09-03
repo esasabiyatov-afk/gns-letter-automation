@@ -241,6 +241,9 @@
   document.querySelectorAll("[data-close-dialog]").forEach((button) => {
     button.addEventListener("click", () => button.closest("dialog")?.close());
   });
+  document.querySelectorAll("dialog[data-auto-open]").forEach((dialog) => {
+    if (!dialog.open) dialog.showModal();
+  });
 
   const inlineNumberForms = [
     ...document.querySelectorAll("form[data-inline-number-form]"),

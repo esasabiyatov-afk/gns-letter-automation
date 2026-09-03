@@ -1,4 +1,5 @@
 from gns_app.services.windows_focus import (
+    _is_outlook_certificate_yes_button,
     _looks_like_outlook_certificate_warning,
 )
 
@@ -43,3 +44,9 @@ def test_does_not_match_unrelated_confirmation_dialogs():
         "Предупреждение системы безопасности",
         ["Сертификат действителен."],
     )
+
+
+def test_russian_outlook_yes_button_is_recognized_without_standard_id():
+    assert _is_outlook_certificate_yes_button("Да", 1008)
+    assert _is_outlook_certificate_yes_button("&Yes", 1008)
+    assert not _is_outlook_certificate_yes_button("Нет", 1008)

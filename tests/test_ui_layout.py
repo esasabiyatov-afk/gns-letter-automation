@@ -403,7 +403,13 @@ def test_guided_tour_uses_safe_get_navigation_and_versioned_storage():
     assert ".click()" not in script[: script.index("const fileInput")]
 
 
-def test_response_ui_uses_compact_rows_without_expandable_cards():
+def test_created_response_card_reveals_all_saved_taxpayers(workflow, monkeypatch):
+    from html import unescape
+
+    from starlette.testclient import TestClient
+
+    from test_daily_batch import _insert_ready_case
+
     stylesheet = (Path(main.__file__).parent / "static" / "styles.css").read_text(
         encoding="utf-8"
     )
@@ -413,10 +419,36 @@ def test_response_ui_uses_compact_rows_without_expandable_cards():
 
     assert ".response-row" in stylesheet
     assert ".created-letter-line" in stylesheet
+    assert ".response-taxpayer-disclosure" in stylesheet
+    assert ".response-taxpayer-list" in stylesheet
     assert 'class="response-list"' in template
+    assert 'data-testid="created-response-taxpayer-disclosure"' in template
     assert 'class="action-menu"' in template
     assert "Подробнее" not in template
     assert "data-page-size" not in template
+
+    first_name = 'ОсОО "Первое лицо готового ответа"'
+    second_name = 'ОсОО "Второе лицо готового ответа"'
+    _insert_ready_case(workflow, "12345678901234", first_name)
+    _insert_ready_case(workflow, "23456789012345", second_name)
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    group = workflow.today_overview()["not_found_groups"][0]
+    workflow.generate_daily_response(group["group_key"], taxpayers_per_page=1)
+
+    generated_group = workflow.today_overview(view="created")["generated_groups"][0]
+    assert len(generated_group["letters"]) == 2
+    taxpayer_names = [item["name"] for item in generated_group["taxpayers"]]
+    assert len(taxpayer_names) == 2
+
+    monkeypatch.setattr(main, "workflow", workflow)
+    response = TestClient(main.app).get("/?tab=responses&response_view=created")
+
+    assert response.status_code == 200
+    assert response.text.count(
+        'data-testid="created-response-taxpayer-disclosure"'
+    ) == 1
+    rendered = unescape(response.text)
+    assert all(name in rendered for name in taxpayer_names)
 
 
 def test_response_menu_opens_one_combined_letter_page():

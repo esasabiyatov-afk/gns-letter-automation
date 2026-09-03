@@ -110,7 +110,7 @@ def test_today_batch_checks_and_groups_by_recipient(workflow):
     overview = workflow.today_overview()
 
     assert summary["case_count"] == 2
-    assert not workflow.abs_session_active()
+    assert workflow.abs_session_active()
     assert len(overview["not_found_groups"]) == 1
     group = overview["not_found_groups"][0]
     assert group["case_count"] == 2
@@ -515,6 +515,30 @@ def test_abs_session_reuses_credentials_only_in_memory(workflow):
     audit_text = "\n".join(event["payload_json"] for event in workflow.get_audit())
     assert "session-user" not in audit_text
     assert "session-secret" not in audit_text
+
+
+@pytest.mark.parametrize(
+    ("username", "password", "expected_status"),
+    [
+        ("session-user", "invalid", AbsStatus.AUTH_ERROR),
+        ("offline", "session-secret", AbsStatus.UNAVAILABLE),
+    ],
+)
+def test_abs_error_clears_session_and_requires_login(
+    workflow,
+    username,
+    password,
+    expected_status,
+):
+    case_id = _insert_ready_case(
+        workflow, "12345678901234", 'ОсОО "Клиент"'
+    )
+
+    result = workflow.check_abs(case_id, username, password)
+
+    assert result.status == expected_status
+    assert not workflow.abs_session_active()
+    assert workflow.abs_login_required()
 
 
 def test_real_abs_credentials_are_not_reused_between_checks(workflow):

@@ -35,6 +35,7 @@ from gns_app.diagnostics import (
     record_event,
     record_exception,
 )
+from gns_app.domain import AbsStatus
 from gns_app.services.storage import StorageError, ensure_within
 from gns_app.services.outlook_service import (
     OutlookInboxImporter,
@@ -454,6 +455,7 @@ def context(request: Request, **values):
         "employee_profiles": workflow.list_employee_profiles(),
         "ui_preferences": workflow.get_ui_preferences(),
         "abs_session_active": workflow.abs_session_active(),
+        "abs_login_required": False,
         "abs_session_supported": workflow.abs_session_supported(),
         "abs_is_fake": workflow.abs_is_fake(),
         "abs_tls_verification_disabled": (
@@ -496,6 +498,7 @@ def index(
     focus_letter: str = "",
     outgoing_start: str = "",
     undo_page_id: str = "",
+    abs_login: bool = False,
     message: str = "",
     error: str = "",
 ):
@@ -578,6 +581,9 @@ def index(
             outgoing_start=outgoing_start,
             active_letter=active_letter,
             active_group=active_group,
+            abs_login_required=(
+                abs_login or workflow.abs_login_required()
+            ),
         )
     return templates.TemplateResponse(
         request,
@@ -740,7 +746,7 @@ def settings_page(request: Request, message: str = "", error: str = ""):
             processing_workers=workflow.get_processing_workers(),
             outlook_status=outlook.last_result(),
             outlook_allowed_senders=", ".join(
-                sorted(outlook_importer.get_allowed_senders())
+                sorted(outlook_importer.get_forwarding_senders())
             ),
             outlook_import_since=outlook_importer.get_import_since().isoformat(),
             outlook_mailbox=outlook_importer.get_mailbox(),
@@ -798,7 +804,7 @@ def download_diagnostics():
 
 @app.post("/settings/outlook/check")
 def check_outlook_connection():
-    result = outlook.diagnose()
+    result = outlook.diagnose(mailbox=outlook_importer.get_mailbox())
     parameter = "message" if result.successful else "error"
     return RedirectResponse(
         f"/settings?{parameter}={quote(result.message)}#outlook",
@@ -808,7 +814,9 @@ def check_outlook_connection():
 
 @app.post("/settings/outlook/send-receive")
 def request_outlook_send_receive():
-    result = outlook.request_send_receive()
+    result = outlook.request_send_receive(
+        mailbox=outlook_importer.get_mailbox()
+    )
     parameter = "message" if result.successful else "error"
     return RedirectResponse(
         f"/settings?{parameter}={quote(result.message)}#outlook",
@@ -1046,6 +1054,14 @@ def abs_check_today(
         return RedirectResponse(
             "/?tab=responses&response_view=prepare&error="
             + quote(str(exc)),
+            status_code=303,
+        )
+    if summary["requires_login"]:
+        return RedirectResponse(
+            (
+                "/?tab=responses&response_view=prepare&abs_login=1&error="
+                + quote(summary["error_message"])
+            ),
             status_code=303,
         )
     return RedirectResponse(
@@ -2179,7 +2195,13 @@ def reopen_incomplete_case_review(case_id: str):
 
 
 @app.get("/cases/{case_id}", response_class=HTMLResponse)
-def case_detail(request: Request, case_id: str, message: str = "", error: str = ""):
+def case_detail(
+    request: Request,
+    case_id: str,
+    message: str = "",
+    error: str = "",
+    abs_login: bool = False,
+):
     case = workflow.get_case(case_id)
     if not case:
         raise HTTPException(404, "Обращение не найдено")
@@ -2218,6 +2240,19 @@ def case_detail(request: Request, case_id: str, message: str = "", error: str = 
             ),
             recipient_position_display=workflow.names.position_display(
                 case.get("recipient_position") or ""
+            ),
+            abs_login_required=(
+                abs_login
+                or (
+                    case.get("status") == "ready_for_abs"
+                    and case.get("abs_status")
+                    in {
+                        AbsStatus.AUTH_ERROR,
+                        AbsStatus.UNAVAILABLE,
+                        AbsStatus.TECHNICAL_ERROR,
+                    }
+                    and not workflow.abs_session_active()
+                )
             ),
             message=message,
             error=error,
@@ -2281,6 +2316,15 @@ def abs_check(
         message = result.message
         if result.is_fake:
             message += " Используется тестовая АБС."
+        if result.status in {
+            AbsStatus.AUTH_ERROR,
+            AbsStatus.UNAVAILABLE,
+            AbsStatus.TECHNICAL_ERROR,
+        }:
+            return RedirectResponse(
+                f"/cases/{case_id}?abs_login=1&error={quote(message)}",
+                status_code=303,
+            )
         return RedirectResponse(
             f"/cases/{case_id}?message={quote(message)}",
             status_code=303,
@@ -2424,6 +2468,10 @@ def run() -> None:
         port=8765,
         reload=False,
         access_log=False,
+        # Оконная portable-сборка не имеет stdout/stderr. Стандартная
+        # конфигурация Uvicorn пытается создать консольный formatter и падает
+        # ещё до запуска сервера.
+        log_config=None,
     )
 
 

@@ -31,7 +31,12 @@
       <article class="compact-list-row history-list-grid">
         <div class="history-received">
           <time>{{ (item.received_at or item.uploaded_at)[:16].replace('T', ' ') }}</time>
-          <small>{{ item.sender_smtp or 'Ручная загрузка' }}</small>
+          {% if item.original_sender_smtp %}
+            <small>Транспортный: {{ item.sender_smtp }}</small>
+            <small>Исходный: {{ item.original_sender_smtp }}</small>
+          {% else %}
+            <small>{{ item.sender_smtp or 'Ручная загрузка' }}</small>
+          {% endif %}
         </div>
         <div class="compact-primary">
           <strong title="{{ item.original_filename }}">{{ item.original_filename }}</strong>
