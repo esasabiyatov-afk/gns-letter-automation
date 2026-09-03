@@ -21,6 +21,7 @@ from gns_app.domain import (
     QrStatus,
 )
 from gns_app.services.workflow import WorkflowValidationError
+from gns_app.services.scanner_service import ScannerError
 from gns_app.services.outlook_service import (
     OutlookDraftResult,
     OutlookIntegrationError,
@@ -165,6 +166,37 @@ def test_same_inn_from_qr_and_manual_case_appears_once_in_response(workflow):
     assert document_text.count(name) == 1
 
 
+def test_personal_ip_prefix_difference_is_not_sent_to_manual_review(workflow):
+    inn = "12909198201284"
+    full_name = "Абдылдаева Анипахан Акматалиевна"
+    qr_case_id = _insert_ready_case(
+        workflow,
+        inn,
+        f"ИП {full_name}",
+        source_kind="qr_official",
+    )
+    manual_case_id = _insert_ready_case(
+        workflow,
+        inn,
+        full_name,
+        source_kind="manual",
+    )
+
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    overview = workflow.today_overview()
+
+    assert not workflow.list_case_match_reviews()
+    assert overview["unresolved_matches"] == 0
+    assert len(overview["not_found_groups"]) == 1
+    group = overview["not_found_groups"][0]
+    assert group["case_count"] == 2
+    assert group["taxpayer_count"] == 1
+    assert group["taxpayers"][0]["name"] == f"ИП {full_name}"
+    assert group["can_generate"]
+    assert workflow.get_taxpayers(qr_case_id)[0]["name"] == f"ИП {full_name}"
+    assert workflow.get_taxpayers(manual_case_id)[0]["name"] == full_name
+
+
 def test_same_inn_with_different_names_blocks_response(workflow):
     inn = "12345678901234"
     _insert_ready_case(
@@ -181,12 +213,269 @@ def test_same_inn_with_different_names_blocks_response(workflow):
     )
 
     workflow.check_abs_today("batch-user", "one-time-secret")
-    groups = workflow.today_overview()["not_found_groups"]
+    overview = workflow.today_overview()
+    reviews = workflow.list_case_match_reviews()
 
+    assert not overview["not_found_groups"]
+    assert overview["unresolved_matches"] == 1
+    assert len(reviews) == 1
+    assert reviews[0]["differing_field"] == "name"
+    assert reviews[0]["left"]["taxpayer"]["inn"] == inn
+    assert reviews[0]["right"]["taxpayer"]["inn"] == inn
+    assert workflow.get_case(reviews[0]["left_case_id"])["status"] == (
+        CaseStatus.NEEDS_REVIEW
+    )
+    assert workflow.get_case(reviews[0]["right_case_id"])["status"] == (
+        CaseStatus.NEEDS_REVIEW
+    )
+
+
+def test_manual_name_correction_resolves_group_conflict(workflow):
+    inn = "12345678901234"
+    expected_name = 'ОсОО "Название из письма"'
+    _insert_ready_case(workflow, inn, expected_name)
+    corrected_case_id = _insert_ready_case(
+        workflow,
+        inn,
+        'ОсОО "Ошибочное название"',
+        source_kind="manual",
+    )
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    taxpayer = workflow.get_taxpayers(corrected_case_id)[0]
+
+    result = workflow.correct_taxpayer(
+        corrected_case_id,
+        taxpayer["id"],
+        name=expected_name,
+        inn=inn,
+        actor="Гапарова Э.",
+    )
+
+    assert result == {
+        "changed_fields": ["name"],
+        "requires_abs_recheck": False,
+    }
+    updated = workflow.get_taxpayers(corrected_case_id)[0]
+    assert updated["name"] == expected_name
+    assert updated["name_source"] == "manual"
+    assert updated["abs_result"] == AbsStatus.NOT_FOUND
+    group = workflow.today_overview()["not_found_groups"][0]
+    assert group["can_generate"]
+    assert not group["issues"]
+    assert any(
+        event["event_type"] == "taxpayer_manually_corrected"
+        for event in workflow.get_audit()
+    )
+
+
+def test_manual_inn_correction_requires_new_abs_check(workflow):
+    case_id = _insert_ready_case(
+        workflow,
+        "12345678901234",
+        'ОсОО "Налогоплательщик"',
+    )
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    taxpayer = workflow.get_taxpayers(case_id)[0]
+
+    result = workflow.correct_taxpayer(
+        case_id,
+        taxpayer["id"],
+        name=taxpayer["name"],
+        inn="99999999999999",
+    )
+
+    assert result["requires_abs_recheck"]
+    assert workflow.get_case(case_id)["status"] == CaseStatus.READY_FOR_ABS
+    assert workflow.get_case(case_id)["abs_status"] == AbsStatus.NOT_CHECKED
+    updated = workflow.get_taxpayers(case_id)[0]
+    assert updated["inn"] == "99999999999999"
+    assert updated["inn_source"] == "manual"
+    assert updated["abs_result"] is None
+
+
+def test_structured_conflict_resolution_uses_explicit_field_sources(workflow):
+    inn = "12345678901234"
+    expected_name = 'ОсОО "Название из QR"'
+    first_case_id = _insert_ready_case(
+        workflow,
+        inn,
+        expected_name,
+        source_kind="qr_official",
+    )
+    second_case_id = _insert_ready_case(
+        workflow,
+        inn,
+        'ОсОО "Другое название"',
+        source_kind="manual",
+    )
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    workflow.today_overview()
+    review = workflow.list_case_match_reviews()[0]
+    chosen = (
+        review["left"]
+        if review["left_case_id"] == first_case_id
+        else review["right"]
+    )["taxpayer"]
+
+    result = workflow.resolve_case_match_review(
+        review["id"],
+        decision="same",
+        name_choice=chosen["id"],
+        inn_choice=chosen["id"],
+        actor="Гапарова Э.",
+    )
+
+    assert result["decision"] == "same"
+    assert not result["requires_abs_recheck"]
+    for case_id in (first_case_id, second_case_id):
+        taxpayer = workflow.get_taxpayers(case_id)[0]
+        assert taxpayer["name"] == expected_name
+        assert taxpayer["inn"] == inn
+        assert taxpayer["name_source"] == "qr_official"
+        assert taxpayer["name_source_reference"] == (
+            f"taxpayer:{chosen['id']}"
+        )
+        assert taxpayer["abs_result"] == AbsStatus.NOT_FOUND
+    updated_group = workflow.today_overview()["not_found_groups"][0]
+    assert updated_group["can_generate"]
+    assert not updated_group["conflicts"]
+
+
+def test_structured_conflict_manual_inn_resets_all_affected_cases(workflow):
+    original_inn = "12345678901234"
+    new_inn = "99999999999999"
+    first_case_id = _insert_ready_case(
+        workflow,
+        original_inn,
+        'ОсОО "Первый вариант"',
+    )
+    second_case_id = _insert_ready_case(
+        workflow,
+        original_inn,
+        'ОсОО "Второй вариант"',
+        source_kind="manual",
+    )
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    workflow.today_overview()
+    review = workflow.list_case_match_reviews()[0]
+    chosen_name = review["left"]["taxpayer"]
+
+    result = workflow.resolve_case_match_review(
+        review["id"],
+        decision="same",
+        name_choice=chosen_name["id"],
+        inn_choice="manual",
+        manual_inn=new_inn,
+    )
+
+    assert result["requires_abs_recheck"]
+    assert result["recheck_case_ids"] == sorted(
+        [first_case_id, second_case_id]
+    )
+    for case_id in (first_case_id, second_case_id):
+        case = workflow.get_case(case_id)
+        taxpayer = workflow.get_taxpayers(case_id)[0]
+        # В тестовом режиме повторная АБС запускается сразу после явного
+        # подтверждения сотрудника.
+        assert case["status"] == CaseStatus.READY_FOR_RESPONSE
+        assert case["abs_status"] == AbsStatus.NOT_FOUND
+        assert taxpayer["inn"] == new_inn
+        assert taxpayer["inn_source"] == "manual"
+        assert taxpayer["inn_source_reference"] is None
+        assert taxpayer["abs_result"] == AbsStatus.NOT_FOUND
+
+
+def test_late_qr_variance_creates_a_new_manual_confirmation(workflow):
+    inn = "12345678901234"
+    first_case_id = _insert_ready_case(
+        workflow,
+        inn,
+        'ОсОО "Подтверждённое название"',
+        source_kind="manual",
+    )
+    second_case_id = _insert_ready_case(
+        workflow,
+        inn,
+        'ОсОО "Ручной вариант"',
+        source_kind="manual",
+    )
+    workflow.reconcile_case_match_reviews()
+    first_review = workflow.list_case_match_reviews()[0]
+    chosen = first_review["left"]["taxpayer"]
+    workflow.resolve_case_match_review(
+        first_review["id"],
+        decision="same",
+        name_choice=chosen["id"],
+        inn_choice=chosen["id"],
+    )
+    assert not workflow.list_case_match_reviews()
+
+    # Официальная версия пришла позже и снова изменила подтверждённое поле.
+    qr_case_id = second_case_id
+    qr_taxpayer = workflow.get_taxpayers(qr_case_id)[0]
+    workflow.db.execute(
+        """
+        UPDATE cases
+        SET source_kind = 'qr_official', official_parse_version = 2,
+            status = 'ready_for_response', updated_at = ?
+        WHERE id = ?
+        """,
+        (utc_now(), qr_case_id),
+    )
+    workflow.db.execute(
+        """
+        UPDATE taxpayers
+        SET name = 'ОсОО "Название из позднего QR"',
+            name_source = 'qr_official', updated_at = ?
+        WHERE id = ?
+        """,
+        (utc_now(), qr_taxpayer["id"]),
+    )
+
+    assert workflow.reconcile_case_match_reviews() == 1
+    second_review = workflow.list_case_match_reviews()[0]
+    assert second_review["id"] != first_review["id"]
+    assert second_review["differing_field"] == "name"
+    assert workflow.get_case(first_case_id)["status"] == CaseStatus.NEEDS_REVIEW
+    assert workflow.get_case(second_case_id)["status"] == CaseStatus.NEEDS_REVIEW
+    assert not workflow.today_overview()["not_found_groups"]
+
+
+def test_same_name_with_different_inn_is_blocked_until_confirmation(workflow):
+    name = 'ОсОО "Одинаковое название"'
+    _insert_ready_case(workflow, "12345678901234", name)
+    _insert_ready_case(workflow, "99999999999999", name, source_kind="manual")
+
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    assert not workflow.today_overview()["not_found_groups"]
+    review = workflow.list_case_match_reviews()[0]
+    assert review["differing_field"] == "inn"
+    assert "отличается ИНН" in review["issue_message"]
+
+
+def test_distinct_decision_restores_both_versions_without_requeue(workflow):
+    inn = "12345678901234"
+    _insert_ready_case(workflow, inn, 'ОсОО "Первое лицо"')
+    _insert_ready_case(
+        workflow,
+        inn,
+        'ОсОО "Второе лицо"',
+        source_kind="manual",
+    )
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    workflow.today_overview()
+    review = workflow.list_case_match_reviews()[0]
+
+    result = workflow.resolve_case_match_review(
+        review["id"], decision="distinct"
+    )
+
+    assert result["decision"] == "distinct"
+    assert not workflow.list_case_match_reviews()
+    groups = workflow.today_overview()["not_found_groups"]
     assert len(groups) == 1
-    assert groups[0]["taxpayer_count"] == 1
-    assert not groups[0]["can_generate"]
-    assert any(inn in issue for issue in groups[0]["issues"])
+    assert groups[0]["can_generate"]
+    assert groups[0]["taxpayer_count"] == 2
 
 
 def test_same_inn_for_another_recipient_stays_in_separate_response(workflow):
@@ -458,6 +747,93 @@ def test_batch_outgoing_numbers_are_previewed_assigned_and_written_to_word(
     assert all(event["actor"] == "Тестовый сотрудник" for event in events)
 
 
+def test_batch_outgoing_numbers_can_start_from_an_inline_letter_suffix(
+    workflow,
+):
+    for index in range(1, 9):
+        _insert_ready_case(
+            workflow,
+            f"{index:014d}",
+            f'ОсОО "Тест {index}"',
+        )
+
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    group = workflow.today_overview()["not_found_groups"][0]
+    group_id, output = workflow.generate_daily_response(
+        group["group_key"], taxpayers_per_page=2
+    )
+    letters = workflow.db.fetch_all(
+        "SELECT * FROM response_letters WHERE response_group_id = ? "
+        "ORDER BY letter_order",
+        (group_id,),
+    )
+    workflow.set_outgoing_number(letters[2]["id"], "7000")
+
+    summary = workflow.assign_outgoing_numbers(
+        "9544",
+        [letters[1]["id"], letters[3]["id"]],
+        actor="Тестовый сотрудник",
+    )
+
+    assert summary["letter_count"] == 2
+    refreshed = workflow.db.fetch_all(
+        "SELECT outgoing_number FROM response_letters "
+        "WHERE response_group_id = ? ORDER BY letter_order",
+        (group_id,),
+    )
+    assert [letter["outgoing_number"] for letter in refreshed] == [
+        None,
+        "9544",
+        "7000",
+        "9545",
+    ]
+    document_text = "\n".join(
+        paragraph.text for paragraph in Document(output).paragraphs
+    )
+    assert "04-1/9544" in document_text
+    assert "04-1/7000" in document_text
+    assert "04-1/9545" in document_text
+
+
+def test_batch_outgoing_numbers_reject_non_contiguous_inline_selection(
+    workflow,
+):
+    for index in range(1, 7):
+        _insert_ready_case(
+            workflow,
+            f"{index:014d}",
+            f'ОсОО "Тест {index}"',
+        )
+
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    group = workflow.today_overview()["not_found_groups"][0]
+    group_id, _ = workflow.generate_daily_response(
+        group["group_key"], taxpayers_per_page=2
+    )
+    letters = workflow.db.fetch_all(
+        "SELECT * FROM response_letters WHERE response_group_id = ? "
+        "ORDER BY letter_order",
+        (group_id,),
+    )
+
+    with pytest.raises(WorkflowValidationError):
+        workflow.assign_outgoing_numbers(
+            "9544",
+            [letters[0]["id"], letters[2]["id"]],
+        )
+
+    refreshed = workflow.db.fetch_all(
+        "SELECT outgoing_number FROM response_letters "
+        "WHERE response_group_id = ? ORDER BY letter_order",
+        (group_id,),
+    )
+    assert [letter["outgoing_number"] for letter in refreshed] == [
+        None,
+        None,
+        None,
+    ]
+
+
 def test_outgoing_number_correction_is_unique_and_regenerates_word(workflow):
     _insert_ready_case(workflow, "12345678901234", 'ОсОО "Первый"')
     workflow.check_abs_today("batch-user", "one-time-secret")
@@ -512,7 +888,7 @@ def test_outgoing_number_cannot_be_reused_for_another_letter(workflow):
         workflow.set_outgoing_number(letters[1]["id"], "9544")
 
 
-def test_today_page_previews_and_confirms_outgoing_number_range(
+def test_created_responses_assign_numbers_from_the_inline_letter_field(
     workflow, monkeypatch
 ):
     from starlette.testclient import TestClient
@@ -527,11 +903,17 @@ def test_today_page_previews_and_confirms_outgoing_number_range(
     monkeypatch.setattr(main, "workflow", workflow)
     client = TestClient(main.app)
 
-    preview = client.get("/today?outgoing_start=9544")
+    page = client.get("/?tab=responses&response_view=created")
 
-    assert preview.status_code == 200
-    assert "Будут заняты номера 9544–9544" in preview.text
-    assert "Подтвердить и вставить номера в Word" in preview.text
+    assert page.status_code == 200
+    assert 'class="number-sequence-bar"' not in page.text
+    assert 'data-number-sequence-start' not in page.text
+    assert (
+        f'data-inline-number-form data-letter-id="{letter["id"]}"'
+        in page.text
+    )
+    assert 'data-inline-number-input' in page.text
+    assert "Первый свободный исх. №" not in page.text
 
     assigned = client.post(
         "/today/outgoing-numbers/assign",
@@ -545,6 +927,66 @@ def test_today_page_previews_and_confirms_outgoing_number_range(
         (letter["id"],),
     )
     assert refreshed["outgoing_number"] == "9544"
+
+
+def test_created_responses_number_old_unfinished_backlog(
+    workflow, monkeypatch
+):
+    from starlette.testclient import TestClient
+
+    from gns_app import main
+
+    _insert_ready_case(workflow, "12345678901234", 'ОсОО "Старое письмо"')
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    group = workflow.today_overview()["not_found_groups"][0]
+    group_id, _ = workflow.generate_daily_response(group["group_key"])
+    workflow.db.execute(
+        "UPDATE response_groups SET business_date = ? WHERE id = ?",
+        ("2000-01-01", group_id),
+    )
+    letter = workflow.list_outgoing_letters(only_unnumbered=True)[0]
+    monkeypatch.setattr(main, "workflow", workflow)
+
+    page = TestClient(main.app).get(
+        "/?tab=responses&response_view=created"
+    )
+
+    assert page.status_code == 200
+    assert 'class="number-sequence-bar"' not in page.text
+    assert (
+        f'data-inline-number-form data-letter-id="{letter["id"]}"'
+        in page.text
+    )
+
+
+def test_created_responses_do_not_open_scan_drawer_without_explicit_focus(
+    workflow,
+    monkeypatch,
+):
+    from starlette.testclient import TestClient
+
+    from gns_app import main
+
+    _, letter = _ready_response_letter(workflow)
+    workflow.start_signed_scan_session(letter["id"])
+    monkeypatch.setattr(main, "workflow", workflow)
+    client = TestClient(main.app)
+
+    closed = client.get("/?tab=responses&response_view=created")
+    opened = client.get(
+        "/?tab=responses&response_view=created"
+        f"&focus_letter={letter['id']}"
+    )
+    unknown = client.get(
+        "/?tab=responses&response_view=created&focus_letter=missing"
+    )
+
+    assert closed.status_code == 200
+    assert 'id="letter-workflow"' not in closed.text
+    assert opened.status_code == 200
+    assert 'id="letter-workflow"' in opened.text
+    assert unknown.status_code == 200
+    assert 'id="letter-workflow"' not in unknown.text
 
 
 def test_outgoing_number_preview_rejects_range_overflow(
@@ -698,6 +1140,149 @@ def test_device_scan_is_registered_through_wia_gateway(workflow, monkeypatch):
     assert scan["status"] == "needs_confirmation"
 
 
+def test_multi_page_wia_session_builds_one_pdf(workflow, monkeypatch):
+    _, letter = _ready_response_letter(workflow)
+    acquired = 0
+
+    def fake_acquire(destination, timeout_seconds=900):
+        nonlocal acquired
+        acquired += 1
+        color = "white" if acquired == 1 else "lightgray"
+        Image.new("RGB", (620, 877), color).save(destination, "PNG")
+        return destination
+
+    monkeypatch.setattr(workflow.scanner, "acquire_a4", fake_acquire)
+    session = workflow.start_signed_scan_session(
+        letter["id"], actor="Тестовый сотрудник"
+    )
+    first = workflow.acquire_signed_scan_session_page(session["id"])
+    second = workflow.acquire_signed_scan_session_page(session["id"])
+
+    assert first["page_count"] == 1
+    assert second["page_count"] == 2
+    assert all(
+        Path(page["original_path"]).is_file() for page in second["pages"]
+    )
+
+    scan = workflow.finalize_signed_scan_session(
+        session["id"], actor="Тестовый сотрудник"
+    )
+
+    assert scan["source"] == "wia"
+    assert scan["page_count"] == 2
+    assert len(PdfReader(scan["pdf_path"]).pages) == 2
+    completed = workflow.get_signed_scan_session(session["id"])
+    assert completed["status"] == "completed"
+    assert completed["result_scan_id"] == scan["id"]
+    assert Path(scan["original_path"]).is_file()
+
+
+def test_wia_session_error_keeps_previous_pages_and_can_resume(
+    workflow,
+    monkeypatch,
+):
+    _, letter = _ready_response_letter(workflow)
+    calls = 0
+
+    def flaky_acquire(destination, timeout_seconds=900):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ScannerError("Тестовая ошибка сканера")
+        Image.new("RGB", (620, 877), "white").save(destination, "PNG")
+        return destination
+
+    monkeypatch.setattr(workflow.scanner, "acquire_a4", flaky_acquire)
+    session = workflow.start_signed_scan_session(letter["id"])
+    workflow.acquire_signed_scan_session_page(session["id"])
+
+    with pytest.raises(ScannerError, match="Тестовая ошибка"):
+        workflow.acquire_signed_scan_session_page(session["id"])
+
+    failed = workflow.get_signed_scan_session(session["id"])
+    assert failed["status"] == "technical_error"
+    assert failed["page_count"] == 1
+    assert len(failed["pages"]) == 1
+
+    resumed = workflow.acquire_signed_scan_session_page(session["id"])
+    assert resumed["status"] == "collecting"
+    assert resumed["error_message"] is None
+    assert resumed["page_count"] == 2
+
+
+def test_wia_session_reorders_replaces_and_removes_pages(workflow, monkeypatch):
+    _, letter = _ready_response_letter(workflow)
+    acquired = 0
+
+    def fake_acquire(destination, timeout_seconds=900):
+        nonlocal acquired
+        acquired += 1
+        Image.new("RGB", (620, 877), (acquired, acquired, acquired)).save(
+            destination,
+            "PNG",
+        )
+        return destination
+
+    monkeypatch.setattr(workflow.scanner, "acquire_a4", fake_acquire)
+    session = workflow.start_signed_scan_session(letter["id"])
+    workflow.acquire_signed_scan_session_page(session["id"])
+    current = workflow.acquire_signed_scan_session_page(session["id"])
+    first_id, second_id = [page["id"] for page in current["pages"]]
+
+    moved = workflow.move_signed_scan_session_page(
+        session["id"], second_id, "up"
+    )
+    assert [page["id"] for page in moved["pages"]] == [second_id, first_id]
+
+    replaced = workflow.acquire_signed_scan_session_page(
+        session["id"], replace_page_id=second_id
+    )
+    replacement_id = replaced["pages"][0]["id"]
+    assert replacement_id != second_id
+    removed_raw = workflow.db.fetch_one(
+        "SELECT * FROM signed_scan_session_pages WHERE id = ?",
+        (second_id,),
+    )
+    assert removed_raw["status"] == "removed"
+    assert Path(removed_raw["original_path"]).is_file()
+
+    remaining = workflow.remove_signed_scan_session_page(
+        session["id"], replacement_id
+    )
+    assert remaining["page_count"] == 1
+    assert [page["page_order"] for page in remaining["pages"]] == [1]
+
+
+def test_cancelled_wia_session_does_not_create_or_supersede_scan(workflow):
+    _, letter = _ready_response_letter(workflow)
+    existing = workflow.register_signed_response_scan(
+        letter["id"], "existing.png", _png_scan()
+    )
+    session = workflow.start_signed_scan_session(letter["id"])
+
+    workflow.cancel_signed_scan_session(session["id"])
+
+    assert workflow.get_signed_scan_session(session["id"])["status"] == "cancelled"
+    assert workflow.get_signed_response_scan(existing["id"])["status"] == (
+        "needs_confirmation"
+    )
+
+
+def test_ready_file_upload_closes_unfinished_wia_session(workflow):
+    _, letter = _ready_response_letter(workflow)
+    session = workflow.start_signed_scan_session(letter["id"])
+
+    scan = workflow.register_signed_response_scan(
+        letter["id"], "ready-from-mfu.png", _png_scan()
+    )
+
+    assert scan["status"] == "needs_confirmation"
+    assert workflow.get_signed_scan_session(session["id"])["status"] == (
+        "cancelled"
+    )
+    assert workflow.get_active_signed_scan_session(letter["id"]) is None
+
+
 def test_signed_scan_upload_and_confirmation_routes(workflow, monkeypatch):
     from starlette.testclient import TestClient
 
@@ -723,30 +1308,30 @@ def test_signed_scan_upload_and_confirmation_routes(workflow, monkeypatch):
     preview = client.get(f"/signed-response-scans/{scan['id']}")
     assert preview.status_code == 200
     assert preview.headers["content-type"] == "application/pdf"
+    assert "content-disposition" not in preview.headers
 
-    incomplete = client.post(
-        f"/signed-response-scans/{scan['id']}/confirm",
-        data={
-            "group_id": group_id,
-            "correct_letter": "true",
-            "signature_present": "true",
-        },
-        follow_redirects=False,
+    drawer = client.get(
+        "/?tab=responses&response_view=created"
+        f"&focus_letter={letter['id']}"
     )
-    assert incomplete.status_code == 303
-    assert workflow.get_signed_response_scan(scan["id"])["status"] == "needs_confirmation"
+    assert drawer.status_code == 200
+    assert (
+        f'src="/signed-response-scans/{scan["id"]}'
+        '#page=1&amp;zoom=page-fit"' in drawer.text
+    )
+    assert "Открыть PDF" not in drawer.text
+    assert 'type="checkbox"' not in drawer.text
 
     confirmed = client.post(
         f"/signed-response-scans/{scan['id']}/confirm",
-        data={
-            "group_id": group_id,
-            "correct_letter": "true",
-            "signature_present": "true",
-            "bank_seal_present": "true",
-        },
+        data={"group_id": group_id},
         follow_redirects=False,
     )
     assert confirmed.status_code == 303
+    assert confirmed.headers["location"].startswith(
+        "/?tab=responses&response_view=created"
+        f"&focus_letter={letter['id']}&message="
+    )
     assert workflow.get_signed_response_scan(scan["id"])["status"] == "confirmed"
 
 
@@ -860,6 +1445,37 @@ def test_found_abs_questionnaire_waits_for_manual_account_result(workflow):
     assert workflow.get_case(case_id)["status"] == "ready_for_response"
 
 
+def test_abs_account_task_moves_to_manual_response_without_duplicate(workflow):
+    case_id = _insert_ready_case(
+        workflow, "12345678901234", 'ОсОО "Первый"'
+    )
+    workflow.db.execute(
+        "UPDATE taxpayers SET abs_result = 'found' WHERE case_id = ?",
+        (case_id,),
+    )
+    workflow.db.execute(
+        "UPDATE cases SET status = 'needs_review', abs_status = 'found' "
+        "WHERE id = ?",
+        (case_id,),
+    )
+
+    before = workflow.manual_review_overview()
+    assert len(before["account_groups"]) == 1
+    assert not workflow.manual_response_groups()
+
+    workflow.confirm_abs_account_taxpayer(
+        case_id,
+        "12345678901234",
+        "found",
+    )
+
+    after = workflow.manual_review_overview()
+    manual = workflow.manual_response_groups()
+    assert not after["account_groups"]
+    assert len(manual) == 1
+    assert manual[0]["taxpayers"][0]["source_case_id"] == case_id
+
+
 def test_real_abs_account_counts_are_persisted_without_auto_confirmation(
     workflow, monkeypatch
 ):
@@ -909,16 +1525,17 @@ def test_real_abs_account_counts_are_persisted_without_auto_confirmation(
     assert overview_taxpayer["abs_active_account_count"] == 2
     assert overview_taxpayer["abs_closed_account_count"] == 1
     monkeypatch.setattr(main, "workflow", workflow)
-    response = TestClient(main.app).get("/today")
+    response = TestClient(main.app).get("/?tab=review")
     assert response.status_code == 200
     visible_text = " ".join(
         BeautifulSoup(response.text, "html.parser")
         .get_text(" ", strip=True)
         .split()
     )
-    assert "АБС прочитала счета: активных — 2, закрытых — 1." in visible_text
-    assert "Есть счёт" in response.text
-    assert "Счёта нет" in response.text
+    assert "Активных счетов: 2 · закрытых: 1" in visible_text
+    assert "Расчётный счёт" in response.text
+    assert 'name="account_result" value="found"' in response.text
+    assert 'name="account_result" value="not_found"' in response.text
 
 
 def test_found_abs_questionnaire_with_account_stays_manual(workflow):

@@ -1,11 +1,18 @@
 {% extends "base.html" %}
 {% block title %}Обращение · ГНС{% endblock %}
+{% block body_class %}case-workspace-page{% endblock %}
 {% block content %}
 <div class="page-heading">
   <div>
     <div class="breadcrumb-links">
-      <a class="back-link" href="/today">← Готовые ответы</a>
-      <a class="back-link" href="/cases">Все обращения</a>
+      {% if request.query_params.get('return_to') == 'responses' %}
+        <a class="back-link" href="/?tab=responses&amp;response_view=prepare">← Ответы</a>
+      {% elif request.query_params.get('return_to') == 'history' %}
+        <a class="back-link" href="/history">← История писем</a>
+      {% else %}
+        <a class="back-link" href="/?tab=review">← Проверка</a>
+      {% endif %}
+      <a class="back-link" href="/history">История писем</a>
     </div>
     <p class="eyebrow">КАРТОЧКА ОБРАЩЕНИЯ</p>
     <h1>{{ case.recipient_display_name or 'Не завершено' }}</h1>
@@ -17,8 +24,37 @@
 {% if message %}<div class="alert alert-success">{{ message }}</div>{% endif %}
 {% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
 
+<div class="case-workspace" data-testid="case-workspace">
+  <section class="case-document-viewer" data-testid="case-source-document">
+    <div class="case-document-toolbar">
+      <div>
+        <p class="eyebrow">ИСХОДНОЕ ПИСЬМО</p>
+        <strong title="{{ source_upload.original_filename if source_upload else 'Исходный PDF' }}">
+          {{ source_upload.original_filename if source_upload else 'Исходный PDF' }}
+        </strong>
+      </div>
+      {% if source_page %}
+        <span>Страница {{ source_page.page_number }}</span>
+      {% endif %}
+    </div>
+    {% if source_page %}
+      <iframe
+        data-testid="case-source-pdf"
+        src="/pages/{{ source_page.id }}/pdf#page=1&zoom=page-fit"
+        title="Исходное письмо, страница {{ source_page.page_number }}">
+      </iframe>
+    {% else %}
+      <div class="empty-state case-document-missing">
+        <strong>Исходный лист не найден</strong>
+        <span>Данные обращения доступны справа.</span>
+      </div>
+    {% endif %}
+  </section>
+
+  <section class="case-content-pane" data-testid="case-sidebar"
+           aria-label="Данные и действия обращения">
 <div class="case-grid">
-  <section class="panel">
+  <section class="panel" data-testid="case-details">
     <p class="eyebrow">ПИСЬМО</p>
     <h2>
       {% if case.source_kind == 'qr_official' %}
@@ -28,11 +64,9 @@
       {% endif %}
     </h2>
     <dl class="detail-list">
-      <div><dt>Район и место</dt><dd>{{ case.district_place or '—' }}</dd></div>
       <div><dt>Должность в письме</dt><dd>{{ case.recipient_position or '—' }}</dd></div>
       <div><dt>Должность в ответе</dt><dd>{{ recipient_position_display or '—' }}</dd></div>
       <div><dt>Полное ФИО</dt><dd>{{ case.recipient_full_name or '—' }}</dd></div>
-      <div><dt>Обращение</dt><dd>{{ case.recipient_display_name or '—' }}</dd></div>
       <div><dt>Период</dt><dd>
         {% if case.period_start and case.period_end %}
           {{ case.period_start }} — {{ case.period_end }}
@@ -47,7 +81,7 @@
     </dl>
   </section>
 
-  <section class="panel">
+  <section class="panel" data-testid="case-taxpayers">
     <p class="eyebrow">НАЛОГОПЛАТЕЛЬЩИКИ</p>
     <h2>{{ taxpayers|length }} {{ taxpayer_word(taxpayers|length) }}</h2>
     <div class="taxpayer-cards">
@@ -100,7 +134,7 @@
   </section>
 </div>
 
-<section class="action-panel">
+<section class="action-panel" data-testid="case-primary-action">
   <div>
     <p class="eyebrow">СЛЕДУЮЩЕЕ ДЕЙСТВИЕ</p>
     {% if case.status == 'needs_review'
@@ -150,7 +184,12 @@
     {% endif %}
   </div>
   <div class="action-buttons">
-    {% if case.status == 'needs_review'
+    {% if case.status in ['needs_review', 'technical_error']
+          and not case.fields_confirmed %}
+      <form method="post" action="/cases/{{ case.id }}/reopen-review">
+        <button class="button button-primary" type="submit">Исправить данные</button>
+      </form>
+    {% elif case.status == 'needs_review'
           and registry_needs_confirmation %}
       <form method="post"
             action="/cases/{{ case.id }}/registry/accept">
@@ -169,7 +208,7 @@
         </button>
       {% endif %}
     {% elif case.status == 'ready_for_response' %}
-      <a class="button button-primary" href="/today">
+      <a class="button button-primary" href="/?tab=responses&amp;response_view=prepare">
         Открыть общие ответы
       </a>
     {% elif case.status == 'response_created' %}
@@ -223,6 +262,9 @@
   </div>
 </section>
 {% endif %}
+
+  </section>
+</div>
 
 <dialog id="abs-dialog" class="modal">
   <form method="post" action="/cases/{{ case.id }}/abs" autocomplete="off">

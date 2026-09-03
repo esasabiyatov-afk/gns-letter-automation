@@ -1,18 +1,70 @@
 {% extends "base.html" %}
 {% block title %}Ручная проверка · ГНС{% endblock %}
+{% block body_class %}workspace-page{% endblock %}
 {% block content %}
 <div class="page-heading">
   <div>
     <p class="eyebrow">ОЧЕРЕДЬ СОТРУДНИКА</p>
-    <h1>Проблемные страницы</h1>
-    <p>Исправьте только выделенные страницы. Затем обработка продолжится.</p>
+    <h1>Ручная проверка</h1>
+    <p>Подтвердите совпадения и исправьте только проблемные страницы.</p>
   </div>
-  <span class="count-pill">{{ pages|length }}</span>
+  <span class="count-pill">{{ review_count }}</span>
 </div>
 {% if message %}<div class="alert alert-success">{{ message }}</div>{% endif %}
 {% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
 
+{% if match_reviews %}
+<section class="review-section">
+  <div class="review-section-heading">
+    <div>
+      <p class="eyebrow">СОВПАДЕНИЯ ОБРАЩЕНИЙ</p>
+      <h2>Нужно подтверждение</h2>
+    </div>
+    <span class="count-pill">{{ match_reviews|length }}</span>
+  </div>
+  <div class="match-review-list">
+  {% for review in match_reviews %}
+    <article class="match-review-row">
+      <div class="match-review-summary">
+        <strong>Это одно и то же обращение?</strong>
+        <p>{{ review.issue_message }}</p>
+      </div>
+      <div class="match-review-sources">
+        {% for source in [review.left, review.right] %}
+        <div class="match-review-source">
+          {% if source.source_page_id %}
+            <a class="review-thumb" href="/pages/{{ source.source_page_id }}/pdf"
+               target="_blank">
+              <img src="/pages/{{ source.source_page_id }}/image"
+                   alt="Лист {{ source.source_page_number }}">
+            </a>
+          {% endif %}
+          <div>
+            <small>{{ source_labels.get(source.source_kind, source.source_kind) }}</small>
+            <strong>{{ source.taxpayer.name }}</strong>
+            <span>ИНН {{ source.taxpayer.inn }}</span>
+            <small>{{ source.original_filename }}{% if source.source_page_number %} · лист {{ source.source_page_number }}{% endif %}</small>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      <a class="button button-primary"
+         href="/review/matches/{{ review.id }}">Сравнить</a>
+    </article>
+  {% endfor %}
+  </div>
+</section>
+{% endif %}
+
 {% if pages %}
+<section class="review-section">
+  <div class="review-section-heading">
+    <div>
+      <p class="eyebrow">СТРАНИЦЫ</p>
+      <h2>Проверить данные</h2>
+    </div>
+    <span class="count-pill">{{ pages|length }}</span>
+  </div>
 <section class="review-list">
 {% for page in pages %}
   <article class="review-row">
@@ -24,9 +76,9 @@
       {% endif %}
     </a>
     <div class="review-info">
-      <p class="eyebrow">{{ page.original_filename }}</p>
+      <p class="review-file">{{ page.original_filename }}</p>
       <h2>Страница {{ page.page_number }}</h2>
-      <p>{{ page.issue_message or 'Нужна ручная проверка.' }}</p>
+      <p class="review-reason">{{ page.issue_message or 'Нужна ручная проверка.' }}</p>
       <div class="tag-row">
         <span class="tag">{{ page_type_labels.get(page.page_type, page.page_type) }}</span>
         <span class="tag">QR: {{ qr_status_labels.get(page.qr_status, page.qr_status) }}</span>
@@ -37,28 +89,34 @@
       <form method="post" action="/review/{{ page.id }}/type"
             class="queue-type-form" data-auto-submit-form>
         <select name="page_type" aria-label="Тип страницы" data-auto-submit>
+          <option value="" disabled
+                  {% if page.page_type == 'unknown' %}selected{% endif %}>
+            Выберите тип
+          </option>
           <option value="letter" {% if page.page_type == 'letter' %}selected{% endif %}>Письмо</option>
           <option value="decision" {% if page.page_type == 'decision' %}selected{% endif %}>Решение</option>
           <option value="attachment" {% if page.page_type == 'attachment' %}selected{% endif %}>Приложение</option>
           <option value="other" {% if page.page_type == 'other' %}selected{% endif %}>Прочее</option>
         </select>
-        <button class="button button-secondary" type="submit">Применить</button>
       </form>
       {% if page.status == 'technical_error' %}
         <form method="post" action="/pages/{{ page.id }}/reprocess">
           <button class="button button-danger" type="submit">Повторить</button>
         </form>
       {% else %}
-        <a class="button button-danger" href="/review/{{ page.id }}">Открыть</a>
+        <a class="button button-primary" href="/review/{{ page.id }}">Проверить</a>
       {% endif %}
     </div>
   </article>
 {% endfor %}
 </section>
-{% else %}
+</section>
+{% endif %}
+
+{% if not pages and not match_reviews %}
 <div class="empty-state large">
-  <strong>Проблемных страниц нет</strong>
-  <span>Все зарегистрированные страницы имеют итоговый статус.</span>
+  <strong>Ручная проверка не требуется</strong>
+  <span>Все страницы и совпадения обращений подтверждены.</span>
 </div>
 {% endif %}
 {% endblock %}

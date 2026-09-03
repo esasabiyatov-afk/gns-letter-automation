@@ -1,0 +1,119 @@
+<aside id="letter-workflow" class="letter-drawer" aria-label="Подписанный ответ">
+  <header class="letter-drawer-header">
+    <div>
+      <p class="eyebrow">ПОДПИСАННЫЙ ОТВЕТ</p>
+      <h2>{{ active_group.recipient_display_name }}</h2>
+      <span>
+        Исх. № {{ active_letter.outgoing_number or 'не указан' }} ·
+        {% if active_group.letters|length > 1 %}письмо {{ active_letter.letter_order }} · {% endif %}
+        УГНС {{ active_group.district_place }}
+      </span>
+    </div>
+    <a class="letter-drawer-close"
+       href="/?tab=responses&amp;response_view=created"
+       aria-label="Закрыть">×</a>
+  </header>
+
+  {% if active_letter.scan_session %}
+    {% set session = active_letter.scan_session %}
+    {% if session.status == 'technical_error' %}
+      <div class="inline-state inline-state-error">
+        {{ session.error_message or 'Сканер сообщил об ошибке. Полученные листы сохранены.' }}
+      </div>
+    {% endif %}
+    <div class="scan-sheet-grid">
+      {% for page in session.pages %}
+        <article class="scan-sheet">
+          <a href="/signed-scan-sessions/{{ session.id }}/pages/{{ page.id }}" target="_blank">
+            <img src="/signed-scan-sessions/{{ session.id }}/pages/{{ page.id }}"
+                 alt="Лист {{ page.page_order }}">
+          </a>
+          <strong>Лист {{ page.page_order }}</strong>
+          <div class="scan-sheet-actions">
+            <form method="post" action="/signed-scan-sessions/{{ session.id }}/pages/{{ page.id }}/move">
+              <input type="hidden" name="group_id" value="{{ active_group.id }}">
+              <button name="direction" value="up" title="Переместить выше"
+                      {% if loop.first %}disabled{% endif %}>↑</button>
+              <button name="direction" value="down" title="Переместить ниже"
+                      {% if loop.last %}disabled{% endif %}>↓</button>
+            </form>
+            <form method="post" action="/signed-scan-sessions/{{ session.id }}/pages/{{ page.id }}/replace">
+              <input type="hidden" name="group_id" value="{{ active_group.id }}">
+              <button title="Пересканировать">↻</button>
+            </form>
+            <form method="post" action="/signed-scan-sessions/{{ session.id }}/pages/{{ page.id }}/remove">
+              <input type="hidden" name="group_id" value="{{ active_group.id }}">
+              <button class="scan-sheet-remove" title="Убрать лист">×</button>
+            </form>
+          </div>
+        </article>
+      {% else %}
+        <div class="empty-state">Листы ещё не получены.</div>
+      {% endfor %}
+    </div>
+    <div class="letter-drawer-actions">
+      <form method="post" action="/signed-scan-sessions/{{ session.id }}/pages/acquire">
+        <input type="hidden" name="group_id" value="{{ active_group.id }}">
+        <button class="button button-primary" type="submit">Добавить лист</button>
+      </form>
+      <form method="post" action="/signed-scan-sessions/{{ session.id }}/finalize">
+        <input type="hidden" name="group_id" value="{{ active_group.id }}">
+        <button class="button button-secondary" type="submit"
+                {% if not session.pages %}disabled{% endif %}>Создать PDF</button>
+      </form>
+      <form method="post" action="/signed-scan-sessions/{{ session.id }}/cancel">
+        <input type="hidden" name="group_id" value="{{ active_group.id }}">
+        <button class="button button-quiet" type="submit">Отменить сессию</button>
+      </form>
+    </div>
+  {% elif not active_letter.signed_scan %}
+    <div class="letter-drawer-empty">
+      <strong>Получите листы со сканера или загрузите готовый файл.</strong>
+    </div>
+    <form method="post"
+          action="/response-letters/{{ active_letter.id }}/scan-session/start">
+      <input type="hidden" name="group_id" value="{{ active_group.id }}">
+      <button class="button button-primary" type="submit">Начать сканирование</button>
+    </form>
+  {% endif %}
+
+  {% if active_letter.signed_scan %}
+    {% set scan = active_letter.signed_scan %}
+    <section class="scan-pdf-preview" aria-label="Предпросмотр подписанного ответа">
+      <header>
+        <strong>PDF · {{ scan.page_count }} {{ page_word(scan.page_count) }}</strong>
+        <span>{{ 'Подтверждён' if scan.status == 'confirmed' else 'Нужно проверить' }}</span>
+      </header>
+      <iframe src="/signed-response-scans/{{ scan.id }}#page=1&amp;zoom=page-fit"
+              title="Подписанный ответ, {{ scan.page_count }} {{ page_word(scan.page_count) }}">
+      </iframe>
+    </section>
+    {% if scan.status == 'needs_confirmation' %}
+      <form class="scan-confirm-action" method="post"
+            action="/signed-response-scans/{{ scan.id }}/confirm">
+        <input type="hidden" name="group_id" value="{{ active_group.id }}">
+        <button class="button button-primary" type="submit">Подтвердить скан</button>
+      </form>
+    {% elif active_letter.outgoing_number and active_letter.gns_email %}
+      <form method="post"
+            action="/response-letters/{{ active_letter.id }}/outlook-draft">
+        <input type="hidden" name="group_id" value="{{ active_group.id }}">
+        <button class="button button-primary" type="submit">
+          {% if active_letter.outlook_message and active_letter.outlook_message.status == 'draft_created' %}Открыть письмо{% else %}Отправить по почте{% endif %}
+        </button>
+      </form>
+    {% endif %}
+  {% endif %}
+
+  <details class="ready-scan-upload" {% if not active_letter.scan_session and not active_letter.signed_scan %}open{% endif %}>
+    <summary>Загрузить готовый файл с МФУ</summary>
+    <form method="post" enctype="multipart/form-data"
+          action="/response-letters/{{ active_letter.id }}/scan-upload">
+      <input type="hidden" name="group_id" value="{{ active_group.id }}">
+      <input type="file" name="scan_file"
+             accept="application/pdf,image/tiff,image/png,image/jpeg,.pdf,.tif,.tiff,.png,.jpg,.jpeg"
+             required>
+      <button class="button button-secondary button-compact" type="submit">Загрузить</button>
+    </form>
+  </details>
+</aside>

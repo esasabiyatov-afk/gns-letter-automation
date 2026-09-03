@@ -41,13 +41,21 @@ def test_real_tolubay_mode_is_named_correctly_in_login_dialog(
     from gns_app import main
 
     workflow.abs.is_fake = False
+    overview = workflow.today_overview(view="prepare")
+    overview["ready_abs"] = 1
+    monkeypatch.setattr(
+        workflow,
+        "today_overview",
+        lambda *, view="all": overview,
+    )
     monkeypatch.setattr(main, "workflow", workflow)
 
-    response = TestClient(main.app).get("/today")
+    response = TestClient(main.app).get(
+        "/?tab=responses&response_view=prepare"
+    )
 
     assert response.status_code == 200
     assert "АБС TOLUBAY" in response.text
-    assert "Сейчас используется реальная АБС Tolubay" in response.text
     assert "ТЕСТОВАЯ АБС" not in response.text
 
 

@@ -84,7 +84,8 @@ def test_confirming_the_last_page_goes_to_the_empty_queue(
     assert response.status_code == 303
     location = response.headers["location"]
     path, _, query = location.partition("?")
-    assert path == "/review"
+    assert path == "/"
+    assert "tab=review" in query
     assert "Проблемных страниц больше нет" in unquote(query)
 
 
@@ -98,7 +99,9 @@ def test_create_all_route_reports_zero_when_nothing_is_ready(
     assert response.status_code == 303
     location = response.headers["location"]
     path, _, query = location.partition("?")
-    assert path == "/today"
+    assert path == "/"
+    assert "tab=responses" in query
+    assert "response_view=prepare" in query
     assert "Нет готовых групп" in unquote(query)
 
 
@@ -216,3 +219,126 @@ def test_conflicting_ocr_inns_render_one_taxpayer_with_choices(
     assert "12904195800139" in response.text
     assert "12904195890139" in response.text
     assert "OCR распознал разные варианты ИНН" in response.text
+
+
+def _insert_orphaned_scan_case(workflow, prefix: str) -> tuple[str, str]:
+    """A scan case left behind after its source sheet was marked as other."""
+    now = utc_now()
+    upload_id = f"{prefix}-upload"
+    case_id = f"{prefix}-case"
+    page_id = f"{prefix}-page"
+    _insert_upload(workflow, upload_id, page_count=1)
+    workflow.db.execute(
+        """
+        INSERT INTO pages(
+            id, upload_id, page_number, page_type, type_confidence,
+            quality_score, qr_status, ocr_status, extracted_text,
+            status, manual_confirmed, created_at, updated_at
+        ) VALUES (?, ?, 1, 'other', 1, 0.9, 'not_found', 'completed',
+                  'Текст письма', 'manually_confirmed', 1, ?, ?)
+        """,
+        (page_id, upload_id, now, now),
+    )
+    workflow.db.execute(
+        """
+        INSERT INTO cases(
+            id, upload_id, status, source_kind, district_place,
+            fields_confirmed, created_at, updated_at
+        ) VALUES (?, ?, 'needs_review', 'ocr_scan',
+                  'по Жайыльскому району Чуйской области', 0, ?, ?)
+        """,
+        (case_id, upload_id, now, now),
+    )
+    workflow.db.executemany(
+        """
+        INSERT INTO taxpayers(
+            id, case_id, display_order, name, inn,
+            name_source, inn_source, manually_confirmed,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, 'Ткачев Владимир Александрович', ?,
+                  'ocr_scan', 'ocr_scan', 0, ?, ?)
+        """,
+        [
+            (f"{prefix}-taxpayer-one", case_id, 1, "21393198400213", now, now),
+            (f"{prefix}-taxpayer-two", case_id, 2, "21303198400213", now, now),
+        ],
+    )
+    workflow.db.audit(
+        "case",
+        case_id,
+        "scan_case_created",
+        {"source_page_id": page_id},
+    )
+    return case_id, page_id
+
+
+def test_orphaned_scan_case_reopens_its_source_page_for_normal_review(
+    workflow, monkeypatch
+):
+    from starlette.testclient import TestClient
+
+    case_id, page_id = _insert_orphaned_scan_case(workflow, "reopen")
+
+    page = workflow.reopen_incomplete_case_review(
+        case_id, actor="Тестовый сотрудник"
+    )
+
+    assert page["id"] == page_id
+    assert page["case_id"] == case_id
+    assert page["page_type"] == "letter"
+    assert page["status"] == "needs_review"
+    assert page["manual_confirmed"] == 0
+    assert "Заполните и подтвердите" in page["issue_message"]
+    assert workflow.manual_review_overview()["case_tasks"] == []
+
+    monkeypatch.setattr(main, "workflow", workflow)
+    client = TestClient(main.app)
+    review = client.get(f"/review/{page_id}")
+
+    assert review.status_code == 200
+    assert "Заполните данные письма" in review.text
+    assert 'value="letter"' in review.text
+    assert review.text.count('name="taxpayer_name"') == 1
+    assert review.text.count('data-ocr-inn-candidate') == 2
+    assert "21393198400213" in review.text
+    assert "21303198400213" in review.text
+
+    events = workflow.db.fetch_all(
+        "SELECT event_type FROM audit_events WHERE entity_id = ?",
+        (case_id,),
+    )
+    assert "case_review_reopened" in {event["event_type"] for event in events}
+
+
+def test_reopen_route_uses_the_normal_review_page(workflow, monkeypatch):
+    from starlette.testclient import TestClient
+
+    case_id, page_id = _insert_orphaned_scan_case(workflow, "reopen-route")
+    monkeypatch.setattr(main, "workflow", workflow)
+    client = TestClient(main.app)
+
+    queue = client.get("/?tab=review")
+    assert queue.status_code == 200
+    assert f'action="/cases/{case_id}/reopen-review"' in queue.text
+    assert f'href="/cases/{case_id}"' not in queue.text
+
+    response = client.post(
+        f"/cases/{case_id}/reopen-review",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/review/{page_id}"
+
+
+def test_marking_reopened_scan_case_as_other_removes_the_orphan(workflow):
+    case_id, page_id = _insert_orphaned_scan_case(workflow, "cleanup")
+    workflow.reopen_incomplete_case_review(case_id)
+
+    workflow.confirm_page(page_id, page_type="other")
+
+    assert workflow.get_case(case_id) is None
+    assert workflow.db.fetch_all(
+        "SELECT id FROM taxpayers WHERE case_id = ?", (case_id,)
+    ) == []
+    assert workflow.manual_review_overview()["case_tasks"] == []

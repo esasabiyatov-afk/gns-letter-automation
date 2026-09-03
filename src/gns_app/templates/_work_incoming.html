@@ -1,0 +1,94 @@
+<section class="work-section" data-testid="incoming-workspace">
+  <div class="work-section-toolbar" data-tour-anchor="incoming">
+    <div>
+      <h2>Входящие письма</h2>
+      <p>
+        {% if outlook_auto_enabled %}
+          Автопроверка включена{% if outlook_auto_status.checked_at %} · {{ outlook_auto_status.checked_at[:16].replace('T', ' ') }}{% endif %}
+        {% else %}
+          Проверка запускается сотрудником
+        {% endif %}
+      </p>
+    </div>
+    <div class="work-toolbar-actions">
+      <form method="post" action="/work/outlook/import">
+        <button class="button button-primary" type="submit"
+                {% if not active_employee %}disabled{% endif %}
+                data-action="receive-mail">
+          Получить письма
+        </button>
+      </form>
+      <details class="compact-menu manual-intake-menu">
+        <summary class="button button-secondary">Добавить вручную</summary>
+        <div class="compact-menu-panel manual-intake-panel">
+          <form action="/uploads" method="post" enctype="multipart/form-data"
+                class="compact-upload-form">
+            <label class="field">
+              <span>PDF с письмами</span>
+              <input id="pdf-file" name="file" type="file"
+                     accept="application/pdf,.pdf" required
+                     {% if not active_employee %}disabled{% endif %}>
+            </label>
+            <button class="button button-primary" type="submit"
+                    {% if not active_employee %}disabled{% endif %}>
+              Загрузить PDF
+            </button>
+          </form>
+          <div class="compact-divider"></div>
+          <div class="folder-import-row">
+            <div>
+              <strong>Папка «Входящие»</strong>
+              <small>{{ inbox_dir }}</small>
+            </div>
+            <form method="post" action="/inbox/scan">
+              <button class="button button-secondary" type="submit"
+                      {% if not active_employee %}disabled{% endif %}>
+                Проверить папку
+              </button>
+            </form>
+          </div>
+        </div>
+      </details>
+    </div>
+  </div>
+
+  {% if outlook_auto_status.state == 'error' or outlook_import_stats.errors %}
+    <div class="inline-state inline-state-error">
+      {{ outlook_auto_status.message }}
+      <a href="/settings#outlook">Настроить Outlook</a>
+    </div>
+  {% elif outlook_auto_status.checked_at %}
+    <div class="inline-state">{{ outlook_auto_status.message }}</div>
+  {% endif %}
+
+  <div class="compact-list incoming-list">
+    <div class="compact-list-head" aria-hidden="true">
+      <span>Получено</span><span>Документ</span><span>Листы</span><span>Статус</span><span></span>
+    </div>
+    {% for upload in uploads %}
+      <article class="compact-list-row incoming-row">
+        <div class="incoming-source">
+          <time>{{ (upload.received_at or upload.created_at)[:16].replace('T', ' ') }}</time>
+          <small title="{{ upload.sender_smtp or '' }}">
+            {{ upload.sender_smtp or 'Ручная загрузка' }}
+            {% if upload.source_count > 1 %} · копий: {{ upload.source_count }}{% endif %}
+          </small>
+        </div>
+        <div class="compact-primary">
+          <strong title="{{ upload.original_filename }}">{{ upload.original_filename }}</strong>
+        </div>
+        <span>{{ upload.page_count }}</span>
+        <span class="status status-{{ upload.status }}">
+          {{ status_labels.get(upload.status, upload.status) }}
+        </span>
+        <a class="button button-secondary button-compact"
+           href="/uploads/{{ upload.id }}">Открыть</a>
+      </article>
+    {% else %}
+      <div class="empty-state large">
+        <strong>Писем пока нет</strong>
+        <span>Нажмите «Получить письма».</span>
+      </div>
+    {% endfor %}
+  </div>
+</section>

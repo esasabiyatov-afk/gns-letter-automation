@@ -1069,6 +1069,19 @@ def test_settings_page_renders_outlook_diagnostic(workflow, monkeypatch):
     response = main.settings_page(request)
     body = response.body.decode("utf-8")
 
-    assert "Подключение к почте" in body
+    assert "Подключение Outlook" in body
     assert "Рабочий профиль" in body
-    assert "Получить почту сейчас" in body
+    assert "Получить почту" in body
+    assert 'data-settings-tab="processing"' in body
+    assert 'data-settings-tab="outlook"' in body
+    assert 'data-settings-tab="service"' in body
+    assert 'data-settings-form' in body
+    for heading in (
+        "Исполнитель",
+        "Документы и сканер",
+        "OCR",
+        "АБС и реестры",
+        "Интерфейс",
+        "Диагностика",
+    ):
+        assert heading in body

@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}История писем · Автоматизатор писем{% endblock %}
+{% block body_class %}history-page{% endblock %}
+{% block content %}
+<header class="history-header" data-tour-anchor="history">
+  <div>
+    <p class="eyebrow">ПОИСК И ПРОВЕРКА</p>
+    <h1>История писем</h1>
+  </div>
+  <form class="history-search" method="get" action="/history">
+    <input name="query" value="{{ history.query }}"
+           placeholder="Файл, ИНН, адресат, отправитель или исх. №"
+           aria-label="Поиск по истории">
+    <button class="button button-primary button-compact" type="submit">Найти</button>
+    {% if history.query %}<a class="button button-quiet button-compact" href="/history">Сбросить</a>{% endif %}
+  </form>
+</header>
+
+<section class="work-section history-section">
+  <div class="work-section-toolbar">
+    <div>
+      <h2>{% if history.query %}Результаты поиска{% else %}Все обращения{% endif %}</h2>
+      <p>{{ history.total }} {{ case_word(history.total) }}</p>
+    </div>
+  </div>
+  <div class="compact-list history-list">
+    <div class="compact-list-head history-list-grid" aria-hidden="true">
+      <span>Получено</span><span>Входящее письмо</span><span>Адресат</span><span>Ответ</span><span></span>
+    </div>
+    {% for item in history['items'] %}
+      <article class="compact-list-row history-list-grid">
+        <div class="history-received">
+          <time>{{ (item.received_at or item.uploaded_at)[:16].replace('T', ' ') }}</time>
+          <small>{{ item.sender_smtp or 'Ручная загрузка' }}</small>
+        </div>
+        <div class="compact-primary">
+          <strong title="{{ item.original_filename }}">{{ item.original_filename }}</strong>
+          <small class="history-taxpayers" title="{{ item.taxpayer_names or '' }}">
+            {{ item.taxpayer_names or 'Лицо не определено' }}
+          </small>
+          <small>
+            {% if item.source_page_numbers %}Стр. {{ item.source_page_numbers }} из {% endif %}{{ item.page_count }} · Лиц: {{ item.taxpayer_count }}
+          </small>
+        </div>
+        <div class="history-recipient">
+          <strong>{{ item.recipient_display_name or 'Не определён' }}</strong>
+          <small>{{ item.district_place or 'Подразделение не определено' }}</small>
+        </div>
+        <div class="history-response-state">
+          {% if item.outgoing_numbers %}<strong>Исх. № {{ item.outgoing_numbers }}</strong>{% endif %}
+          {% if item.mail_status == 'sent' %}
+            <span class="status status-completed">Отправлено</span>
+            <small>{{ item.recipient_email }}{% if item.sent_at %} · {{ item.sent_at[:16].replace('T', ' ') }}{% endif %}</small>
+          {% elif item.mail_status == 'draft_created' %}
+            <span class="status status-ready">Письмо Outlook подготовлено</span>
+            <small>{{ item.recipient_email }}</small>
+          {% elif item.signed_scan_id %}
+            <span class="status status-response_created">Есть подписанный скан</span>
+          {% elif item.response_group_id %}
+            <span class="status status-response_created">Word создан</span>
+          {% else %}
+            <span class="status status-{{ item.status }}">{{ status_labels.get(item.status, item.status) }}</span>
+          {% endif %}
+        </div>
+        <details class="action-menu">
+          <summary aria-label="Документы письма">⋯</summary>
+          <div class="action-menu-panel action-menu-panel-right">
+            <a href="/cases/{{ item.id }}?return_to=history">Открыть письмо и данные</a>
+            <a href="/uploads/{{ item.upload_id }}">Открыть входящий PDF</a>
+            {% if item.response_group_id %}<a href="/response-groups/{{ item.response_group_id }}">Скачать Word</a>{% endif %}
+            {% if item.signed_scan_id %}<a href="/signed-response-scans/{{ item.signed_scan_id }}" target="_blank">Открыть подписанный PDF</a>{% endif %}
+          </div>
+        </details>
+      </article>
+    {% else %}
+      <div class="empty-state large">
+        <strong>Ничего не найдено</strong>
+        <span>Измените запрос или очистите поиск.</span>
+      </div>
+    {% endfor %}
+  </div>
+
+  {% if history.page_count > 1 %}
+    <nav class="server-pagination" aria-label="Страницы истории">
+      {% if history.page > 1 %}
+        <a class="button button-secondary button-compact"
+           href="/history?query={{ history.query|urlencode }}&amp;page={{ history.page - 1 }}">← Назад</a>
+      {% endif %}
+      <strong>{{ history.page }} из {{ history.page_count }}</strong>
+      {% if history.page < history.page_count %}
+        <a class="button button-secondary button-compact"
+           href="/history?query={{ history.query|urlencode }}&amp;page={{ history.page + 1 }}">Дальше →</a>
+      {% endif %}
+    </nav>
+  {% endif %}
+</section>
+{% endblock %}

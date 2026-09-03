@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS cases (
     official_parse_version INTEGER NOT NULL DEFAULT 0,
     response_path TEXT,
     response_page_overflow INTEGER,
+    match_review_previous_status TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -102,6 +103,8 @@ CREATE TABLE IF NOT EXISTS taxpayers (
     inn TEXT NOT NULL,
     name_source TEXT NOT NULL,
     inn_source TEXT NOT NULL,
+    name_source_reference TEXT,
+    inn_source_reference TEXT,
     manually_confirmed INTEGER NOT NULL DEFAULT 0,
     abs_result TEXT,
     abs_account_result TEXT,
@@ -119,6 +122,33 @@ CREATE TABLE IF NOT EXISTS taxpayers (
 
 CREATE INDEX IF NOT EXISTS idx_taxpayers_case
 ON taxpayers(case_id, display_order);
+
+CREATE TABLE IF NOT EXISTS case_match_reviews (
+    id TEXT PRIMARY KEY,
+    left_case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+    right_case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+    left_taxpayer_id TEXT NOT NULL,
+    right_taxpayer_id TEXT NOT NULL,
+    signature_hash TEXT NOT NULL,
+    differing_field TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    resolution TEXT,
+    resolved_by TEXT,
+    resolved_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK(left_case_id < right_case_id),
+    UNIQUE(left_case_id, right_case_id, signature_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_case_match_reviews_status
+ON case_match_reviews(status, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_case_match_reviews_left
+ON case_match_reviews(left_case_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_case_match_reviews_right
+ON case_match_reviews(right_case_id, status);
 
 CREATE TABLE IF NOT EXISTS audit_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -176,6 +206,9 @@ CREATE TABLE IF NOT EXISTS outlook_attachments (
 
 CREATE INDEX IF NOT EXISTS idx_outlook_attachments_message
 ON outlook_attachments(message_key, attachment_index);
+
+CREATE INDEX IF NOT EXISTS idx_outlook_attachments_upload
+ON outlook_attachments(upload_id);
 
 CREATE TABLE IF NOT EXISTS employee_profiles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -292,6 +325,43 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_signed_response_scans_active
 ON signed_response_scans(response_letter_id)
 WHERE status IN ('needs_confirmation', 'confirmed');
 
+CREATE TABLE IF NOT EXISTS signed_scan_sessions (
+    id TEXT PRIMARY KEY,
+    response_letter_id TEXT NOT NULL
+        REFERENCES response_letters(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    page_count INTEGER NOT NULL DEFAULT 0,
+    result_scan_id TEXT
+        REFERENCES signed_response_scans(id) ON DELETE SET NULL,
+    error_message TEXT,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_signed_scan_sessions_letter
+ON signed_scan_sessions(response_letter_id, created_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_signed_scan_sessions_active
+ON signed_scan_sessions(response_letter_id)
+WHERE status IN ('collecting', 'technical_error');
+
+CREATE TABLE IF NOT EXISTS signed_scan_session_pages (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL
+        REFERENCES signed_scan_sessions(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    page_order INTEGER NOT NULL,
+    original_path TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_signed_scan_session_pages_order
+ON signed_scan_session_pages(session_id, status, page_order);
+
 CREATE TABLE IF NOT EXISTS outlook_outgoing_messages (
     id TEXT PRIMARY KEY,
     response_letter_id TEXT NOT NULL
@@ -407,6 +477,11 @@ class Database:
                 "ALTER TABLE cases ADD COLUMN "
                 "response_page_overflow INTEGER"
             )
+        if "match_review_previous_status" not in existing:
+            connection.execute(
+                "ALTER TABLE cases ADD COLUMN "
+                "match_review_previous_status TEXT"
+            )
 
     @staticmethod
     def _ensure_taxpayer_columns(connection: sqlite3.Connection) -> None:
@@ -426,6 +501,8 @@ class Database:
             "registry_director": "TEXT",
             "registry_checked_at": "TEXT",
             "registry_provider": "TEXT",
+            "name_source_reference": "TEXT",
+            "inn_source_reference": "TEXT",
         }
         for name, column_type in additions.items():
             if name not in existing:

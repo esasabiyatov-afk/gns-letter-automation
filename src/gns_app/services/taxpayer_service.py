@@ -62,6 +62,8 @@ def response_taxpayer_name(name: str, inn: str) -> str:
     cleaned = " ".join(name.split())
     if classify_taxpayer(cleaned, inn) != TaxpayerKind.INDIVIDUAL:
         return cleaned
-    if ENTREPRENEUR_RE.match(cleaned):
-        return ENTREPRENEUR_RE.sub("ИП ", cleaned, count=1).strip()
+    entrepreneur_prefix = ENTREPRENEUR_RE.match(cleaned)
+    if entrepreneur_prefix:
+        suffix = cleaned[entrepreneur_prefix.end() :].lstrip()
+        return f"ИП {suffix}".rstrip()
     return f"ИП {cleaned}"

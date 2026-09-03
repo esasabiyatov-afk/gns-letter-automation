@@ -1,29 +1,26 @@
 {% extends "base.html" %}
-{% block title %}Главная · Автоматизатор писем{% endblock %}
+{% block title %}Работа · Автоматизатор писем{% endblock %}
+{% block body_class %}work-page{% endblock %}
 {% block content %}
-<section id="employee-entry"
-         class="employee-entry {% if not active_employee %}employee-entry-required{% endif %}">
-  <div class="employee-entry-heading">
+{% if not active_employee or request.query_params.get('employee') %}
+<details id="employee-entry"
+         class="employee-entry {% if not active_employee %}employee-entry-required{% endif %}"
+         open>
+  <summary class="employee-entry-heading">
     <div>
-      <p class="eyebrow">ИСПОЛНИТЕЛЬ ТЕКУЩЕЙ СМЕНЫ</p>
-      {% if active_employee %}
-        <h2>{{ active_employee }}</h2>
-        <p>Имя будет автоматически подставлено в новые ответы.</p>
-      {% else %}
-        <h2>Перед началом выберите исполнителя</h2>
-        <p>Без исполнителя загрузка новых PDF временно заблокирована.</p>
+      <p class="eyebrow">ИСПОЛНИТЕЛЬ</p>
+      <h2>{{ active_employee or 'Выберите исполнителя' }}</h2>
+      {% if not active_employee %}
+        <p>Без исполнителя новые документы не загружаются.</p>
       {% endif %}
     </div>
-    {% if active_employee %}
-      <span class="employee-ready-mark">Выбран</span>
-    {% endif %}
-  </div>
-
+    {% if active_employee %}<span class="employee-ready-mark">Закрыть</span>{% endif %}
+  </summary>
   <div class="employee-entry-actions">
     {% if employee_profiles %}
       <form action="/employees/select" method="post" class="employee-select-form">
         <label class="field">
-          <span>Выбрать из справочника</span>
+          <span>Исполнитель</span>
           <select name="employee_key" required>
             {% for employee in employee_profiles %}
               <option value="{{ employee.name_key }}"
@@ -36,131 +33,69 @@
         <button class="button button-secondary" type="submit">Выбрать</button>
       </form>
     {% endif %}
-
     <form action="/employees/add" method="post" class="employee-add-form">
       <label class="field">
-        <span>Добавить нового исполнителя</span>
+        <span>Новый исполнитель</span>
         <input name="employee_name" maxlength="120"
                placeholder="Например: Гапарова Э." required>
       </label>
-      <button class="button button-primary" type="submit">
-        Добавить и выбрать
-      </button>
+      <button class="button button-primary" type="submit">Добавить</button>
     </form>
   </div>
-</section>
+</details>
+{% endif %}
 
-{% if message %}<div class="alert alert-success">{{ message }}</div>{% endif %}
+{% if message %}
+  <div class="alert alert-success{% if undo_page_id %} alert-with-action{% endif %}">
+    <span>{{ message }}</span>
+    {% if undo_page_id %}
+      <form method="post" action="/pages/{{ undo_page_id }}/reopen-type">
+        <button class="button button-quiet button-compact" type="submit">
+          Отменить выбор
+        </button>
+      </form>
+    {% endif %}
+  </div>
+{% endif %}
 {% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
 
-<section class="hero">
+<header class="work-header">
   <div>
-    <h1>Автоматизатор писем</h1>
-    <p class="lead">
-      Загрузите PDF-письма ГНС. Приложение обработает документы и покажет
-      страницы, которые требуют проверки.
-    </p>
+    <p class="eyebrow">РАБОЧИЙ ПРОЦЕСС</p>
+    <h1>Работа</h1>
   </div>
-  <form class="upload-card" action="/uploads" method="post"
-        enctype="multipart/form-data">
-    <label class="drop-zone" for="pdf-file">
-      <span class="drop-icon">PDF</span>
-      <strong>Выберите отсканированный PDF</strong>
-      <span>Один файл может содержать много писем</span>
-      <input id="pdf-file" name="file" type="file"
-             accept="application/pdf,.pdf" required
-             {% if not active_employee %}disabled{% endif %}>
-    </label>
-    <button class="button button-primary" type="submit"
-            {% if not active_employee %}disabled{% endif %}>
-      Загрузить и обработать
-    </button>
-    {% if not active_employee %}
-      <p class="form-note">Сначала выберите исполнителя выше.</p>
-    {% endif %}
-  </form>
-</section>
+  {% if work_counts.processing %}
+    <span class="work-processing">Обрабатывается: {{ work_counts.processing }}</span>
+  {% endif %}
+</header>
 
-<section class="inbox-scan-card">
-  <div>
-    <p class="eyebrow">ПАПКА ВХОДЯЩИХ</p>
-    <h2>Загрузить все новые PDF из папки</h2>
-    <p>
-      Поместите письма в <code>{{ inbox_dir }}</code>. Повторно загруженные
-      файлы определяются по содержимому и пропускаются.
-    </p>
-  </div>
-  <form method="post" action="/inbox/scan">
-    <button class="button button-secondary" type="submit"
-            {% if not active_employee %}disabled{% endif %}>
-      Сканировать папку
-    </button>
-  </form>
-</section>
+<nav class="work-tabs" aria-label="Этапы работы"
+     data-tour-anchor="work-tabs">
+  <a href="/?tab=incoming"
+     {% if work_tab == 'incoming' %}aria-current="page"{% endif %}
+     data-testid="work-tab-incoming">
+    <span>Входящие</span>
+    <strong>{{ work_counts.incoming }}</strong>
+  </a>
+  <a href="/?tab=review"
+     {% if work_tab == 'review' %}aria-current="page"{% endif %}
+     data-testid="work-tab-review">
+    <span>Проверка</span>
+    <strong {% if work_counts.review %}class="is-problem"{% endif %}>{{ work_counts.review }}</strong>
+  </a>
+  <a href="/?tab=responses&amp;response_view=prepare"
+     {% if work_tab == 'responses' %}aria-current="page"{% endif %}
+     data-testid="work-tab-responses">
+    <span>Ответы</span>
+    <strong>{{ work_counts.ready_responses }}</strong>
+  </a>
+</nav>
 
-<section class="home-today-link">
-  <div>
-    <p class="eyebrow">РАБОТА ЗА СЕГОДНЯ</p>
-    <h2>Проверить пакет и подготовить общие ответы</h2>
-    <p>
-      Все готовые QR-письма проверяются одной операцией, а ответы собираются
-      по налоговому органу и адресату.
-    </p>
-  </div>
-  <a class="button button-primary" href="/today">Открыть готовые ответы</a>
-</section>
-
-<section class="stat-grid">
-  <article><strong>{{ stats.uploads }}</strong><span>PDF загружено</span></article>
-  <article><strong>{{ stats.pages }}</strong><span>страниц учтено</span></article>
-  <article class="stat-problem"><strong>{{ stats.review }}</strong><span>требуют проверки</span></article>
-  <article><strong>{{ stats.ready_abs }}</strong><span>готово к АБС</span></article>
-  <article><strong>{{ stats.ready_response }}</strong><span>можно создать ответ</span></article>
-</section>
-
-<div class="content-grid">
-  <section class="panel">
-    <div class="panel-heading">
-      <div>
-        <p class="eyebrow">ВХОДЯЩИЕ</p>
-        <h2>Последние PDF</h2>
-      </div>
-    </div>
-    {% if uploads %}
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Файл</th><th>Страниц</th><th>Статус</th><th></th></tr></thead>
-          <tbody>
-          {% for upload in uploads %}
-            <tr>
-              <td>
-                <strong>{{ upload.original_filename }}</strong>
-                <small>{{ upload.created_at[:16].replace('T', ' ') }}</small>
-              </td>
-              <td>{{ upload.page_count }}</td>
-              <td><span class="status status-{{ upload.status }}">
-                {{ status_labels.get(upload.status, upload.status) }}
-              </span></td>
-              <td><a class="text-link" href="/uploads/{{ upload.id }}">Открыть</a></td>
-            </tr>
-          {% endfor %}
-          </tbody>
-        </table>
-      </div>
-    {% else %}
-      <div class="empty-state">Загрузите первый PDF.</div>
-    {% endif %}
-  </section>
-
-  <aside class="panel guide-card">
-    <p class="eyebrow">ПОРЯДОК</p>
-    <h2>Что делает приложение</h2>
-    <ol class="step-list">
-      <li><span>1</span><div><strong>Учитывает страницы</strong><small>Запись создаётся до распознавания.</small></div></li>
-      <li><span>2</span><div><strong>Ищет QR</strong><small>Несколько безопасных способов чтения.</small></div></li>
-      <li><span>3</span><div><strong>Показывает сомнения</strong><small>Ничего не дописывает наугад.</small></div></li>
-      <li><span>4</span><div><strong>Продолжает после проверки</strong><small>АБС и проект ответа Word.</small></div></li>
-    </ol>
-  </aside>
-</div>
+{% if work_tab == 'incoming' %}
+  {% include "_work_incoming.html" %}
+{% elif work_tab == 'review' %}
+  {% include "_work_review.html" %}
+{% else %}
+  {% include "_work_responses.html" %}
+{% endif %}
 {% endblock %}

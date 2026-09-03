@@ -164,11 +164,13 @@ async def lifespan(_: FastAPI):
         workflow.initialize_employee_profiles()
         workflow.initialize_gns_offices()
         workflow.initialize_gns_office_emails()
+        workflow.reconcile_gns_office_districts()
         workflow.reconcile_gns_office_hints()
         workflow.reconcile_structured_ocr_hints()
         workflow.reconcile_recipient_display_names()
         workflow.reprocess_incomplete_official_documents()
         workflow.reconcile_official_qr_pages()
+        workflow.reconcile_case_match_reviews()
         workflow.reconcile_confident_scan_decisions()
         workflow.repair_cleaned_responses()
         ocr_health = workflow.ocr.health_check()
@@ -335,6 +337,8 @@ EVENT_LABELS = {
     "scan_case_created": "Создано обращение по скану",
     "official_document_processed": "Официальная версия обработана",
     "page_manually_confirmed": "Страница подтверждена сотрудником",
+    "case_review_reopened": "Обращение возвращено на ручную проверку",
+    "page_reopened_for_case_review": "Лист возвращён на ручную проверку",
     "fake_abs_checked": "Выполнена тестовая проверка АБС",
     "abs_checked": "Выполнена проверка АБС Tolubay",
     "fake_abs_startup_rolled_back": "Отменена массовая автопроверка АБС",
@@ -388,6 +392,8 @@ EVENT_LABELS = {
     "employee_profile_added": "Добавлен исполнитель",
     "active_employee_selected": "Выбран активный исполнитель",
     "review_interface_settings_updated": "Обновлены настройки ручной проверки",
+    "case_match_review_created": "Создано ручное сравнение обращений",
+    "case_match_review_resolved": "Принято решение по сравнению обращений",
 }
 
 ENTITY_LABELS = {
@@ -398,15 +404,16 @@ ENTITY_LABELS = {
     "response_group": "Общий ответ",
     "response_letter": "Исходящее письмо",
     "taxpayer": "Налогоплательщик",
+    "case_match_review": "Сравнение обращений",
 }
 
 
 def taxpayer_word(count: int) -> str:
     if count % 10 == 1 and count % 100 != 11:
-        return "запись"
+        return "лицо"
     if count % 10 in {2, 3, 4} and count % 100 not in {12, 13, 14}:
-        return "записи"
-    return "записей"
+        return "лица"
+    return "лиц"
 
 
 def case_word(count: int) -> str:
@@ -415,6 +422,14 @@ def case_word(count: int) -> str:
     if count % 10 in {2, 3, 4} and count % 100 not in {12, 13, 14}:
         return "обращения"
     return "обращений"
+
+
+def page_word(count: int) -> str:
+    if count % 10 == 1 and count % 100 != 11:
+        return "лист"
+    if count % 10 in {2, 3, 4} and count % 100 not in {12, 13, 14}:
+        return "листа"
+    return "листов"
 
 
 def context(request: Request, **values):
@@ -433,6 +448,7 @@ def context(request: Request, **values):
         "entity_labels": ENTITY_LABELS,
         "taxpayer_word": taxpayer_word,
         "case_word": case_word,
+        "page_word": page_word,
         "threshold": workflow.get_period_threshold().isoformat(),
         "active_employee": active_employee,
         "employee_profiles": workflow.list_employee_profiles(),
@@ -473,19 +489,100 @@ def period_review_status(case: dict) -> dict[str, object]:
 
 
 @app.get("/", response_class=HTMLResponse)
-def index(request: Request, message: str = "", error: str = ""):
+def index(
+    request: Request,
+    tab: str = "incoming",
+    response_view: str = "prepare",
+    focus_letter: str = "",
+    outgoing_start: str = "",
+    undo_page_id: str = "",
+    message: str = "",
+    error: str = "",
+):
+    if tab not in {"incoming", "review", "responses"}:
+        tab = "incoming"
+    if response_view not in {"prepare", "created", "manual"}:
+        response_view = "prepare"
+
+    values: dict[str, object] = {
+        "work_tab": tab,
+        "work_counts": workflow.work_counts(),
+        "response_view": response_view,
+        "undo_page_id": undo_page_id,
+        "message": message,
+        "error": error,
+    }
+    if tab == "incoming":
+        values.update(
+            uploads=workflow.list_incoming_work(limit=20),
+            inbox_dir=str(workflow.get_inbox_dir()),
+            outlook_auto_enabled=outlook_importer.get_auto_enabled(),
+            outlook_auto_status=outlook_importer.get_automation_status(),
+            outlook_import_stats=outlook_importer.stats(),
+        )
+    elif tab == "review":
+        review = workflow.manual_review_overview()
+        values.update(
+            review=review,
+            review_count=(
+                len(review["pages"])
+                + len(review["match_reviews"])
+                + len(review["case_tasks"])
+                + sum(
+                    len(group["taxpayers"])
+                    for group in review["account_groups"]
+                )
+                + sum(
+                    len(case["taxpayers"])
+                    for case in review["odb_cases"]
+                )
+            ),
+        )
+    else:
+        outgoing_preview = None
+        if outgoing_start and response_view == "created":
+            try:
+                outgoing_preview = workflow.preview_outgoing_numbers(
+                    outgoing_start
+                )
+            except WorkflowValidationError as exc:
+                error = str(exc)
+                values["error"] = error
+        if response_view == "manual":
+            overview = {
+                "found_groups": workflow.manual_response_groups(),
+                "generated_groups": [],
+                "not_found_groups": [],
+                "unnumbered_letters": [],
+                "ready_abs": values["work_counts"]["ready_abs"],
+                "ready_response": values["work_counts"]["ready_responses"],
+                "unresolved_pages": 0,
+                "unresolved_matches": 0,
+            }
+        else:
+            overview = workflow.today_overview(view=response_view)
+        active_letter = None
+        active_group = None
+        if response_view == "created" and focus_letter:
+            for group in overview["generated_groups"]:
+                for letter in group.get("letters", []):
+                    if letter["id"] == focus_letter:
+                        active_letter = letter
+                        active_group = group
+                        break
+                if active_letter:
+                    break
+        values.update(
+            overview=overview,
+            outgoing_preview=outgoing_preview,
+            outgoing_start=outgoing_start,
+            active_letter=active_letter,
+            active_group=active_group,
+        )
     return templates.TemplateResponse(
         request,
         "index.html",
-        context(
-            request,
-            stats=workflow.dashboard_stats(),
-            uploads=workflow.list_uploads()[:12],
-            cases=workflow.list_cases()[:8],
-            inbox_dir=str(workflow.get_inbox_dir()),
-            message=message,
-            error=error,
-        ),
+        context(request, **values),
     )
 
 
@@ -496,24 +593,31 @@ def today(
     error: str = "",
     outgoing_start: str = "",
 ):
-    outgoing_preview = None
+    parameters = ["tab=responses", "response_view=created"]
     if outgoing_start:
-        try:
-            outgoing_preview = workflow.preview_outgoing_numbers(
-                outgoing_start
-            )
-        except WorkflowValidationError as exc:
-            error = str(exc)
+        parameters.append(f"outgoing_start={quote(outgoing_start)}")
+    if message:
+        parameters.append(f"message={quote(message)}")
+    if error:
+        parameters.append(f"error={quote(error)}")
+    return RedirectResponse(
+        "/?" + "&".join(parameters),
+        status_code=303,
+    )
+
+
+@app.get("/history", response_class=HTMLResponse)
+def letter_history(
+    request: Request,
+    query: str = "",
+    page: int = 1,
+):
     return templates.TemplateResponse(
         request,
-        "today.html",
+        "history.html",
         context(
             request,
-            overview=workflow.today_overview(),
-            outgoing_preview=outgoing_preview,
-            outgoing_start=outgoing_start,
-            message=message,
-            error=error,
+            history=workflow.list_letter_history(query, page=page),
         ),
     )
 
@@ -697,7 +801,7 @@ def check_outlook_connection():
     result = outlook.diagnose()
     parameter = "message" if result.successful else "error"
     return RedirectResponse(
-        f"/settings?{parameter}={quote(result.message)}",
+        f"/settings?{parameter}={quote(result.message)}#outlook",
         status_code=303,
     )
 
@@ -707,7 +811,7 @@ def request_outlook_send_receive():
     result = outlook.request_send_receive()
     parameter = "message" if result.successful else "error"
     return RedirectResponse(
-        f"/settings?{parameter}={quote(result.message)}",
+        f"/settings?{parameter}={quote(result.message)}#outlook",
         status_code=303,
     )
 
@@ -735,11 +839,11 @@ def update_outlook_import_settings(
         outlook_outgoing.update_subject_template(outlook_subject_template)
     except OutlookIntegrationError as exc:
         return RedirectResponse(
-            f"/settings?error={quote(str(exc))}",
+            f"/settings?error={quote(str(exc))}#outlook",
             status_code=303,
         )
     return RedirectResponse(
-        "/settings?message=" + quote("Настройки Outlook сохранены."),
+        "/settings?message=" + quote("Настройки Outlook сохранены.") + "#outlook",
         status_code=303,
     )
 
@@ -796,7 +900,7 @@ def import_outlook_attachments(background_tasks: BackgroundTasks):
         summary = outlook_importer.import_new(workflow)
     except OutlookIntegrationError as exc:
         return RedirectResponse(
-            f"/settings?error={quote(str(exc))}",
+            f"/settings?error={quote(str(exc))}#outlook",
             status_code=303,
         )
     for upload_id in summary["imported"]:
@@ -818,7 +922,36 @@ def import_outlook_attachments(background_tasks: BackgroundTasks):
         else "message"
     )
     return RedirectResponse(
-        f"/settings?{parameter}={quote(message)}",
+        f"/settings?{parameter}={quote(message)}#outlook",
+        status_code=303,
+    )
+
+
+@app.post("/work/outlook/import")
+def import_outlook_from_work(background_tasks: BackgroundTasks):
+    try:
+        summary = outlook_importer.import_new(workflow)
+    except OutlookIntegrationError as exc:
+        return RedirectResponse(
+            f"/?tab=incoming&error={quote(str(exc))}",
+            status_code=303,
+        )
+    for upload_id in summary["imported"]:
+        background_tasks.add_task(workflow.process_upload, upload_id)
+    error_count = (
+        int(summary["scan_errors"])
+        + int(bool(summary.get("sync_error")))
+        + len(summary["errors"])
+    )
+    message = (
+        f"Почта проверена. Новых писем: {summary['new_messages']}; "
+        f"PDF: {summary['saved_attachments']}; "
+        f"повторов: {summary['known'] + summary['duplicate_attachments']}; "
+        f"ошибок: {error_count}."
+    )
+    parameter = "error" if error_count else "message"
+    return RedirectResponse(
+        f"/?tab=incoming&{parameter}={quote(message)}",
         status_code=303,
     )
 
@@ -846,11 +979,11 @@ def update_settings(
         )
     except WorkflowValidationError as exc:
         return RedirectResponse(
-            "/settings?error=" + quote(str(exc)),
+            "/settings?error=" + quote(str(exc)) + "#processing",
             status_code=303,
         )
     return RedirectResponse(
-        "/settings?message=" + quote("Настройки сохранены."),
+        "/settings?message=" + quote("Настройки сохранены.") + "#processing",
         status_code=303,
     )
 
@@ -862,7 +995,7 @@ def reset_processing_data(
 ):
     if action not in {"clear", "rescan"}:
         return RedirectResponse(
-            "/settings?error=" + quote("Неизвестный вариант сброса."),
+            "/settings?error=" + quote("Неизвестный вариант сброса.") + "#service",
             status_code=303,
         )
     try:
@@ -877,7 +1010,7 @@ def reset_processing_data(
                 background_tasks.add_task(workflow.process_upload, upload_id)
     except WorkflowValidationError as exc:
         return RedirectResponse(
-            "/settings?error=" + quote(str(exc)),
+            "/settings?error=" + quote(str(exc)) + "#service",
             status_code=303,
         )
 
@@ -887,15 +1020,17 @@ def reset_processing_data(
             f"ошибок: {len(errors)}."
         )
         destination = "/"
+        fragment = ""
     else:
         message = (
             "Данные обработки очищены. Исходные PDF в папке входящих сохранены."
         )
         destination = "/settings"
+        fragment = "#service"
     if summary["cleanup_errors"]:
         message += " Некоторые старые служебные файлы заняты другой программой."
     return RedirectResponse(
-        f"{destination}?message={quote(message)}",
+        f"{destination}?message={quote(message)}{fragment}",
         status_code=303,
     )
 
@@ -909,12 +1044,13 @@ def abs_check_today(
         summary = workflow.check_abs_today(username, password)
     except WorkflowValidationError as exc:
         return RedirectResponse(
-            f"/today?error={quote(str(exc))}",
+            "/?tab=responses&response_view=prepare&error="
+            + quote(str(exc)),
             status_code=303,
         )
     return RedirectResponse(
         (
-            "/today?message="
+            "/?tab=responses&response_view=prepare&message="
             + quote(
                 "Пакетная проверка завершена. Обращений: "
                 f"{summary['case_count']}."
@@ -929,7 +1065,9 @@ def abs_account_check_taxpayer(
     case_id: str,
     taxpayer_inn: str = Form(...),
     account_result: str = Form(...),
+    return_to: str = Form(""),
 ):
+    destination = "/?tab=review" if return_to == "review" else "/today"
     try:
         result = workflow.confirm_abs_account_taxpayer(
             case_id,
@@ -939,7 +1077,10 @@ def abs_account_check_taxpayer(
         )
     except WorkflowValidationError as exc:
         return RedirectResponse(
-            f"/today?error={quote(str(exc))}", status_code=303
+            f"{destination}&error={quote(str(exc))}"
+            if "?" in destination
+            else f"{destination}?error={quote(str(exc))}",
+            status_code=303,
         )
     message = (
         "Наличие счёта подтверждено — оставлено для ручного ответа."
@@ -947,7 +1088,10 @@ def abs_account_check_taxpayer(
         else "Счёта нет — обращение направлено дальше по правилу периода."
     )
     return RedirectResponse(
-        f"/today?message={quote(message)}", status_code=303
+        f"{destination}&message={quote(message)}"
+        if "?" in destination
+        else f"{destination}?message={quote(message)}",
+        status_code=303,
     )
 
 
@@ -958,17 +1102,27 @@ def create_all_grouped_responses():
     errors = summary["errors"]
     if created and not errors:
         message = quote(f"Создано ответов: {created}.")
-        return RedirectResponse(f"/today?message={message}", status_code=303)
+        return RedirectResponse(
+            f"/?tab=responses&response_view=created&message={message}",
+            status_code=303,
+        )
     if created and errors:
         message = quote(
             f"Создано ответов: {created}. Не удалось создать: {len(errors)}."
         )
-        return RedirectResponse(f"/today?message={message}", status_code=303)
+        return RedirectResponse(
+            f"/?tab=responses&response_view=created&message={message}",
+            status_code=303,
+        )
     if errors:
         message = quote("Ничего не создано: " + errors[0]["message"])
-        return RedirectResponse(f"/today?error={message}", status_code=303)
+        return RedirectResponse(
+            f"/?tab=responses&response_view=prepare&error={message}",
+            status_code=303,
+        )
     return RedirectResponse(
-        "/today?message=" + quote("Нет готовых групп для создания ответа."),
+        "/?tab=responses&response_view=prepare&message="
+        + quote("Нет готовых групп для создания ответа."),
         status_code=303,
     )
 
@@ -985,14 +1139,15 @@ def create_grouped_response(
         )
     except (WorkflowValidationError, ValueError) as exc:
         return RedirectResponse(
-            f"/today?error={quote(str(exc))}",
+            "/?tab=responses&response_view=prepare&error="
+            + quote(str(exc)),
             status_code=303,
         )
     return RedirectResponse(
         (
-            "/today?message="
+            "/?tab=responses&response_view=created&message="
             + quote("Общий проект ответа Word создан.")
-            + f"#group-{group_id}"
+            + f"&focus_group={group_id}#group-{group_id}"
         ),
         status_code=303,
     )
@@ -1011,7 +1166,8 @@ def assign_outgoing_numbers(
         )
     except WorkflowValidationError as exc:
         return RedirectResponse(
-            f"/today?error={quote(str(exc))}",
+            "/?tab=responses&response_view=created&error="
+            + quote(str(exc)),
             status_code=303,
         )
     message = quote(
@@ -1019,7 +1175,10 @@ def assign_outgoing_numbers(
         f"{summary['letter_count']} — с {summary['first_number']} "
         f"по {summary['last_number']}."
     )
-    return RedirectResponse(f"/today?message={message}", status_code=303)
+    return RedirectResponse(
+        "/?tab=responses&response_view=created&message=" + message,
+        status_code=303,
+    )
 
 
 @app.post("/response-letters/{letter_id}/outgoing-number")
@@ -1076,6 +1235,207 @@ def scan_response_letter_from_device(
     )
 
 
+@app.post("/response-letters/{letter_id}/scan-session/start")
+def start_response_letter_scan_session(
+    letter_id: str,
+    group_id: str = Form(""),
+):
+    actor = workflow.get_active_employee() or "Сотрудник"
+    try:
+        session = workflow.start_signed_scan_session(letter_id, actor=actor)
+        workflow.acquire_signed_scan_session_page(session["id"], actor=actor)
+    except ScannerCancelled:
+        return RedirectResponse(
+            f"/today?message={quote('Лист не добавлен. Сессия сохранена.')}"
+            f"#group-{quote(group_id)}",
+            status_code=303,
+        )
+    except (ScannerError, WorkflowValidationError) as exc:
+        return RedirectResponse(
+            f"/today?error={quote(str(exc))}#group-{quote(group_id)}",
+            status_code=303,
+        )
+    return RedirectResponse(
+        "/today?message="
+        + quote("Первый лист получен. Добавьте остальные или создайте PDF.")
+        + f"#group-{quote(group_id)}",
+        status_code=303,
+    )
+
+
+@app.post("/signed-scan-sessions/{session_id}/pages/acquire")
+def acquire_response_scan_session_page(
+    session_id: str,
+    group_id: str = Form(""),
+):
+    try:
+        workflow.acquire_signed_scan_session_page(
+            session_id,
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+    except ScannerCancelled:
+        return RedirectResponse(
+            f"/today?message={quote('Добавление листа отменено.')}"
+            f"#group-{quote(group_id)}",
+            status_code=303,
+        )
+    except (ScannerError, WorkflowValidationError) as exc:
+        return RedirectResponse(
+            f"/today?error={quote(str(exc))}#group-{quote(group_id)}",
+            status_code=303,
+        )
+    return RedirectResponse(
+        f"/today?message={quote('Лист добавлен.')}#group-{quote(group_id)}",
+        status_code=303,
+    )
+
+
+@app.post("/signed-scan-sessions/{session_id}/pages/{page_id}/replace")
+def replace_response_scan_session_page(
+    session_id: str,
+    page_id: str,
+    group_id: str = Form(""),
+):
+    try:
+        workflow.acquire_signed_scan_session_page(
+            session_id,
+            replace_page_id=page_id,
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+    except ScannerCancelled:
+        return RedirectResponse(
+            f"/today?message={quote('Пересканирование отменено; старый лист сохранён.')}"
+            f"#group-{quote(group_id)}",
+            status_code=303,
+        )
+    except (ScannerError, WorkflowValidationError) as exc:
+        return RedirectResponse(
+            f"/today?error={quote(str(exc))}#group-{quote(group_id)}",
+            status_code=303,
+        )
+    return RedirectResponse(
+        f"/today?message={quote('Лист заменён.')}#group-{quote(group_id)}",
+        status_code=303,
+    )
+
+
+@app.post("/signed-scan-sessions/{session_id}/pages/{page_id}/move")
+def move_response_scan_session_page(
+    session_id: str,
+    page_id: str,
+    direction: str = Form(...),
+    group_id: str = Form(""),
+):
+    try:
+        workflow.move_signed_scan_session_page(
+            session_id,
+            page_id,
+            direction,
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            f"/today?error={quote(str(exc))}#group-{quote(group_id)}",
+            status_code=303,
+        )
+    return RedirectResponse(
+        f"/today#group-{quote(group_id)}",
+        status_code=303,
+    )
+
+
+@app.post("/signed-scan-sessions/{session_id}/pages/{page_id}/remove")
+def remove_response_scan_session_page(
+    session_id: str,
+    page_id: str,
+    group_id: str = Form(""),
+):
+    try:
+        workflow.remove_signed_scan_session_page(
+            session_id,
+            page_id,
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            f"/today?error={quote(str(exc))}#group-{quote(group_id)}",
+            status_code=303,
+        )
+    return RedirectResponse(
+        f"/today?message={quote('Лист удалён из будущего PDF.')}"
+        f"#group-{quote(group_id)}",
+        status_code=303,
+    )
+
+
+@app.get("/signed-scan-sessions/{session_id}/pages/{page_id}")
+def preview_response_scan_session_page(session_id: str, page_id: str):
+    page = workflow.db.fetch_one(
+        """
+        SELECT * FROM signed_scan_session_pages
+        WHERE id = ? AND session_id = ?
+        """,
+        (page_id, session_id),
+    )
+    if not page:
+        raise HTTPException(404, "Лист не найден")
+    try:
+        path = ensure_within(
+            Path(page["original_path"]),
+            workflow.settings.runtime_dir / "signed_scans",
+        )
+    except StorageError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    if not path.is_file():
+        raise HTTPException(404, "Файл листа отсутствует")
+    return FileResponse(path, media_type="image/png", filename=path.name)
+
+
+@app.post("/signed-scan-sessions/{session_id}/finalize")
+def finalize_response_scan_session(
+    session_id: str,
+    group_id: str = Form(""),
+):
+    try:
+        workflow.finalize_signed_scan_session(
+            session_id,
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            f"/today?error={quote(str(exc))}#group-{quote(group_id)}",
+            status_code=303,
+        )
+    return RedirectResponse(
+        "/today?message="
+        + quote("PDF создан. Откройте его и подтвердите подписи и печать.")
+        + f"#group-{quote(group_id)}",
+        status_code=303,
+    )
+
+
+@app.post("/signed-scan-sessions/{session_id}/cancel")
+def cancel_response_scan_session(
+    session_id: str,
+    group_id: str = Form(""),
+):
+    try:
+        workflow.cancel_signed_scan_session(
+            session_id,
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            f"/today?error={quote(str(exc))}#group-{quote(group_id)}",
+            status_code=303,
+        )
+    return RedirectResponse(
+        f"/today?message={quote('Сессия сканирования отменена.')}"
+        f"#group-{quote(group_id)}",
+        status_code=303,
+    )
+
+
 @app.post("/response-letters/{letter_id}/scan-upload")
 def upload_response_letter_scan(
     letter_id: str,
@@ -1118,34 +1478,42 @@ def download_signed_response_scan(scan_id: str):
         raise HTTPException(403, str(exc)) from exc
     if not path.is_file():
         raise HTTPException(404, "Файл подписанного скана отсутствует")
-    return FileResponse(path, media_type="application/pdf", filename=path.name)
+    return FileResponse(
+        path,
+        media_type="application/pdf",
+    )
 
 
 @app.post("/signed-response-scans/{scan_id}/confirm")
 def confirm_signed_response_scan(
     scan_id: str,
     group_id: str = Form(""),
-    correct_letter: bool = Form(False),
-    signature_present: bool = Form(False),
-    bank_seal_present: bool = Form(False),
 ):
+    scan = workflow.get_signed_response_scan(scan_id)
+    letter_id = str(scan.get("response_letter_id") or "") if scan else ""
+    destination = "/?tab=responses&response_view=created"
+    if letter_id:
+        destination += "&focus_letter=" + quote(letter_id)
     try:
         workflow.confirm_signed_response_scan(
             scan_id,
-            correct_letter=correct_letter,
-            signature_present=signature_present,
-            bank_seal_present=bank_seal_present,
+            # Нажатие единственной кнопки после просмотра встроенного PDF
+            # является явным подтверждением всех трёх условий.
+            correct_letter=True,
+            signature_present=True,
+            bank_seal_present=True,
             actor=workflow.get_active_employee() or "Сотрудник",
         )
     except WorkflowValidationError as exc:
         return RedirectResponse(
-            f"/today?error={quote(str(exc))}#group-{quote(group_id)}",
+            destination + "&error=" + quote(str(exc)) + "#letter-workflow",
             status_code=303,
         )
     return RedirectResponse(
-        "/today?message="
+        destination
+        + "&message="
         + quote("Подписанный ответ проверен и готов к отправке.")
-        + f"#group-{quote(group_id)}",
+        + "#letter-workflow",
         status_code=303,
     )
 
@@ -1288,6 +1656,7 @@ def scan_inbox(background_tasks: BackgroundTasks):
 def upload_detail(
     request: Request,
     upload_id: str,
+    page: int | None = None,
     message: str = "",
     error: str = "",
 ):
@@ -1295,6 +1664,26 @@ def upload_detail(
     if not upload:
         raise HTTPException(404, "PDF не найден")
     pages = workflow.get_upload_pages(upload_id)
+    selected_index = next(
+        (
+            index
+            for index, item in enumerate(pages)
+            if item["status"] in {"needs_review", "technical_error"}
+        ),
+        0,
+    )
+    if page is not None:
+        selected_index = next(
+            (
+                index
+                for index, item in enumerate(pages)
+                if int(item["page_number"]) == page
+            ),
+            -1,
+        )
+        if selected_index < 0:
+            raise HTTPException(404, "Страница не найдена в этом PDF")
+    selected_page = pages[selected_index] if pages else None
     return templates.TemplateResponse(
         request,
         "upload_detail.html",
@@ -1302,6 +1691,15 @@ def upload_detail(
             request,
             upload=upload,
             pages=pages,
+            selected_page=selected_page,
+            previous_page=(
+                pages[selected_index - 1] if selected_index > 0 else None
+            ),
+            next_page=(
+                pages[selected_index + 1]
+                if pages and selected_index + 1 < len(pages)
+                else None
+            ),
             message=message,
             error=error,
         ),
@@ -1312,12 +1710,22 @@ def upload_detail(
 def reprocess_upload(
     background_tasks: BackgroundTasks,
     upload_id: str,
+    return_page: int | None = Form(default=None),
 ):
+    page_query = ""
+    if return_page is not None and any(
+        int(item["page_number"]) == return_page
+        for item in workflow.get_upload_pages(upload_id)
+    ):
+        page_query = f"page={return_page}&"
     try:
         count = workflow.request_problem_reprocess(upload_id)
     except WorkflowValidationError as exc:
         return RedirectResponse(
-            f"/uploads/{upload_id}?error={quote(str(exc))}",
+            (
+                f"/uploads/{upload_id}?{page_query}error={quote(str(exc))}"
+                f"{'#page-viewer' if page_query else ''}"
+            ),
             status_code=303,
         )
     background_tasks.add_task(
@@ -1327,8 +1735,9 @@ def reprocess_upload(
     )
     return RedirectResponse(
         (
-            f"/uploads/{upload_id}?message="
+            f"/uploads/{upload_id}?{page_query}message="
             f"{quote(f'Повторно обрабатывается страниц: {count}')}"
+            f"{'#page-viewer' if page_query else ''}"
         ),
         status_code=303,
     )
@@ -1375,9 +1784,19 @@ def reprocess_page(
     background_tasks: BackgroundTasks,
     page_id: str,
 ):
+    page_record = workflow.get_page(page_id)
     try:
         upload_id = workflow.request_page_reprocess(page_id)
     except WorkflowValidationError as exc:
+        if page_record:
+            return RedirectResponse(
+                (
+                    f"/uploads/{page_record['upload_id']}?"
+                    f"page={int(page_record['page_number'])}&"
+                    f"error={quote(str(exc))}#page-viewer"
+                ),
+                status_code=303,
+            )
         return RedirectResponse(
             f"/review/{page_id}?error={quote(str(exc))}",
             status_code=303,
@@ -1387,10 +1806,16 @@ def reprocess_page(
         upload_id,
         True,
     )
+    page_query = (
+        f"page={int(page_record['page_number'])}&"
+        if page_record
+        else ""
+    )
     return RedirectResponse(
         (
-            f"/uploads/{upload_id}?message="
+            f"/uploads/{upload_id}?{page_query}message="
             f"{quote('Страница поставлена на повторную обработку.')}"
+            "#page-viewer"
         ),
         status_code=303,
     )
@@ -1420,15 +1845,112 @@ def precise_ocr_page(
 
 @app.get("/review", response_class=HTMLResponse)
 def review_queue(request: Request, message: str = "", error: str = ""):
+    parameters = ["tab=review"]
+    if message:
+        parameters.append(f"message={quote(message)}")
+    if error:
+        parameters.append(f"error={quote(error)}")
+    return RedirectResponse(
+        "/?" + "&".join(parameters),
+        status_code=303,
+    )
+
+
+@app.get("/review/matches/{review_id}", response_class=HTMLResponse)
+def review_case_match(
+    request: Request,
+    review_id: str,
+    message: str = "",
+    error: str = "",
+):
+    workflow.reconcile_case_match_reviews()
+    review = workflow.get_case_match_review(review_id)
+    if not review:
+        raise HTTPException(404, "Проверка совпадения не найдена")
+    if review["status"] != "pending":
+        return RedirectResponse(
+            "/?tab=review&message=" + quote("Эта проверка уже завершена."),
+            status_code=303,
+        )
+    reviews = workflow.list_case_match_reviews()
+    review_index = next(
+        (
+            index
+            for index, item in enumerate(reviews)
+            if item["id"] == review_id
+        ),
+        0,
+    )
     return templates.TemplateResponse(
         request,
-        "review_queue.html",
+        "match_review.html",
         context(
             request,
-            pages=workflow.list_review_pages(),
+            review=review,
+            review_position=review_index + 1,
+            review_total=max(len(reviews), 1),
+            previous_review_id=(
+                reviews[review_index - 1]["id"] if review_index > 0 else None
+            ),
+            next_review_id=(
+                reviews[review_index + 1]["id"]
+                if review_index + 1 < len(reviews)
+                else None
+            ),
             message=message,
             error=error,
         ),
+    )
+
+
+@app.post("/review/matches/{review_id}")
+def confirm_case_match(
+    review_id: str,
+    decision: str = Form(...),
+    name_choice: str = Form(""),
+    inn_choice: str = Form(""),
+    manual_name: str = Form(""),
+    manual_inn: str = Form(""),
+):
+    try:
+        result = workflow.resolve_case_match_review(
+            review_id,
+            decision=decision,
+            name_choice=name_choice,
+            inn_choice=inn_choice,
+            manual_name=manual_name,
+            manual_inn=manual_inn,
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            f"/review/matches/{review_id}?error={quote(str(exc))}",
+            status_code=303,
+        )
+    remaining_matches = workflow.list_case_match_reviews()
+    if remaining_matches:
+        message = quote(
+            "Решение сохранено. Осталось сравнений: "
+            f"{len(remaining_matches)}."
+        )
+        return RedirectResponse(
+            f"/review/matches/{remaining_matches[0]['id']}?message={message}",
+            status_code=303,
+        )
+    remaining_pages = workflow.list_review_pages()
+    if remaining_pages:
+        return RedirectResponse(
+            f"/review/{remaining_pages[0]['id']}?message="
+            + quote("Решение сохранено. Перейдите к проверке страницы."),
+            status_code=303,
+        )
+    message = (
+        "Совпадение подтверждено. Обращения продолжили обработку."
+        if result["decision"] == "same"
+        else "Обращения подтверждены как разные и продолжили обработку."
+    )
+    return RedirectResponse(
+        f"/?tab=review&message={quote(message)}", status_code=303
     )
 
 
@@ -1477,6 +1999,22 @@ def review_page(request: Request, page_id: str, error: str = ""):
     if not taxpayers:
         taxpayers = [{"name": "", "inn": ""}]
     upload = workflow.get_upload(page["upload_id"])
+    review_pages = workflow.list_review_pages()
+    review_index = next(
+        (
+            index
+            for index, review_item in enumerate(review_pages)
+            if review_item["id"] == page_id
+        ),
+        None,
+    )
+    previous_review_page_id = None
+    next_review_page_id = None
+    if review_index is not None:
+        if review_index > 0:
+            previous_review_page_id = review_pages[review_index - 1]["id"]
+        if review_index + 1 < len(review_pages):
+            next_review_page_id = review_pages[review_index + 1]["id"]
     return templates.TemplateResponse(
         request,
         "review_page.html",
@@ -1489,6 +2027,10 @@ def review_page(request: Request, page_id: str, error: str = ""):
             upload=upload or {},
             gns_offices=workflow.list_gns_offices(),
             period_status=period_review_status(case or {}),
+            review_position=(review_index + 1) if review_index is not None else 1,
+            review_total=max(len(review_pages), 1),
+            previous_review_page_id=previous_review_page_id,
+            next_review_page_id=next_review_page_id,
             error=error,
         ),
     )
@@ -1551,6 +2093,16 @@ def confirm_review(
             f"/review/{next_page_id}?message={message}",
             status_code=303,
         )
+    match_reviews = workflow.list_case_match_reviews()
+    if match_reviews:
+        message = quote(
+            "Страница подтверждена. Теперь проверьте возможное "
+            "совпадение обращений."
+        )
+        return RedirectResponse(
+            f"/review/matches/{match_reviews[0]['id']}?message={message}",
+            status_code=303,
+        )
     if case_id:
         return RedirectResponse(
             f"/cases/{case_id}?message=" + quote(
@@ -1559,7 +2111,7 @@ def confirm_review(
             status_code=303,
         )
     return RedirectResponse(
-        "/review?message=" + quote("Проблемных страниц больше нет."),
+        "/?tab=review&message=" + quote("Проблемных страниц больше нет."),
         status_code=303,
     )
 
@@ -1573,12 +2125,30 @@ def mark_review_page_type(
         removed = workflow.mark_page_type_from_queue(page_id, page_type)
     except WorkflowValidationError as exc:
         return RedirectResponse(
-            "/review?error=" + quote(str(exc)),
+            "/?tab=review&error=" + quote(str(exc)),
             status_code=303,
         )
     if removed:
         return RedirectResponse(
-            "/review?message=" + quote("Тип страницы подтверждён."),
+            "/?tab=review&message="
+            + quote("Тип страницы подтверждён.")
+            + "&undo_page_id="
+            + quote(page_id),
+            status_code=303,
+        )
+    return RedirectResponse(f"/review/{page_id}", status_code=303)
+
+
+@app.post("/pages/{page_id}/reopen-type")
+def reopen_page_type_review(page_id: str):
+    try:
+        workflow.reopen_page_type_review(
+            page_id,
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            "/?tab=review&error=" + quote(str(exc)),
             status_code=303,
         )
     return RedirectResponse(f"/review/{page_id}", status_code=303)
@@ -1593,12 +2163,29 @@ def cases_list(request: Request):
     )
 
 
+@app.post("/cases/{case_id}/reopen-review")
+def reopen_incomplete_case_review(case_id: str):
+    try:
+        page = workflow.reopen_incomplete_case_review(
+            case_id,
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            f"/cases/{case_id}?error={quote(str(exc))}",
+            status_code=303,
+        )
+    return RedirectResponse(f"/review/{page['id']}", status_code=303)
+
+
 @app.get("/cases/{case_id}", response_class=HTMLResponse)
 def case_detail(request: Request, case_id: str, message: str = "", error: str = ""):
     case = workflow.get_case(case_id)
     if not case:
         raise HTTPException(404, "Обращение не найдено")
     taxpayers = workflow.get_taxpayers(case_id)
+    source_page = workflow.get_case_source_page(case_id)
+    source_upload = workflow.get_upload(case["upload_id"])
     return templates.TemplateResponse(
         request,
         "case_detail.html",
@@ -1606,6 +2193,8 @@ def case_detail(request: Request, case_id: str, message: str = "", error: str = 
             request,
             case=case,
             taxpayers=taxpayers,
+            source_page=source_page,
+            source_upload=source_upload,
             odb_pending_taxpayers=[
                 item for item in taxpayers if not item.get("odb_result")
             ],
@@ -1633,6 +2222,51 @@ def case_detail(request: Request, case_id: str, message: str = "", error: str = 
             message=message,
             error=error,
         ),
+    )
+
+
+@app.post("/cases/{case_id}/taxpayers/{taxpayer_id}/correct")
+def correct_taxpayer(
+    case_id: str,
+    taxpayer_id: str,
+    taxpayer_name: str = Form(...),
+    taxpayer_inn: str = Form(...),
+    return_to: str = Form(""),
+):
+    try:
+        result = workflow.correct_taxpayer(
+            case_id,
+            taxpayer_id,
+            name=taxpayer_name,
+            inn=taxpayer_inn,
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+    except WorkflowValidationError as exc:
+        destination = (
+            "/today" if return_to == "today" else f"/cases/{case_id}"
+        )
+        return RedirectResponse(
+            f"{destination}?error={quote(str(exc))}",
+            status_code=303,
+        )
+
+    if result["requires_abs_recheck"]:
+        message = quote(
+            "ИНН исправлен. Результат прежней проверки сброшен — проверьте обращение в АБС повторно."
+        )
+        return RedirectResponse(
+            f"/cases/{case_id}?message={message}",
+            status_code=303,
+        )
+    message = quote(
+        "Наименование исправлено. Группа ответов пересобрана автоматически."
+    )
+    destination = (
+        "/today" if return_to == "today" else f"/cases/{case_id}"
+    )
+    return RedirectResponse(
+        f"{destination}?message={message}",
+        status_code=303,
     )
 
 

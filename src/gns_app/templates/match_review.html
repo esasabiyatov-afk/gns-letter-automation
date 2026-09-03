@@ -1,0 +1,145 @@
+{% extends "base.html" %}
+{% block title %}Сравнение обращений · ГНС{% endblock %}
+{% block body_class %}workspace-page{% endblock %}
+{% block content %}
+<div class="match-review-page">
+  <header class="match-review-page-header">
+    <div>
+      <a class="back-link" href="/?tab=review">← К ручной проверке</a>
+      <p class="eyebrow">СОВПАДЕНИЕ ОБРАЩЕНИЙ</p>
+      <h1>Это одно и то же обращение?</h1>
+      <p>{{ review.issue_message }}</p>
+    </div>
+    <nav class="review-queue-nav" aria-label="Навигация по сравнениям">
+      {% if previous_review_id %}
+        <a href="/review/matches/{{ previous_review_id }}"
+           aria-label="Предыдущее сравнение">←</a>
+      {% else %}<span>←</span>{% endif %}
+      <strong>{{ review_position }} из {{ review_total }}</strong>
+      {% if next_review_id %}
+        <a href="/review/matches/{{ next_review_id }}"
+           aria-label="Следующее сравнение">→</a>
+      {% else %}<span>→</span>{% endif %}
+    </nav>
+  </header>
+
+  {% if message %}<div class="alert alert-success">{{ message }}</div>{% endif %}
+  {% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
+
+  <section class="match-source-grid" aria-label="Версии обращения">
+    {% for source in [review.left, review.right] %}
+    <article class="match-source-card">
+      <div class="match-source-heading">
+        <div>
+          <span>Версия {{ loop.index }}</span>
+          <strong>{{ source_labels.get(source.source_kind, source.source_kind) }}</strong>
+        </div>
+        {% if source.source_page_id %}
+          <a class="text-link" href="/pages/{{ source.source_page_id }}/pdf"
+             target="_blank">Открыть лист</a>
+        {% else %}
+          <a class="text-link" href="/cases/{{ source.id }}"
+             target="_blank">Открыть карточку</a>
+        {% endif %}
+      </div>
+      <dl class="match-source-fields">
+        <div{% if review.differing_field == 'name' %} class="match-field-difference"{% endif %}>
+          <dt>
+            Наименование лица
+            {% if review.differing_field == 'name' %}<span>Отличается</span>{% endif %}
+          </dt>
+          <dd>{{ source.taxpayer.name }}</dd>
+          <small>{{ source_labels.get(source.taxpayer.name_source, source.taxpayer.name_source) }}</small>
+        </div>
+        <div{% if review.differing_field == 'inn' %} class="match-field-difference"{% endif %}>
+          <dt>
+            ИНН
+            {% if review.differing_field == 'inn' %}<span>Отличается</span>{% endif %}
+          </dt>
+          <dd>{{ source.taxpayer.inn }}</dd>
+          <small>{{ source_labels.get(source.taxpayer.inn_source, source.taxpayer.inn_source) }}</small>
+        </div>
+        <div>
+          <dt>Адресат</dt>
+          <dd>{{ source.recipient_full_name }}</dd>
+          <small>УГНС {{ source.district_place }}</small>
+        </div>
+        <div>
+          <dt>Период</dt>
+          <dd>
+            {% if source.period_start and source.period_end %}
+              {{ source.period_start }} — {{ source.period_end }}
+            {% elif source.period_route == 'odb' %}по данным ОДБ
+            {% else %}без ОДБ{% endif %}
+          </dd>
+          <small>{{ source.original_filename }}{% if source.source_page_number %} · лист {{ source.source_page_number }}{% endif %}</small>
+        </div>
+      </dl>
+    </article>
+    {% endfor %}
+  </section>
+
+  <section class="match-decision-panel">
+    <div class="match-decision-heading">
+      <div>
+        <p class="eyebrow">РЕШЕНИЕ СОТРУДНИКА</p>
+        <h2>Если это одно обращение</h2>
+        <p>Выберите итог отдельно для каждого поля. Значения не объединяются автоматически.</p>
+      </div>
+      <form method="post" action="/review/matches/{{ review.id }}">
+        <input type="hidden" name="decision" value="distinct">
+        <button class="button button-secondary" type="submit">
+          Нет, это разные обращения
+        </button>
+      </form>
+    </div>
+
+    <form class="match-resolution-form" method="post"
+          action="/review/matches/{{ review.id }}">
+      <input type="hidden" name="decision" value="same">
+      <fieldset{% if review.differing_field == 'name' %} class="match-resolution-difference"{% endif %}>
+        <legend>Итоговое наименование</legend>
+        {% for source in [review.left, review.right] %}
+          <label>
+            <input type="radio" name="name_choice"
+                   value="{{ source.taxpayer.id }}" required>
+            <span>{{ source.taxpayer.name }}</span>
+            <small>Версия {{ loop.index }} · {{ source_labels.get(source.taxpayer.name_source, source.taxpayer.name_source) }}</small>
+          </label>
+        {% endfor %}
+        <label class="conflict-manual-choice">
+          <input type="radio" name="name_choice" value="manual" required>
+          <span>Ввести вручную</span>
+          <input type="text" name="manual_name"
+                 aria-label="Итоговое наименование вручную">
+        </label>
+      </fieldset>
+      <fieldset{% if review.differing_field == 'inn' %} class="match-resolution-difference"{% endif %}>
+        <legend>Итоговый ИНН</legend>
+        {% for source in [review.left, review.right] %}
+          <label>
+            <input type="radio" name="inn_choice"
+                   value="{{ source.taxpayer.id }}" required>
+            <span>{{ source.taxpayer.inn }}</span>
+            <small>Версия {{ loop.index }} · {{ source_labels.get(source.taxpayer.inn_source, source.taxpayer.inn_source) }}</small>
+          </label>
+        {% endfor %}
+        <label class="conflict-manual-choice">
+          <input type="radio" name="inn_choice" value="manual" required>
+          <span>Ввести вручную</span>
+          <input type="text" name="manual_inn" inputmode="numeric"
+                 pattern="[0-9]{14}" maxlength="14"
+                 aria-label="Итоговый ИНН вручную">
+        </label>
+      </fieldset>
+      <p class="conflict-impact-note">
+        Если итоговый ИНН изменится, прежние результаты АБС и ОДБ будут
+        сброшены. Обращение пройдёт проверку заново.
+      </p>
+      <button class="button button-primary" type="submit">
+        Да, применить итоговые данные
+      </button>
+    </form>
+  </section>
+</div>
+{% endblock %}

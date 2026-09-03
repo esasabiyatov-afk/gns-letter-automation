@@ -1,21 +1,34 @@
 {% extends "base.html" %}
 {% block title %}{{ upload.original_filename }} · ГНС{% endblock %}
+{% block body_class %}upload-workspace-page{% endblock %}
 {% block head %}
-{% if upload.status in ['registered', 'processing'] %}
+{% if upload.status in ['registered', 'processing'] and not request.query_params.get('page') %}
   <meta http-equiv="refresh" content="5">
 {% endif %}
 {% endblock %}
 {% block content %}
-<div class="page-heading">
+<div class="page-heading upload-page-heading">
   <div>
-    <a class="back-link" href="/">← Главная</a>
+    <a class="back-link" href="/?tab=incoming">← Входящие</a>
     <p class="eyebrow">ПАКЕТНЫЙ PDF</p>
-    <h1>{{ upload.original_filename }}</h1>
-    <p>{{ upload.page_count }} страниц · SHA-256 {{ upload.sha256[:12] }}…</p>
+    <h1 title="{{ upload.original_filename }}">{{ upload.original_filename }}</h1>
+    <p>{{ upload.page_count }} {{ page_word(upload.page_count) }} · SHA-256 {{ upload.sha256[:12] }}…</p>
   </div>
-  <span class="status status-{{ upload.status }}">
-    {{ status_labels.get(upload.status, upload.status) }}
-  </span>
+  <div class="upload-heading-actions">
+    <span class="status status-{{ upload.status }}">
+      {{ status_labels.get(upload.status, upload.status) }}
+    </span>
+    {% if upload.status == 'needs_review' %}
+      <form method="post" action="/uploads/{{ upload.id }}/reprocess">
+        {% if selected_page %}
+          <input type="hidden" name="return_page" value="{{ selected_page.page_number }}">
+        {% endif %}
+        <button class="button button-secondary button-compact" type="submit">
+          Повторить проблемные
+        </button>
+      </form>
+    {% endif %}
+  </div>
 </div>
 
 {% if message %}<div class="alert alert-success">{{ message }}</div>{% endif %}
@@ -26,63 +39,123 @@
   <span class="spinner"></span>
   Обработка идёт в фоне. Страница обновляется автоматически.
 </div>
-{% elif upload.status == 'needs_review' %}
-<form method="post" action="/uploads/{{ upload.id }}/reprocess" class="reprocess-form">
-  <button class="button button-secondary" type="submit">
-    Повторно обработать проблемные страницы
-  </button>
-</form>
 {% endif %}
 
-<section class="page-grid">
-{% for page in pages %}
-  <article class="page-card {% if page.status in ['needs_review', 'technical_error'] %}page-card-problem{% endif %}">
-    <div class="page-preview">
-      {% if page.preview_path %}
-        <img src="/pages/{{ page.id }}/image" alt="Страница {{ page.page_number }}">
-      {% else %}
-        <div class="preview-placeholder"><span>{{ page.page_number }}</span></div>
-      {% endif %}
-      <span class="page-number">Стр. {{ page.page_number }}</span>
-    </div>
-    <div class="page-card-body">
-      <div class="page-meta">
-        <strong>{{ page_type_labels.get(page.page_type, page.page_type) }}</strong>
-        <span class="status status-{{ page.status }}">
-          {{ status_labels.get(page.status, page.status) }}
-        </span>
+{% if selected_page %}
+<div class="upload-workspace{% if message or error %} has-notice{% endif %}{% if upload.status in ['registered', 'processing'] %} has-progress{% endif %}"
+     data-testid="upload-workspace">
+  <section id="page-viewer" class="upload-document-viewer"
+           data-testid="upload-page-viewer"
+           aria-labelledby="upload-document-title">
+    <div class="upload-document-toolbar">
+      <div>
+        <p class="eyebrow">СТРАНИЦА {{ selected_page.page_number }} ИЗ {{ pages|length }}</p>
+        <h2 id="upload-document-title">
+          {{ page_type_labels.get(selected_page.page_type, selected_page.page_type) }}
+        </h2>
       </div>
-      <dl>
-        <div><dt>QR</dt><dd>{{ qr_status_labels.get(page.qr_status, page.qr_status) }}</dd></div>
-        <div><dt>OCR</dt><dd>{{ ocr_status_labels.get(page.ocr_status, page.ocr_status) }}</dd></div>
-        <div><dt>Качество</dt><dd>{% if page.quality_score is not none %}{{ (page.quality_score * 100)|round|int }}%{% else %}—{% endif %}</dd></div>
-      </dl>
-      {% if page.issue_message %}
-        <p class="issue-text">{{ page.issue_message }}</p>
-      {% endif %}
-      {% if page.status == 'technical_error' %}
-        <form method="post" action="/pages/{{ page.id }}/reprocess">
-          <button class="button button-danger button-block" type="submit">
-            Повторить обработку
-          </button>
-        </form>
-        {% if page.preview_path %}
-          <a class="text-link page-preview-link"
-             href="/pages/{{ page.id }}/image" target="_blank">
-            Открыть сохранённое превью
-          </a>
-        {% endif %}
-      {% elif page.status == 'needs_review' %}
-        <a class="button button-danger button-block" href="/review/{{ page.id }}">
-          Проверить страницу
-        </a>
-      {% elif page.preview_path %}
-        <a class="button button-secondary button-block" href="/pages/{{ page.id }}/image" target="_blank">
-          Открыть превью
-        </a>
-      {% endif %}
+      <div class="upload-viewer-actions">
+        <span class="status status-{{ selected_page.status }}">
+          {{ status_labels.get(selected_page.status, selected_page.status) }}
+        </span>
+        <nav class="upload-page-navigation" aria-label="Переключение страниц">
+          {% if previous_page %}
+            <a href="/uploads/{{ upload.id }}?page={{ previous_page.page_number }}#page-viewer"
+               aria-label="Предыдущая страница">←</a>
+          {% else %}
+            <span aria-hidden="true">←</span>
+          {% endif %}
+          <strong>{{ selected_page.page_number }} / {{ pages|length }}</strong>
+          {% if next_page %}
+            <a href="/uploads/{{ upload.id }}?page={{ next_page.page_number }}#page-viewer"
+               aria-label="Следующая страница">→</a>
+          {% else %}
+            <span aria-hidden="true">→</span>
+          {% endif %}
+        </nav>
+      </div>
     </div>
-  </article>
-{% endfor %}
-</section>
+    <iframe
+      id="upload-page-pdf"
+      data-testid="upload-page-pdf"
+      src="/pages/{{ selected_page.id }}/pdf#page=1&zoom=page-fit"
+      title="PDF, страница {{ selected_page.page_number }}">
+    </iframe>
+  </section>
+
+  <section class="upload-pages-pane" aria-labelledby="upload-pages-title">
+    <div class="upload-pages-heading">
+      <div>
+        <p class="eyebrow">ЛИСТЫ ПАКЕТА</p>
+        <h2 id="upload-pages-title">{{ pages|length }} {{ page_word(pages|length) }}</h2>
+      </div>
+      <small>Выберите лист для просмотра</small>
+    </div>
+    <div class="upload-page-list" role="list" data-testid="upload-page-list">
+      {% for page in pages %}
+        {% set is_selected = page.id == selected_page.id %}
+        <article class="upload-page-row{% if is_selected %} is-selected{% endif %}{% if page.status in ['needs_review', 'technical_error'] %} is-problem{% endif %}"
+                 role="listitem" data-page-id="{{ page.id }}"
+                 data-testid="upload-page-row">
+          <a class="upload-page-select"
+             href="/uploads/{{ upload.id }}?page={{ page.page_number }}#page-viewer"
+             aria-controls="upload-page-pdf"
+             {% if is_selected %}aria-current="page"{% endif %}>
+            <span class="upload-page-thumbnail" aria-hidden="true">
+              {% if page.preview_path %}
+                <img src="/pages/{{ page.id }}/image" alt="">
+              {% else %}
+                <span>{{ page.page_number }}</span>
+              {% endif %}
+            </span>
+            <span class="upload-page-summary">
+              <span class="upload-page-summary-top">
+                <strong>Стр. {{ page.page_number }} · {{ page_type_labels.get(page.page_type, page.page_type) }}</strong>
+                <span class="status status-{{ page.status }}">
+                  {{ status_labels.get(page.status, page.status) }}
+                </span>
+              </span>
+              <span class="upload-page-metrics">
+                QR: {{ qr_status_labels.get(page.qr_status, page.qr_status) }} ·
+                OCR: {{ ocr_status_labels.get(page.ocr_status, page.ocr_status) }} ·
+                {% if page.quality_score is not none %}{{ (page.quality_score * 100)|round|int }}%{% else %}качество —{% endif %}
+              </span>
+              {% if page.issue_message %}
+                <small class="upload-page-issue">{{ page.issue_message }}</small>
+              {% endif %}
+            </span>
+          </a>
+          {% if page.status == 'technical_error' %}
+            <form class="upload-page-row-action" method="post"
+                  action="/pages/{{ page.id }}/reprocess">
+              <button class="button button-danger button-compact" type="submit">
+                Повторить
+              </button>
+            </form>
+          {% elif page.status == 'needs_review' %}
+            <a class="button button-danger button-compact upload-page-row-action"
+               href="/review/{{ page.id }}">
+              Проверить
+            </a>
+          {% elif page.status == 'manually_confirmed'
+                    and page.manual_confirmed
+                    and page.page_type != 'letter' %}
+            <form class="upload-page-row-action" method="post"
+                  action="/pages/{{ page.id }}/reopen-type">
+              <button class="button button-quiet button-compact" type="submit">
+                Изменить тип
+              </button>
+            </form>
+          {% endif %}
+        </article>
+      {% endfor %}
+    </div>
+  </section>
+</div>
+{% else %}
+  <div class="empty-state large" data-testid="upload-pages-empty">
+    <strong>Страницы ещё не зарегистрированы</strong>
+    <span>Они появятся здесь во время обработки PDF.</span>
+  </div>
+{% endif %}
 {% endblock %}

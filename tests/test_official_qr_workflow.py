@@ -84,6 +84,96 @@ def test_complete_official_qr_needs_no_manual_confirmation(
     assert taxpayers[0]["manually_confirmed"] == 1
 
 
+def test_official_qr_district_typo_uses_canonical_directory_value(
+    workflow,
+    sample_pdf: Path,
+    monkeypatch,
+):
+    workflow.initialize_employee_profiles()
+    with sample_pdf.open("rb") as stream:
+        upload_id = workflow.create_upload(sample_pdf.name, stream)
+    case_id, _ = workflow._ensure_qr_case(upload_id, "panfilov-qr-hash")
+    fields = ExtractedFields(
+        district_place="по Панфиловсому району Чуйской области",
+        recipient_position="Начальник управления",
+        recipient_full_name="Тынганбеков Данис Тынганбекович",
+        period_start="2026-05-08",
+        period_end="2026-07-27",
+        taxpayers=[
+            ExtractedTaxpayer(
+                name='Учреждение "Фонд развития Панфиловского района"',
+                inn="02704201810121",
+                confidence=0.99,
+            )
+        ],
+        confidence=0.96,
+    )
+    monkeypatch.setattr(workflow, "_official_text", lambda _path: "official")
+    monkeypatch.setattr(
+        workflow.extractor,
+        "extract_official_letter",
+        lambda _text: fields,
+    )
+
+    complete = workflow._apply_official_document(case_id, sample_pdf)
+
+    case = workflow.get_case(case_id)
+    assert complete
+    assert case["district_place"] == (
+        "по Панфиловскому району Чуйской области"
+    )
+    event = workflow.db.fetch_one(
+        """
+        SELECT payload_json
+        FROM audit_events
+        WHERE entity_type = 'case' AND entity_id = ?
+          AND event_type = 'gns_office_location_canonicalized'
+        ORDER BY id DESC LIMIT 1
+        """,
+        (case_id,),
+    )
+    assert event is not None
+
+
+def test_unknown_official_qr_district_stays_in_manual_review(
+    workflow,
+    sample_pdf: Path,
+    monkeypatch,
+):
+    workflow.initialize_employee_profiles()
+    with sample_pdf.open("rb") as stream:
+        upload_id = workflow.create_upload(sample_pdf.name, stream)
+    case_id, _ = workflow._ensure_qr_case(upload_id, "unknown-office-qr")
+    fields = ExtractedFields(
+        district_place="по Совершенно Неизвестному району",
+        recipient_position="Начальник управления",
+        recipient_full_name="Тестов Тест Тестович",
+        period_start="2026-05-08",
+        period_end="2026-07-27",
+        taxpayers=[
+            ExtractedTaxpayer(
+                name="ИП Тестов Тест Тестович",
+                inn="12701200100011",
+                confidence=0.99,
+            )
+        ],
+        confidence=0.96,
+    )
+    monkeypatch.setattr(workflow, "_official_text", lambda _path: "official")
+    monkeypatch.setattr(
+        workflow.extractor,
+        "extract_official_letter",
+        lambda _text: fields,
+    )
+
+    complete = workflow._apply_official_document(case_id, sample_pdf)
+
+    case = workflow.get_case(case_id)
+    assert not complete
+    assert case["fields_confirmed"] == 0
+    assert case["status"] == CaseStatus.NEEDS_REVIEW
+
+
 def test_stale_review_page_is_completed_when_official_qr_is_complete(
     workflow,
     sample_pdf: Path,

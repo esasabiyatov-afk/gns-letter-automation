@@ -12,7 +12,7 @@ from difflib import SequenceMatcher
 from datetime import UTC, date, datetime, time, timedelta, timezone
 from pathlib import Path
 from threading import RLock
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Callable
 from uuid import uuid4
 
 from docx import Document
@@ -52,7 +52,11 @@ from gns_app.services.registry_service import (
     RegistryLookupError,
     RegistryLookupResult,
 )
-from gns_app.services.scanner_service import ScannerService
+from gns_app.services.scanner_service import (
+    ScannerCancelled,
+    ScannerError,
+    ScannerService,
+)
 from gns_app.services.visual_classifier import PageVisualAnalyzer
 from gns_app.services.storage import (
     ensure_within,
@@ -62,6 +66,7 @@ from gns_app.services.storage import (
 from gns_app.services.taxpayer_service import (
     TaxpayerKind,
     classify_taxpayer,
+    response_taxpayer_name,
 )
 from gns_app.services.word_service import WordTemplateError, WordTemplateService
 from gns_app.text_cleanup import clean_location, clean_taxpayer_name
@@ -82,12 +87,26 @@ class WorkflowService:
     INBOX_DIR_SETTING = "inbox_dir"
     REGISTRY_PRIORITY_SETTING = "registry_priority"
     PROCESSING_WORKERS_SETTING = "processing_workers"
+    # Город Ош — отдельная административная единица. Упоминание Ошской
+    # области в той же фразе противоречит городскому маршруту и не может
+    # автоматически выбрать его по частичному совпадению.
+    INDEPENDENT_CITY_REGION_CONFLICTS = {
+        "по г ош": "ошской области",
+    }
     UI_SETTING_DEFAULTS = {
         "allow_multiple_taxpayers": False,
         "show_recipient_salutation": True,
         "require_review_checkbox": False,
     }
-    OFFICIAL_PARSER_VERSION = 2
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+    OFFICIAL_PARSER_VERSION = 3
     BUSINESS_TIMEZONE = timezone(timedelta(hours=6), "Asia/Bishkek")
     DEFAULT_GNS_OFFICES_PATH = (
         Path(__file__).resolve().parents[1]
@@ -134,6 +153,13 @@ class WorkflowService:
             self.names,
         )
         self.scanner = ScannerService()
+        self._gns_offices_cache: list[dict[str, Any]] | None = None
+        self._gns_office_terms_cache: list[
+            tuple[dict[str, Any], frozenset[str]]
+        ] | None = None
+        self._gns_office_exact_cache: dict[
+            str, tuple[dict[str, Any], ...]
+        ] | None = None
         # OCR и рендер независимых страниц выполняются параллельно, а создание
         # и связывание карточек остаётся последовательным. Это исключает две
         # карточки для страниц с одинаковым QR.
@@ -518,6 +544,7 @@ class WorkflowService:
                         now,
                     ),
                 )
+        self._invalidate_gns_office_cache()
         self.db.audit(
             "settings",
             "gns_offices",
@@ -669,9 +696,17 @@ class WorkflowService:
             },
             actor="Система",
         )
+        self._invalidate_gns_office_cache()
         return {"updated": updated, "unmatched": unmatched}
 
+    def _invalidate_gns_office_cache(self) -> None:
+        self._gns_offices_cache = None
+        self._gns_office_terms_cache = None
+        self._gns_office_exact_cache = None
+
     def list_gns_offices(self) -> list[dict[str, Any]]:
+        if self._gns_offices_cache is not None:
+            return self._gns_offices_cache
         rows = self.db.fetch_all(
             """
             SELECT * FROM gns_offices
@@ -686,13 +721,24 @@ class WorkflowService:
                 )
             except json.JSONDecodeError:
                 row["aliases"] = []
-        return rows
+        self._gns_offices_cache = rows
+        return self._gns_offices_cache
 
-    def match_gns_office(self, text: str) -> dict[str, Any] | None:
-        normalized_text = self._normalize_office_text(text)
-        if not normalized_text:
-            return None
-        matches: list[dict[str, Any]] = []
+    def _gns_office_match_index(
+        self,
+    ) -> tuple[
+        list[tuple[dict[str, Any], frozenset[str]]],
+        dict[str, tuple[dict[str, Any], ...]],
+    ]:
+        if (
+            self._gns_office_terms_cache is not None
+            and self._gns_office_exact_cache is not None
+        ):
+            return self._gns_office_terms_cache, self._gns_office_exact_cache
+        terms_by_office: list[
+            tuple[dict[str, Any], frozenset[str]]
+        ] = []
+        exact: dict[str, list[dict[str, Any]]] = {}
         for office in self.list_gns_offices():
             raw_terms = [
                 office.get("office_name") or "",
@@ -700,11 +746,51 @@ class WorkflowService:
                 office.get("postal_address") or "",
                 *(office.get("aliases") or []),
             ]
-            normalized_terms = {
+            all_normalized_terms = frozenset(
                 normalized
                 for term in raw_terms
-                if len(normalized := self._normalize_office_text(term)) >= 8
-            }
+                if (normalized := self._normalize_office_text(term))
+            )
+            # Короткая форма «по г. Ош» допустима только как точное и
+            # уникальное значение. В поиске подстроки она слишком общая и
+            # могла бы захватить более длинный, другой адресат.
+            normalized_terms = frozenset(
+                term for term in all_normalized_terms if len(term) >= 8
+            )
+            terms_by_office.append((office, normalized_terms))
+            for term in all_normalized_terms:
+                candidates = exact.setdefault(term, [])
+                if not any(
+                    candidate["id"] == office["id"]
+                    for candidate in candidates
+                ):
+                    candidates.append(office)
+        self._gns_office_terms_cache = terms_by_office
+        self._gns_office_exact_cache = {
+            term: tuple(candidates) for term, candidates in exact.items()
+        }
+        return self._gns_office_terms_cache, self._gns_office_exact_cache
+
+    def match_gns_office(self, text: str) -> dict[str, Any] | None:
+        normalized_text = self._normalize_office_text(text)
+        if not normalized_text:
+            return None
+        terms_by_office, exact = self._gns_office_match_index()
+        direct = exact.get(normalized_text, ())
+        if len(direct) == 1:
+            return direct[0]
+        if len(direct) > 1:
+            return None
+        matches: list[dict[str, Any]] = []
+        for office, normalized_terms in terms_by_office:
+            district = self._normalize_office_text(
+                office.get("district_place") or ""
+            )
+            prohibited_region = self.INDEPENDENT_CITY_REGION_CONFLICTS.get(
+                district
+            )
+            if prohibited_region and prohibited_region in normalized_text:
+                continue
             if any(term in normalized_text for term in normalized_terms):
                 matches.append(office)
         return matches[0] if len(matches) == 1 else None
@@ -777,6 +863,168 @@ class WorkflowService:
         if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 0.08:
             return None
         return ranked[0][1]
+
+    def canonical_gns_office(
+        self,
+        text: str,
+    ) -> dict[str, Any] | None:
+        """Return one directory office for an exact or safe fuzzy match.
+
+        The local directory is the only source of the canonical district
+        value. A fuzzy result is accepted only when it clears both the
+        confidence threshold and the gap from the runner-up.
+        """
+        if not self.list_gns_offices():
+            self.initialize_gns_offices()
+        return self.best_gns_office(clean_location(text))
+
+    def reconcile_gns_office_districts(self) -> dict[str, int]:
+        """Canonicalize saved cases and unsigned generated responses."""
+        now = utc_now()
+        case_count = 0
+        group_count = 0
+        for case in self.db.fetch_all(
+            """
+            SELECT id, district_place
+            FROM cases
+            WHERE district_place IS NOT NULL AND district_place != ''
+            ORDER BY created_at, id
+            """
+        ):
+            before = clean_location(case["district_place"])
+            office = self.canonical_gns_office(before)
+            if not office:
+                continue
+            after = office["district_place"]
+            if before == after:
+                continue
+            self.db.execute(
+                "UPDATE cases SET district_place = ?, updated_at = ? WHERE id = ?",
+                (after, now, case["id"]),
+            )
+            self.db.audit(
+                "case",
+                case["id"],
+                "gns_office_location_canonicalized",
+                {
+                    "before": before,
+                    "after": after,
+                    "office_id": office["id"],
+                    "source": "unique_directory_match",
+                },
+            )
+            case_count += 1
+
+        for group in self.db.fetch_all(
+            """
+            SELECT *
+            FROM response_groups
+            WHERE status = 'created'
+              AND district_place IS NOT NULL
+              AND district_place != ''
+            ORDER BY created_at, id
+            """
+        ):
+            before = clean_location(group["district_place"])
+            office = self.canonical_gns_office(before)
+            if not office:
+                continue
+            after = office["district_place"]
+            if before == after:
+                continue
+            active_scan = self.db.fetch_one(
+                """
+                SELECT signed_response_scans.id
+                FROM signed_response_scans
+                JOIN response_letters
+                  ON response_letters.id =
+                     signed_response_scans.response_letter_id
+                WHERE response_letters.response_group_id = ?
+                  AND signed_response_scans.status != 'superseded'
+                LIMIT 1
+                """,
+                (group["id"],),
+            )
+            if active_scan:
+                self.db.audit(
+                    "response_group",
+                    group["id"],
+                    "gns_office_canonicalization_needs_review",
+                    {
+                        "office_id": office["id"],
+                        "reason": "signed_response_exists",
+                    },
+                )
+                continue
+
+            taxpayers = self.db.fetch_all(
+                """
+                SELECT name, inn
+                FROM response_group_taxpayers
+                WHERE response_group_id = ?
+                ORDER BY display_order
+                """,
+                (group["id"],),
+            )
+            letters = self.db.fetch_all(
+                """
+                SELECT outgoing_number
+                FROM response_letters
+                WHERE response_group_id = ?
+                ORDER BY letter_order
+                """,
+                (group["id"],),
+            )
+            output = ensure_within(
+                Path(group["response_path"]),
+                self.settings.responses_dir,
+            )
+            if not taxpayers or not letters or not output.exists():
+                continue
+            temporary = output.with_name(
+                f".{output.stem}-district-{uuid4().hex}.docx"
+            )
+            try:
+                _, likely_overflow = self.word.render_pages(
+                    temporary,
+                    {
+                        "district_place": after,
+                        "recipient_position": group["recipient_position"],
+                        "recipient_display_name": group["recipient_display_name"],
+                        "employee_name": group["employee_name"],
+                    },
+                    taxpayers,
+                    int(group["taxpayers_per_letter"] or len(taxpayers)),
+                    outgoing_numbers=[
+                        str(letter["outgoing_number"] or "")
+                        for letter in letters
+                    ],
+                )
+                temporary.replace(output)
+            except (OSError, WordTemplateError, ValueError):
+                temporary.unlink(missing_ok=True)
+                continue
+            self.db.execute(
+                """
+                UPDATE response_groups
+                SET district_place = ?, response_page_overflow = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (after, int(likely_overflow), now, group["id"]),
+            )
+            self.db.audit(
+                "response_group",
+                group["id"],
+                "gns_office_location_canonicalized",
+                {
+                    "before": before,
+                    "after": after,
+                    "office_id": office["id"],
+                    "filename": output.name,
+                },
+            )
+            group_count += 1
+        return {"cases": case_count, "response_groups": group_count}
 
     def reconcile_gns_office_hints(self) -> int:
         rows = self.db.fetch_all(
@@ -1710,15 +1958,26 @@ class WorkflowService:
             """
             SELECT COUNT(*) AS count
             FROM cases
-            WHERE upload_id = ? AND official_document_path IS NULL
+            WHERE upload_id = ?
+              AND source_kind = ?
+              AND official_document_path IS NULL
+              AND fields_confirmed = 0
+              AND status IN (?, ?, ?)
               AND NOT EXISTS (
                   SELECT 1 FROM pages WHERE pages.case_id = cases.id
               )
               AND NOT EXISTS (
-                  SELECT 1 FROM taxpayers WHERE taxpayers.case_id = cases.id
+                  SELECT 1 FROM response_group_cases
+                  WHERE response_group_cases.case_id = cases.id
               )
             """,
-            (upload_id,),
+            (
+                upload_id,
+                ValueSource.OCR_SCAN,
+                CaseStatus.COLLECTING,
+                CaseStatus.NEEDS_REVIEW,
+                CaseStatus.TECHNICAL_ERROR,
+            ),
         )
         count = int(row["count"] if row else 0)
         if not count:
@@ -1726,15 +1985,26 @@ class WorkflowService:
         self.db.execute(
             """
             DELETE FROM cases
-            WHERE upload_id = ? AND official_document_path IS NULL
+            WHERE upload_id = ?
+              AND source_kind = ?
+              AND official_document_path IS NULL
+              AND fields_confirmed = 0
+              AND status IN (?, ?, ?)
               AND NOT EXISTS (
                   SELECT 1 FROM pages WHERE pages.case_id = cases.id
               )
               AND NOT EXISTS (
-                  SELECT 1 FROM taxpayers WHERE taxpayers.case_id = cases.id
+                  SELECT 1 FROM response_group_cases
+                  WHERE response_group_cases.case_id = cases.id
               )
             """,
-            (upload_id,),
+            (
+                upload_id,
+                ValueSource.OCR_SCAN,
+                CaseStatus.COLLECTING,
+                CaseStatus.NEEDS_REVIEW,
+                CaseStatus.TECHNICAL_ERROR,
+            ),
         )
         self.db.audit(
             "upload",
@@ -2743,6 +3013,13 @@ class WorkflowService:
     ) -> bool:
         text = self._official_text(official_path)
         fields = self.extractor.extract_official_letter(text)
+        raw_district = clean_location(fields.district_place or "")
+        office = self.canonical_gns_office(raw_district) if raw_district else None
+        district_place = office["district_place"] if office else raw_district
+        if raw_district and not office:
+            fields.issues.append(
+                "Район и место не удалось однозначно выбрать из справочника ГНС."
+            )
         recipient_display = (
             self.names.recipient_display(fields.recipient_full_name or "")
             if fields.recipient_full_name
@@ -2750,13 +3027,17 @@ class WorkflowService:
         )
         complete = bool(
             fields.confidence >= 0.95
-            and fields.district_place
+            and district_place
+            and office
             and fields.recipient_position
             and fields.recipient_full_name
             and recipient_display
             and fields.period_start
             and fields.period_end
             and fields.taxpayers
+        )
+        target_status = (
+            CaseStatus.READY_FOR_ABS if complete else CaseStatus.NEEDS_REVIEW
         )
         employee = self.get_active_employee()
         self.db.execute(
@@ -2768,13 +3049,17 @@ class WorkflowService:
                 recipient_display_name = ?, period_start = ?,
                 period_end = ?, employee_name = ?,
                 fields_confirmed = ?, status = ?,
-                official_parse_version = ?, updated_at = ?
+                official_parse_version = ?,
+                match_review_previous_status = CASE
+                    WHEN match_review_previous_status IS NOT NULL
+                    THEN ? ELSE NULL END,
+                updated_at = ?
             WHERE id = ?
             """,
             (
                 str(official_path),
                 ValueSource.QR_OFFICIAL,
-                fields.district_place,
+                district_place,
                 fields.recipient_position,
                 fields.recipient_full_name,
                 recipient_display,
@@ -2782,12 +3067,9 @@ class WorkflowService:
                 fields.period_end,
                 employee,
                 1 if complete else 0,
-                (
-                    CaseStatus.READY_FOR_ABS
-                    if complete
-                    else CaseStatus.NEEDS_REVIEW
-                ),
+                target_status,
                 self.OFFICIAL_PARSER_VERSION,
+                target_status,
                 utc_now(),
                 case_id,
             ),
@@ -2831,9 +3113,26 @@ class WorkflowService:
                 "fields_complete": complete,
                 "employee_profile_present": bool(employee),
                 "issues": fields.issues,
+                "gns_office_id": office["id"] if office else None,
+                "district_canonicalized": bool(
+                    office and raw_district != district_place
+                ),
             },
         )
-        if complete:
+        if office and raw_district != district_place:
+            self.db.audit(
+                "case",
+                case_id,
+                "gns_office_location_canonicalized",
+                {
+                    "before": raw_district,
+                    "after": district_place,
+                    "office_id": office["id"],
+                    "source": "official_document_unique_directory_match",
+                },
+            )
+        self.reconcile_case_match_reviews()
+        if complete and not self.has_pending_case_match_review(case_id):
             self.auto_check_abs(case_id)
         return complete
 
@@ -2898,6 +3197,13 @@ class WorkflowService:
                 employee_name.strip() or self.get_active_employee() or ""
             )
             district_place = clean_location(district_place)
+            office = self.canonical_gns_office(district_place)
+            if not office:
+                raise WorkflowValidationError(
+                    "Район и место не найдены однозначно в справочнике ГНС"
+                )
+            original_district_place = district_place
+            district_place = office["district_place"]
             if period_start and period_end:
                 period_route = ""
             clean_taxpayers = self._validate_manual_fields(
@@ -2950,6 +3256,19 @@ class WorkflowService:
                 ),
             )
             self._replace_taxpayers(case_id, clean_taxpayers)
+            if original_district_place != district_place:
+                self.db.audit(
+                    "case",
+                    case_id,
+                    "gns_office_location_canonicalized",
+                    {
+                        "before": original_district_place,
+                        "after": district_place,
+                        "office_id": office["id"],
+                        "source": "manual_unique_directory_match",
+                    },
+                    actor=actor,
+                )
             if page.get("qr_status") != QrStatus.FOUND:
                 self.check_registry_case(case_id, automatic=True)
         elif case_id:
@@ -2991,6 +3310,12 @@ class WorkflowService:
         self._remove_orphan_cases(page["upload_id"])
         self._refresh_upload_status(page["upload_id"])
         if selected_type == PageType.LETTER and case_id:
+            self.reconcile_case_match_reviews()
+        if (
+            selected_type == PageType.LETTER
+            and case_id
+            and not self.has_pending_case_match_review(case_id)
+        ):
             self.auto_check_abs(case_id)
         return case_id
 
@@ -3031,6 +3356,52 @@ class WorkflowService:
             actor=actor,
         )
         return False
+
+    def reopen_page_type_review(
+        self,
+        page_id: str,
+        actor: str = "Сотрудник",
+    ) -> dict[str, Any]:
+        """Return a manually classified non-letter page to the review queue."""
+        page = self.get_page(page_id)
+        if not page:
+            raise WorkflowValidationError("Страница не найдена")
+        if (
+            page.get("status") != PageStatus.MANUALLY_CONFIRMED
+            or not page.get("manual_confirmed")
+            or page.get("page_type") == PageType.LETTER
+        ):
+            raise WorkflowValidationError(
+                "Изменить тип можно только у вручную подтверждённого "
+                "решения, приложения или прочей страницы"
+            )
+        previous_type = str(page.get("page_type") or PageType.UNKNOWN)
+        self.db.execute(
+            """
+            UPDATE pages
+            SET page_type = ?, type_confidence = 0,
+                manual_confirmed = 0, status = ?,
+                issue_code = ?, issue_message = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                PageType.UNKNOWN,
+                PageStatus.NEEDS_REVIEW,
+                "page_type_reopened",
+                "Выберите правильный тип страницы.",
+                utc_now(),
+                page_id,
+            ),
+        )
+        self.db.audit(
+            "page",
+            page_id,
+            "page_type_reopened",
+            {"previous_page_type": previous_type},
+            actor=actor,
+        )
+        self._refresh_upload_status(page["upload_id"])
+        return self.get_page(page_id) or page
 
     @staticmethod
     def _registry_name_key(value: str) -> str:
@@ -3278,6 +3649,10 @@ class WorkflowService:
         if not case["fields_confirmed"]:
             raise WorkflowValidationError(
                 "Перед АБС нужно подтвердить все поля письма"
+            )
+        if self.has_pending_case_match_review(case_id):
+            raise WorkflowValidationError(
+                "Сначала подтвердите совпадение обращений в ручной проверке"
             )
         taxpayers = self.get_taxpayers(case_id)
         if not taxpayers:
@@ -3748,7 +4123,12 @@ class WorkflowService:
     def today_overview(
         self,
         business_date: date | None = None,
+        *,
+        view: str = "all",
     ) -> dict[str, Any]:
+        if view not in {"all", "prepare", "created", "manual"}:
+            raise WorkflowValidationError("Неизвестный раздел ответов")
+        self.reconcile_case_match_reviews()
         day = business_date or datetime.now(self.BUSINESS_TIMEZONE).date()
         counts = self.db.fetch_one(
             """
@@ -3780,48 +4160,160 @@ class WorkflowService:
             WHERE pages.status IN ('needs_review', 'technical_error')
             """
         ) or {"count": 0}
-        generated = self.db.fetch_all(
+        unresolved_matches = self.db.fetch_one(
             """
+            SELECT COUNT(*) AS count
+            FROM case_match_reviews
+            WHERE status = 'pending'
+            """
+        ) or {"count": 0}
+        generated: list[dict[str, Any]] = []
+        if view in {"all", "created"}:
+            # Созданный Word ещё не означает, что письмо отправлено. Пока
+            # Outlook надёжно фиксирует только открытие черновика, старые
+            # незавершённые ответы нельзя скрывать фильтром текущего дня.
+            generated = self._generated_response_groups(None)
+
+        odb_cases = (
+            self._list_odb_cases() if view == "all" else []
+        )
+
+        return {
+            "business_date": day.isoformat(),
+            "ready_abs": int(counts.get("ready_abs") or 0),
+            "ready_qr": int(counts.get("ready_qr") or 0),
+            "ready_response": int(counts.get("ready_response") or 0),
+            "odb_pending": int(counts.get("odb_pending") or 0),
+            "unresolved_pages": int(unresolved["count"]),
+            "unresolved_matches": int(unresolved_matches["count"]),
+            "odb_cases": odb_cases,
+            "not_found_groups": (
+                self._daily_response_groups(day, AbsStatus.NOT_FOUND)
+                if view in {"all", "prepare"}
+                else []
+            ),
+            "found_groups": (
+                self._daily_response_groups(day, AbsStatus.FOUND)
+                if view in {"all", "manual"}
+                else []
+            ),
+            "generated_groups": generated,
+            "unnumbered_letters": (
+                self.list_outgoing_letters(None, only_unnumbered=True)
+                if view in {"all", "created"}
+                else []
+            ),
+        }
+
+    def _generated_response_groups(
+        self,
+        business_date: date | None,
+    ) -> list[dict[str, Any]]:
+        parameters: tuple[Any, ...] = ()
+        where = ""
+        if business_date is not None:
+            where = "WHERE business_date = ?"
+            parameters = (business_date.isoformat(),)
+        generated = self.db.fetch_all(
+            f"""
             SELECT *
             FROM response_groups
-            ORDER BY created_at DESC
-            """
+            {where}
+            ORDER BY created_at, rowid
+            """,
+            parameters,
         )
+        if not generated:
+            return []
+
         generated_by_id = {group["id"]: group for group in generated}
+        group_ids = tuple(generated_by_id)
+        placeholders = ",".join("?" for _ in group_ids)
         generated_letters = self.db.fetch_all(
-            """
+            f"""
             SELECT response_letters.*
             FROM response_letters
             JOIN response_groups
               ON response_groups.id = response_letters.response_group_id
-            ORDER BY response_groups.created_at DESC,
-                     response_groups.id, response_letters.letter_order
-            """
+            WHERE response_groups.id IN ({placeholders})
+            ORDER BY response_groups.created_at,
+                     response_groups.rowid, response_letters.letter_order
+            """,
+            group_ids,
         )
         for group in generated:
             group["letters"] = []
-        active_scans = self.db.fetch_all(
-            """
-            SELECT * FROM signed_response_scans
-            WHERE status IN ('needs_confirmation', 'confirmed')
-            ORDER BY created_at DESC
-            """
-        )
-        scans_by_letter = {
-            scan["response_letter_id"]: scan for scan in active_scans
-        }
-        outgoing_messages = self.db.fetch_all(
-            """
-            SELECT * FROM outlook_outgoing_messages
-            ORDER BY created_at DESC
-            """
-        )
-        outgoing_by_scan = {
-            message["signed_scan_id"]: message
-            for message in outgoing_messages
-        }
+
+        letter_ids = tuple(letter["id"] for letter in generated_letters)
+        scans_by_letter: dict[str, dict[str, Any]] = {}
+        sessions_by_letter: dict[str, dict[str, Any]] = {}
+        outgoing_by_scan: dict[str, dict[str, Any]] = {}
+        if letter_ids:
+            letter_placeholders = ",".join("?" for _ in letter_ids)
+            active_scans = self.db.fetch_all(
+                f"""
+                SELECT * FROM signed_response_scans
+                WHERE response_letter_id IN ({letter_placeholders})
+                  AND status IN ('needs_confirmation', 'confirmed')
+                ORDER BY created_at DESC
+                """,
+                letter_ids,
+            )
+            scans_by_letter = {
+                scan["response_letter_id"]: scan for scan in active_scans
+            }
+            active_scan_sessions = self.db.fetch_all(
+                f"""
+                SELECT * FROM signed_scan_sessions
+                WHERE response_letter_id IN ({letter_placeholders})
+                  AND status IN ('collecting', 'technical_error')
+                ORDER BY created_at DESC
+                """,
+                letter_ids,
+            )
+            session_ids = tuple(
+                session["id"] for session in active_scan_sessions
+            )
+            pages_by_session: dict[str, list[dict[str, Any]]] = {}
+            if session_ids:
+                session_placeholders = ",".join("?" for _ in session_ids)
+                session_pages = self.db.fetch_all(
+                    f"""
+                    SELECT * FROM signed_scan_session_pages
+                    WHERE session_id IN ({session_placeholders})
+                      AND status = 'active'
+                    ORDER BY session_id, page_order, created_at, id
+                    """,
+                    session_ids,
+                )
+                for page in session_pages:
+                    pages_by_session.setdefault(
+                        page["session_id"], []
+                    ).append(page)
+            for session in active_scan_sessions:
+                session["pages"] = pages_by_session.get(session["id"], [])
+                sessions_by_letter.setdefault(
+                    session["response_letter_id"], session
+                )
+            scan_ids = tuple(scan["id"] for scan in active_scans)
+            if scan_ids:
+                scan_placeholders = ",".join("?" for _ in scan_ids)
+                outgoing_messages = self.db.fetch_all(
+                    f"""
+                    SELECT * FROM outlook_outgoing_messages
+                    WHERE signed_scan_id IN ({scan_placeholders})
+                    ORDER BY created_at DESC
+                    """,
+                    scan_ids,
+                )
+                outgoing_by_scan = {
+                    message["signed_scan_id"]: message
+                    for message in outgoing_messages
+                }
+
         for letter in generated_letters:
             letter["signed_scan"] = scans_by_letter.get(letter["id"])
+            letter["scan_session"] = sessions_by_letter.get(letter["id"])
             if letter["signed_scan"]:
                 letter["outlook_message"] = outgoing_by_scan.get(
                     letter["signed_scan"]["id"]
@@ -3840,6 +4332,9 @@ class WorkflowService:
             group["numbered_letter_count"] = sum(
                 1 for letter in group["letters"] if letter["outgoing_number"]
             )
+        return generated
+
+    def _list_odb_cases(self) -> list[dict[str, Any]]:
         odb_cases = self.db.fetch_all(
             """
             SELECT cases.id, cases.recipient_display_name,
@@ -3856,47 +4351,212 @@ class WorkflowService:
             ORDER BY cases.created_at
             """
         )
+        if not odb_cases:
+            return []
         taxpayers_by_case: dict[str, list[dict[str, Any]]] = {}
-        if odb_cases:
-            odb_taxpayers = self.db.fetch_all(
-                """
-                SELECT taxpayers.case_id, taxpayers.name, taxpayers.inn,
-                       taxpayers.odb_result
-                FROM taxpayers
-                JOIN cases ON cases.id = taxpayers.case_id
-                WHERE cases.status = 'manual_period_rule'
-                  AND taxpayers.odb_result IS NULL
-                ORDER BY taxpayers.case_id, taxpayers.display_order
-                """
-            )
-            for taxpayer in odb_taxpayers:
-                taxpayers_by_case.setdefault(
-                    taxpayer["case_id"], []
-                ).append(taxpayer)
+        odb_taxpayers = self.db.fetch_all(
+            """
+            SELECT taxpayers.case_id, taxpayers.name, taxpayers.inn,
+                   taxpayers.odb_result
+            FROM taxpayers
+            JOIN cases ON cases.id = taxpayers.case_id
+            WHERE cases.status = 'manual_period_rule'
+              AND taxpayers.odb_result IS NULL
+            ORDER BY taxpayers.case_id, taxpayers.display_order
+            """
+        )
+        for taxpayer in odb_taxpayers:
+            taxpayers_by_case.setdefault(
+                taxpayer["case_id"], []
+            ).append(taxpayer)
         for odb_case in odb_cases:
             odb_case["taxpayers"] = taxpayers_by_case.get(
                 odb_case["id"], []
             )
+        return odb_cases
 
+    @staticmethod
+    def _filter_group_taxpayers(
+        groups: list[dict[str, Any]],
+        predicate: Callable[[dict[str, Any]], bool],
+    ) -> list[dict[str, Any]]:
+        filtered_groups: list[dict[str, Any]] = []
+        for source_group in groups:
+            taxpayers = [
+                dict(taxpayer)
+                for taxpayer in source_group.get("taxpayers", [])
+                if predicate(taxpayer)
+            ]
+            if not taxpayers:
+                continue
+            group = dict(source_group)
+            group["taxpayers"] = taxpayers
+            group["taxpayer_count"] = len(taxpayers)
+            case_ids = {
+                str(taxpayer.get("source_case_id") or "")
+                for taxpayer in taxpayers
+                if taxpayer.get("source_case_id")
+            }
+            group["case_ids"] = sorted(case_ids)
+            group["case_count"] = len(case_ids)
+            group["can_generate"] = False
+            filtered_groups.append(group)
+        return filtered_groups
+
+    def work_counts(
+        self,
+        business_date: date | None = None,
+    ) -> dict[str, int]:
+        row = self.db.fetch_one(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM uploads) AS incoming,
+                (SELECT COUNT(*) FROM uploads
+                 WHERE status = 'processing') AS processing,
+                (SELECT COUNT(*) FROM pages
+                 WHERE status IN ('needs_review', 'technical_error'))
+                    AS review_pages,
+                (SELECT COUNT(*) FROM case_match_reviews
+                 WHERE status = 'pending') AS review_matches,
+                (SELECT COUNT(*)
+                 FROM taxpayers
+                 JOIN cases ON cases.id = taxpayers.case_id
+                 WHERE taxpayers.abs_result = 'found'
+                   AND taxpayers.abs_account_result IS NULL)
+                    AS review_accounts,
+                (SELECT COUNT(*)
+                 FROM taxpayers
+                 JOIN cases ON cases.id = taxpayers.case_id
+                 WHERE cases.status = 'manual_period_rule'
+                   AND taxpayers.odb_result IS NULL)
+                    AS review_odb,
+                (SELECT COUNT(*)
+                 FROM cases
+                 WHERE cases.status IN ('needs_review', 'technical_error')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM pages
+                       WHERE pages.case_id = cases.id
+                         AND pages.status IN (
+                             'needs_review', 'technical_error'
+                         )
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM case_match_reviews
+                       WHERE status = 'pending'
+                         AND (left_case_id = cases.id
+                              OR right_case_id = cases.id)
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM taxpayers
+                       WHERE taxpayers.case_id = cases.id
+                         AND taxpayers.abs_result = 'found'
+                         AND taxpayers.abs_account_result IS NULL
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM taxpayers
+                       WHERE taxpayers.case_id = cases.id
+                         AND (taxpayers.abs_account_result = 'found'
+                              OR taxpayers.odb_result = 'found')
+                   )) AS review_cases,
+                (SELECT COUNT(*) FROM cases
+                 WHERE status = 'ready_for_abs') AS ready_abs,
+                (SELECT COUNT(*) FROM cases
+                 WHERE status = 'ready_for_response') AS ready_responses,
+                (SELECT COUNT(*) FROM response_groups)
+                    AS created_responses,
+                (SELECT COUNT(DISTINCT cases.id)
+                 FROM cases
+                 JOIN taxpayers ON taxpayers.case_id = cases.id
+                 WHERE taxpayers.abs_account_result = 'found'
+                    OR taxpayers.odb_result = 'found') AS manual_responses
+            """
+        ) or {}
+        review_count = sum(
+            int(row.get(key) or 0)
+            for key in (
+                "review_pages",
+                "review_matches",
+                "review_accounts",
+                "review_odb",
+                "review_cases",
+            )
+        )
         return {
-            "business_date": day.isoformat(),
-            "ready_abs": int(counts.get("ready_abs") or 0),
-            "ready_qr": int(counts.get("ready_qr") or 0),
-            "ready_response": int(counts.get("ready_response") or 0),
-            "odb_pending": int(counts.get("odb_pending") or 0),
-            "unresolved_pages": int(unresolved["count"]),
-            "odb_cases": odb_cases,
-            "not_found_groups": self._daily_response_groups(
-                day, AbsStatus.NOT_FOUND
-            ),
-            "found_groups": self._daily_response_groups(
-                day, AbsStatus.FOUND
-            ),
-            "generated_groups": generated,
-            "unnumbered_letters": self.list_outgoing_letters(
-                day, only_unnumbered=True
-            ),
+            "incoming": int(row.get("incoming") or 0),
+            "processing": int(row.get("processing") or 0),
+            "review": review_count,
+            "ready_abs": int(row.get("ready_abs") or 0),
+            "ready_responses": int(row.get("ready_responses") or 0),
+            "created_responses": int(row.get("created_responses") or 0),
+            "manual_responses": int(row.get("manual_responses") or 0),
         }
+
+    def manual_review_overview(
+        self,
+        business_date: date | None = None,
+    ) -> dict[str, Any]:
+        day = business_date or datetime.now(self.BUSINESS_TIMEZONE).date()
+        found_groups = self._daily_response_groups(day, AbsStatus.FOUND)
+        account_groups = self._filter_group_taxpayers(
+            found_groups,
+            lambda taxpayer: (
+                taxpayer.get("abs_result") == "found"
+                and not taxpayer.get("abs_account_result")
+            ),
+        )
+        generic_cases = self.db.fetch_all(
+            """
+            SELECT cases.*, uploads.original_filename,
+                   (SELECT COUNT(*) FROM taxpayers
+                    WHERE taxpayers.case_id = cases.id) AS taxpayer_count
+            FROM cases
+            JOIN uploads ON uploads.id = cases.upload_id
+            WHERE cases.status IN ('needs_review', 'technical_error')
+              AND NOT EXISTS (
+                  SELECT 1 FROM pages
+                  WHERE pages.case_id = cases.id
+                    AND pages.status IN ('needs_review', 'technical_error')
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM case_match_reviews
+                  WHERE status = 'pending'
+                    AND (left_case_id = cases.id OR right_case_id = cases.id)
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM taxpayers
+                  WHERE taxpayers.case_id = cases.id
+                    AND taxpayers.abs_result = 'found'
+                    AND taxpayers.abs_account_result IS NULL
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM taxpayers
+                  WHERE taxpayers.case_id = cases.id
+                    AND (taxpayers.abs_account_result = 'found'
+                         OR taxpayers.odb_result = 'found')
+              )
+            ORDER BY cases.created_at, cases.id
+            """
+        )
+        return {
+            "pages": self.list_review_pages(),
+            "match_reviews": self.list_case_match_reviews(),
+            "account_groups": account_groups,
+            "odb_cases": self._list_odb_cases(),
+            "case_tasks": generic_cases,
+        }
+
+    def manual_response_groups(
+        self,
+        business_date: date | None = None,
+    ) -> list[dict[str, Any]]:
+        day = business_date or datetime.now(self.BUSINESS_TIMEZONE).date()
+        return self._filter_group_taxpayers(
+            self._daily_response_groups(day, AbsStatus.FOUND),
+            lambda taxpayer: (
+                taxpayer.get("abs_account_result") == "found"
+                or taxpayer.get("odb_result") == "found"
+            ),
+        )
 
     def _daily_response_groups(
         self,
@@ -3933,9 +4593,16 @@ class WorkflowService:
                 cases.recipient_full_name,
                 cases.recipient_display_name,
                 cases.employee_name,
+                cases.source_kind AS case_source_kind,
                 cases.created_at AS case_created_at,
+                uploads.original_filename,
+                taxpayers.id AS taxpayer_id,
                 taxpayers.name AS taxpayer_name,
                 taxpayers.inn AS taxpayer_inn,
+                taxpayers.name_source,
+                taxpayers.inn_source,
+                taxpayers.name_source_reference,
+                taxpayers.inn_source_reference,
                 taxpayers.display_order,
                 taxpayers.abs_result,
                 taxpayers.abs_account_result,
@@ -3946,21 +4613,48 @@ class WorkflowService:
                     SELECT pages.id
                     FROM pages
                     WHERE pages.case_id = cases.id
-                      AND pages.page_type = 'letter'
-                    ORDER BY pages.page_number
+                    ORDER BY CASE WHEN pages.page_type = 'letter' THEN 0 ELSE 1 END,
+                             pages.page_number
                     LIMIT 1
                 ) AS source_page_id
+                ,(
+                    SELECT pages.page_number
+                    FROM pages
+                    WHERE pages.case_id = cases.id
+                    ORDER BY CASE WHEN pages.page_type = 'letter' THEN 0 ELSE 1 END,
+                             pages.page_number
+                    LIMIT 1
+                ) AS source_page_number
             FROM cases
             JOIN taxpayers ON taxpayers.case_id = cases.id
+            JOIN uploads ON uploads.id = cases.upload_id
             WHERE {extra_where}
+              AND NOT EXISTS (
+                  SELECT 1 FROM case_match_reviews
+                  WHERE case_match_reviews.status = 'pending'
+                    AND (
+                        case_match_reviews.left_case_id = cases.id
+                        OR case_match_reviews.right_case_id = cases.id
+                    )
+              )
             ORDER BY cases.created_at, cases.id, taxpayers.display_order
             """
         )
+        distinct_pairs = {
+            tuple(sorted((item["left_case_id"], item["right_case_id"])))
+            for item in self.db.fetch_all(
+                """
+                SELECT left_case_id, right_case_id
+                FROM case_match_reviews
+                WHERE status = 'resolved' AND resolution = 'distinct'
+                """
+            )
+        }
 
         grouped: dict[str, dict[str, Any]] = {}
         for row in rows:
             district = clean_location(row.get("district_place"))
-            office = self.match_gns_office(district)
+            office = self.canonical_gns_office(district)
             office_identity = office["office_key"] if office else district
             if office:
                 district = office["district_place"]
@@ -3995,6 +4689,7 @@ class WorkflowService:
                     "_display_names": set(),
                     "_employees": set(),
                     "_taxpayers_by_inn": {},
+                    "_conflicts_by_inn": {},
                 },
             )
             if row["case_id"] not in group["case_ids"]:
@@ -4012,12 +4707,41 @@ class WorkflowService:
             )
 
             inn = re.sub(r"\D", "", row.get("taxpayer_inn") or "")
-            name = " ".join((row.get("taxpayer_name") or "").split())
+            raw_name = " ".join(
+                (row.get("taxpayer_name") or "").split()
+            )
+            name = response_taxpayer_name(raw_name, inn)
             existing = group["_taxpayers_by_inn"].get(inn)
+            source_record = {
+                "taxpayer_id": row["taxpayer_id"],
+                "source_case_id": row["case_id"],
+                "source_page_id": row.get("source_page_id"),
+                "source_page_number": row.get("source_page_number"),
+                "original_filename": row.get("original_filename") or "",
+                "case_source_kind": row.get("case_source_kind") or "",
+                "name_source": row.get("name_source") or "",
+                "inn_source": row.get("inn_source") or "",
+                "name_source_reference": row.get("name_source_reference"),
+                "inn_source_reference": row.get("inn_source_reference"),
+                "name": name,
+                "inn": inn,
+            }
             if existing is None:
                 taxpayer = {
+                    "taxpayer_id": row["taxpayer_id"],
                     "source_case_id": row["case_id"],
                     "source_page_id": row.get("source_page_id"),
+                    "source_page_number": row.get("source_page_number"),
+                    "original_filename": row.get("original_filename") or "",
+                    "case_source_kind": row.get("case_source_kind") or "",
+                    "name_source": row.get("name_source") or "",
+                    "inn_source": row.get("inn_source") or "",
+                    "name_source_reference": row.get(
+                        "name_source_reference"
+                    ),
+                    "inn_source_reference": row.get(
+                        "inn_source_reference"
+                    ),
                     "name": name,
                     "inn": inn,
                     "abs_result": row.get("abs_result"),
@@ -4035,12 +4759,72 @@ class WorkflowService:
             elif self._normalize_group_value(existing["name"]) != (
                 self._normalize_group_value(name)
             ):
+                pair = tuple(
+                    sorted((existing["source_case_id"], row["case_id"]))
+                )
+                if pair in distinct_pairs:
+                    taxpayer = {
+                        **source_record,
+                        "abs_result": row.get("abs_result"),
+                        "abs_account_result": row.get("abs_account_result"),
+                        "abs_active_account_count": row.get(
+                            "abs_active_account_count"
+                        ),
+                        "abs_closed_account_count": row.get(
+                            "abs_closed_account_count"
+                        ),
+                        "odb_result": row.get("odb_result"),
+                    }
+                    group["_taxpayers_by_inn"][
+                        f"{inn}:{row['case_id']}"
+                    ] = taxpayer
+                    group["taxpayers"].append(taxpayer)
+                    continue
                 issue = (
-                    f"ИНН {inn} встречается с разными наименованиями. "
-                    "Нужно проверить вручную."
+                    f"Для ИНН {inn} указаны разные наименования."
                 )
                 if issue not in group["issues"]:
                     group["issues"].append(issue)
+                conflict_records = group["_conflicts_by_inn"].setdefault(
+                    inn, []
+                )
+                for candidate in (existing, source_record):
+                    if not any(
+                        record["taxpayer_id"] == candidate["taxpayer_id"]
+                        for record in conflict_records
+                    ):
+                        conflict_records.append(
+                            {
+                                "taxpayer_id": candidate["taxpayer_id"],
+                                "source_case_id": candidate["source_case_id"],
+                                "source_page_id": candidate.get(
+                                    "source_page_id"
+                                ),
+                                "source_page_number": candidate.get(
+                                    "source_page_number"
+                                ),
+                                "original_filename": candidate.get(
+                                    "original_filename", ""
+                                ),
+                                "case_source_kind": candidate.get(
+                                    "case_source_kind", ""
+                                ),
+                                "name_source": candidate.get(
+                                    "name_source", ""
+                                ),
+                                "inn_source": candidate.get(
+                                    "inn_source", ""
+                                ),
+                                "name_source_reference": candidate.get(
+                                    "name_source_reference"
+                                ),
+                                "inn_source_reference": candidate.get(
+                                    "inn_source_reference"
+                                ),
+                                "name": candidate["name"],
+                                "inn": candidate["inn"],
+                            }
+                        )
 
         result: list[dict[str, Any]] = []
         for group in grouped.values():
@@ -4058,6 +4842,10 @@ class WorkflowService:
                 )
             group["case_count"] = len(group["case_ids"])
             group["taxpayer_count"] = len(group["taxpayers"])
+            group["conflicts"] = [
+                {"inn": inn, "records": records}
+                for inn, records in group["_conflicts_by_inn"].items()
+            ]
             group["can_generate"] = bool(
                 abs_bucket == AbsStatus.NOT_FOUND
                 and group["taxpayers"]
@@ -4068,6 +4856,7 @@ class WorkflowService:
                 "_display_names",
                 "_employees",
                 "_taxpayers_by_inn",
+                "_conflicts_by_inn",
             ):
                 group.pop(private_key, None)
             result.append(group)
@@ -4314,7 +5103,11 @@ class WorkflowService:
         *,
         only_unnumbered: bool = False,
     ) -> list[dict[str, Any]]:
-        day = business_date or datetime.now(self.BUSINESS_TIMEZONE).date()
+        date_filter = ""
+        parameters: tuple[Any, ...] = ()
+        if business_date is not None:
+            date_filter = "AND response_groups.business_date = ?"
+            parameters = (business_date.isoformat(),)
         unnumbered_filter = (
             "AND response_letters.outgoing_number IS NULL"
             if only_unnumbered
@@ -4331,13 +5124,13 @@ class WorkflowService:
             FROM response_letters
             JOIN response_groups
               ON response_groups.id = response_letters.response_group_id
-            WHERE response_groups.business_date = ?
-              AND response_groups.status = 'created'
+            WHERE response_groups.status = 'created'
+              {date_filter}
               {unnumbered_filter}
             ORDER BY response_groups.created_at,
                      response_groups.rowid, response_letters.letter_order
             """,
-            (day.isoformat(),),
+            parameters,
         )
 
     def preview_outgoing_numbers(
@@ -4347,7 +5140,10 @@ class WorkflowService:
     ) -> dict[str, Any]:
         day = business_date or datetime.now(self.BUSINESS_TIMEZONE).date()
         first = self._canonical_outgoing_number(first_number)
-        letters = self.list_outgoing_letters(day, only_unnumbered=True)
+        letters = self.list_outgoing_letters(
+            business_date,
+            only_unnumbered=True,
+        )
         if letters and int(first) + len(letters) - 1 > 999_999_999:
             raise WorkflowValidationError(
                 "Диапазон исходящих номеров превышает 999999999"
@@ -4656,25 +5452,45 @@ class WorkflowService:
         *,
         actor: str = "Сотрудник",
     ) -> dict[str, Any]:
-        preview = self.preview_outgoing_numbers(first_number, business_date)
-        preview_ids = [letter["id"] for letter in preview["letters"]]
-        if not preview_ids:
+        first = self._canonical_outgoing_number(first_number)
+        letters = self.list_outgoing_letters(
+            business_date,
+            only_unnumbered=True,
+        )
+        current_ids = [letter["id"] for letter in letters]
+        if not current_ids:
             raise WorkflowValidationError(
                 "Нет готовых писем без исходящего номера"
             )
-        if expected_letter_ids != preview_ids:
+        if not expected_letter_ids or len(expected_letter_ids) != len(
+            set(expected_letter_ids)
+        ):
             raise WorkflowValidationError(
-                "Список готовых писем изменился. Покажите диапазон заново."
+                "Список готовых писем изменился. Обновите страницу."
+            )
+        try:
+            start_index = current_ids.index(expected_letter_ids[0])
+        except ValueError as exc:
+            raise WorkflowValidationError(
+                "Список готовых писем изменился. Обновите страницу."
+            ) from exc
+        if expected_letter_ids != current_ids[start_index:]:
+            raise WorkflowValidationError(
+                "Список готовых писем изменился. Обновите страницу."
+            )
+        if int(first) + len(expected_letter_ids) - 1 > 999_999_999:
+            raise WorkflowValidationError(
+                "Диапазон исходящих номеров превышает 999999999"
             )
         updates = {
-            letter["id"]: letter["proposed_number"]
-            for letter in preview["letters"]
+            letter_id: str(int(first) + offset)
+            for offset, letter_id in enumerate(expected_letter_ids)
         }
         summary = self._apply_outgoing_number_updates(updates, actor=actor)
         summary.update(
             {
-                "first_number": preview["first_number"],
-                "last_number": preview["last_number"],
+                "first_number": first,
+                "last_number": updates[expected_letter_ids[-1]],
             }
         )
         return summary
@@ -4728,6 +5544,628 @@ class WorkflowService:
             """,
             (letter_id,),
         )
+
+    def get_signed_scan_session(
+        self, session_id: str
+    ) -> dict[str, Any] | None:
+        session = self.db.fetch_one(
+            "SELECT * FROM signed_scan_sessions WHERE id = ?",
+            (session_id,),
+        )
+        if not session:
+            return None
+        session["pages"] = self.db.fetch_all(
+            """
+            SELECT * FROM signed_scan_session_pages
+            WHERE session_id = ? AND status = 'active'
+            ORDER BY page_order, created_at, id
+            """,
+            (session_id,),
+        )
+        return session
+
+    def get_active_signed_scan_session(
+        self, letter_id: str
+    ) -> dict[str, Any] | None:
+        row = self.db.fetch_one(
+            """
+            SELECT id FROM signed_scan_sessions
+            WHERE response_letter_id = ?
+              AND status IN ('collecting', 'technical_error')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (letter_id,),
+        )
+        return self.get_signed_scan_session(row["id"]) if row else None
+
+    def start_signed_scan_session(
+        self,
+        letter_id: str,
+        *,
+        actor: str = "Сотрудник",
+    ) -> dict[str, Any]:
+        if not self.get_response_letter(letter_id):
+            raise WorkflowValidationError("Готовое письмо не найдено")
+        existing = self.get_active_signed_scan_session(letter_id)
+        if existing:
+            return existing
+
+        session_id = uuid4().hex
+        session_dir = ensure_within(
+            self.settings.runtime_dir
+            / "signed_scans"
+            / letter_id
+            / "sessions"
+            / session_id,
+            self.settings.runtime_dir,
+        )
+        session_dir.mkdir(parents=True, exist_ok=False)
+        now = utc_now()
+        try:
+            with self.db.connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO signed_scan_sessions(
+                        id, response_letter_id, status, page_count,
+                        created_by, created_at, updated_at
+                    ) VALUES (?, ?, 'collecting', 0, ?, ?, ?)
+                    """,
+                    (session_id, letter_id, actor, now, now),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO audit_events(
+                        entity_type, entity_id, event_type,
+                        actor, payload_json, created_at
+                    ) VALUES ('signed_scan_session', ?,
+                              'signed_scan_session_started', ?, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        actor,
+                        json.dumps(
+                            {"response_letter_id": letter_id},
+                            ensure_ascii=False,
+                        ),
+                        now,
+                    ),
+                )
+        except Exception:
+            shutil.rmtree(session_dir, ignore_errors=True)
+            raise
+        return self.get_signed_scan_session(session_id) or {}
+
+    def _scan_session_page_destination(
+        self,
+        session: dict[str, Any],
+        page_id: str,
+    ) -> Path:
+        return ensure_within(
+            self.settings.runtime_dir
+            / "signed_scans"
+            / session["response_letter_id"]
+            / "sessions"
+            / session["id"]
+            / "pages"
+            / f"{page_id}.png",
+            self.settings.runtime_dir,
+        )
+
+    def _set_signed_scan_session_error(
+        self,
+        session_id: str,
+        message: str,
+        *,
+        actor: str,
+    ) -> None:
+        safe_message = message.strip() or "Не удалось получить лист со сканера"
+        now = utc_now()
+        with self.db.connect() as connection:
+            connection.execute(
+                """
+                UPDATE signed_scan_sessions
+                SET status = 'technical_error', error_message = ?, updated_at = ?
+                WHERE id = ? AND status IN ('collecting', 'technical_error')
+                """,
+                (safe_message, now, session_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO audit_events(
+                    entity_type, entity_id, event_type,
+                    actor, payload_json, created_at
+                ) VALUES ('signed_scan_session', ?,
+                          'signed_scan_page_failed', ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    actor,
+                    json.dumps({"message": safe_message}, ensure_ascii=False),
+                    now,
+                ),
+            )
+
+    def acquire_signed_scan_session_page(
+        self,
+        session_id: str,
+        *,
+        replace_page_id: str | None = None,
+        actor: str = "Сотрудник",
+    ) -> dict[str, Any]:
+        session = self.get_signed_scan_session(session_id)
+        if not session or session["status"] not in {
+            "collecting",
+            "technical_error",
+        }:
+            raise WorkflowValidationError("Сессия сканирования не найдена или завершена")
+        replaced_page = None
+        if replace_page_id:
+            replaced_page = self.db.fetch_one(
+                """
+                SELECT * FROM signed_scan_session_pages
+                WHERE id = ? AND session_id = ? AND status = 'active'
+                """,
+                (replace_page_id, session_id),
+            )
+            if not replaced_page:
+                raise WorkflowValidationError("Лист для пересканирования не найден")
+
+        page_id = uuid4().hex
+        destination = self._scan_session_page_destination(session, page_id)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.scanner.acquire_a4(destination)
+            size_bytes = destination.stat().st_size
+            if not size_bytes:
+                raise WorkflowValidationError("Сканер вернул пустой лист")
+            if size_bytes > self.settings.max_upload_bytes:
+                raise WorkflowValidationError(
+                    "Один лист превышает допустимый размер файла"
+                )
+            with Image.open(destination) as image:
+                image.verify()
+            digest = self._file_sha256(destination)
+            if replaced_page:
+                page_order = int(replaced_page["page_order"])
+            else:
+                page_order = max(
+                    (
+                        int(page["page_order"])
+                        for page in session["pages"]
+                    ),
+                    default=0,
+                ) + 1
+            now = utc_now()
+            with self.db.connect() as connection:
+                if replaced_page:
+                    connection.execute(
+                        """
+                        UPDATE signed_scan_session_pages
+                        SET status = 'removed', updated_at = ?
+                        WHERE id = ? AND session_id = ? AND status = 'active'
+                        """,
+                        (now, replace_page_id, session_id),
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO signed_scan_session_pages(
+                        id, session_id, status, page_order, original_path,
+                        sha256, size_bytes, created_at, updated_at
+                    ) VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        page_id,
+                        session_id,
+                        page_order,
+                        str(destination),
+                        digest,
+                        size_bytes,
+                        now,
+                        now,
+                    ),
+                )
+                page_count = connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM signed_scan_session_pages
+                    WHERE session_id = ? AND status = 'active'
+                    """,
+                    (session_id,),
+                ).fetchone()["count"]
+                connection.execute(
+                    """
+                    UPDATE signed_scan_sessions
+                    SET status = 'collecting', page_count = ?,
+                        error_message = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (page_count, now, session_id),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO audit_events(
+                        entity_type, entity_id, event_type,
+                        actor, payload_json, created_at
+                    ) VALUES ('signed_scan_session', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        (
+                            "signed_scan_page_replaced"
+                            if replaced_page
+                            else "signed_scan_page_added"
+                        ),
+                        actor,
+                        json.dumps(
+                            {
+                                "page_id": page_id,
+                                "page_order": page_order,
+                                "replaced_page_id": replace_page_id,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        now,
+                    ),
+                )
+        except ScannerCancelled:
+            destination.unlink(missing_ok=True)
+            self.db.audit(
+                "signed_scan_session",
+                session_id,
+                "signed_scan_page_cancelled",
+                actor=actor,
+            )
+            raise
+        except (ScannerError, WorkflowValidationError, OSError) as exc:
+            destination.unlink(missing_ok=True)
+            self._set_signed_scan_session_error(
+                session_id,
+                str(exc),
+                actor=actor,
+            )
+            raise
+        return self.get_signed_scan_session(session_id) or {}
+
+    def remove_signed_scan_session_page(
+        self,
+        session_id: str,
+        page_id: str,
+        *,
+        actor: str = "Сотрудник",
+    ) -> dict[str, Any]:
+        session = self.get_signed_scan_session(session_id)
+        if not session or session["status"] not in {
+            "collecting",
+            "technical_error",
+        }:
+            raise WorkflowValidationError("Сессия сканирования не найдена или завершена")
+        page = next(
+            (item for item in session["pages"] if item["id"] == page_id),
+            None,
+        )
+        if not page:
+            raise WorkflowValidationError("Лист не найден")
+        now = utc_now()
+        with self.db.connect() as connection:
+            connection.execute(
+                """
+                UPDATE signed_scan_session_pages
+                SET status = 'removed', updated_at = ?
+                WHERE id = ? AND session_id = ? AND status = 'active'
+                """,
+                (now, page_id, session_id),
+            )
+            remaining = connection.execute(
+                """
+                SELECT id FROM signed_scan_session_pages
+                WHERE session_id = ? AND status = 'active'
+                ORDER BY page_order, created_at, id
+                """,
+                (session_id,),
+            ).fetchall()
+            for order, row in enumerate(remaining, 1):
+                connection.execute(
+                    """
+                    UPDATE signed_scan_session_pages
+                    SET page_order = ?, updated_at = ? WHERE id = ?
+                    """,
+                    (order, now, row["id"]),
+                )
+            connection.execute(
+                """
+                UPDATE signed_scan_sessions
+                SET page_count = ?, updated_at = ? WHERE id = ?
+                """,
+                (len(remaining), now, session_id),
+            )
+        self.db.audit(
+            "signed_scan_session",
+            session_id,
+            "signed_scan_page_removed",
+            {"page_id": page_id},
+            actor=actor,
+        )
+        return self.get_signed_scan_session(session_id) or {}
+
+    def move_signed_scan_session_page(
+        self,
+        session_id: str,
+        page_id: str,
+        direction: str,
+        *,
+        actor: str = "Сотрудник",
+    ) -> dict[str, Any]:
+        if direction not in {"up", "down"}:
+            raise WorkflowValidationError("Неизвестное направление перемещения")
+        session = self.get_signed_scan_session(session_id)
+        if not session or session["status"] not in {
+            "collecting",
+            "technical_error",
+        }:
+            raise WorkflowValidationError("Сессия сканирования не найдена или завершена")
+        pages = session["pages"]
+        index = next(
+            (position for position, page in enumerate(pages) if page["id"] == page_id),
+            None,
+        )
+        if index is None:
+            raise WorkflowValidationError("Лист не найден")
+        target_index = index - 1 if direction == "up" else index + 1
+        if target_index < 0 or target_index >= len(pages):
+            return session
+        current = pages[index]
+        target = pages[target_index]
+        now = utc_now()
+        with self.db.connect() as connection:
+            connection.execute(
+                "UPDATE signed_scan_session_pages SET page_order = ?, updated_at = ? WHERE id = ?",
+                (target["page_order"], now, current["id"]),
+            )
+            connection.execute(
+                "UPDATE signed_scan_session_pages SET page_order = ?, updated_at = ? WHERE id = ?",
+                (current["page_order"], now, target["id"]),
+            )
+            connection.execute(
+                "UPDATE signed_scan_sessions SET updated_at = ? WHERE id = ?",
+                (now, session_id),
+            )
+        self.db.audit(
+            "signed_scan_session",
+            session_id,
+            "signed_scan_pages_reordered",
+            {"page_id": page_id, "direction": direction},
+            actor=actor,
+        )
+        return self.get_signed_scan_session(session_id) or {}
+
+    @staticmethod
+    def _make_session_pages_pdf(
+        pages: list[dict[str, Any]],
+        destination: Path,
+    ) -> int:
+        rendered: list[Image.Image] = []
+        try:
+            for page in pages:
+                with Image.open(Path(page["original_path"])) as image:
+                    image.load()
+                    if image.mode in {"RGBA", "LA"}:
+                        background = Image.new("RGB", image.size, "white")
+                        background.paste(image, mask=image.getchannel("A"))
+                        rendered.append(background)
+                    else:
+                        rendered.append(image.convert("RGB"))
+            if not rendered:
+                raise WorkflowValidationError("Добавьте хотя бы один лист")
+            first, *remaining = rendered
+            first.save(
+                destination,
+                "PDF",
+                save_all=True,
+                append_images=remaining,
+                resolution=300.0,
+            )
+            return len(rendered)
+        except WorkflowValidationError:
+            raise
+        except (UnidentifiedImageError, OSError) as exc:
+            raise WorkflowValidationError(
+                "Не удалось собрать PDF из отсканированных листов"
+            ) from exc
+        finally:
+            for image in rendered:
+                image.close()
+
+    def finalize_signed_scan_session(
+        self,
+        session_id: str,
+        *,
+        actor: str = "Сотрудник",
+    ) -> dict[str, Any]:
+        session = self.get_signed_scan_session(session_id)
+        if not session or session["status"] not in {
+            "collecting",
+            "technical_error",
+        }:
+            raise WorkflowValidationError("Сессия сканирования не найдена или завершена")
+        pages = session["pages"]
+        if not pages:
+            raise WorkflowValidationError("Добавьте хотя бы один лист")
+        total_size = sum(int(page["size_bytes"]) for page in pages)
+        if total_size > self.settings.max_upload_bytes:
+            raise WorkflowValidationError(
+                "Общий размер отсканированных листов превышает допустимый"
+            )
+
+        scan_id = uuid4().hex
+        scan_dir = ensure_within(
+            self.settings.runtime_dir
+            / "signed_scans"
+            / session["response_letter_id"]
+            / scan_id,
+            self.settings.runtime_dir,
+        )
+        scan_dir.mkdir(parents=True, exist_ok=False)
+        pdf_path = scan_dir / "signed-response.pdf"
+        manifest_path = scan_dir / "source-pages.json"
+        try:
+            page_count = self._make_session_pages_pdf(pages, pdf_path)
+            if pdf_path.stat().st_size > self.settings.max_upload_bytes:
+                raise WorkflowValidationError(
+                    "Созданный PDF превышает допустимый размер файла"
+                )
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "session_id": session_id,
+                        "pages": [
+                            {
+                                "id": page["id"],
+                                "order": page["page_order"],
+                                "sha256": page["sha256"],
+                            }
+                            for page in pages
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            digest = self._file_sha256(pdf_path)
+            now = utc_now()
+            with self.db.connect() as connection:
+                connection.execute(
+                    """
+                    UPDATE signed_response_scans
+                    SET status = 'superseded', updated_at = ?
+                    WHERE response_letter_id = ?
+                      AND status IN ('needs_confirmation', 'confirmed')
+                    """,
+                    (now, session["response_letter_id"]),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO signed_response_scans(
+                        id, response_letter_id, status, source,
+                        original_filename, original_path, pdf_path,
+                        sha256, size_bytes, page_count,
+                        created_at, updated_at
+                    ) VALUES (?, ?, 'needs_confirmation', 'wia', ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        scan_id,
+                        session["response_letter_id"],
+                        f"Сессия WIA — {page_count} стр.",
+                        str(manifest_path),
+                        str(pdf_path),
+                        digest,
+                        pdf_path.stat().st_size,
+                        page_count,
+                        now,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE signed_scan_sessions
+                    SET status = 'completed', page_count = ?,
+                        result_scan_id = ?, error_message = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (page_count, scan_id, now, session_id),
+                )
+                for entity_type, entity_id, event_type, payload in (
+                    (
+                        "signed_response_scan",
+                        scan_id,
+                        "signed_response_scan_registered",
+                        {
+                            "response_letter_id": session["response_letter_id"],
+                            "source": "wia",
+                            "sha256": digest,
+                            "page_count": page_count,
+                            "session_id": session_id,
+                        },
+                    ),
+                    (
+                        "signed_scan_session",
+                        session_id,
+                        "signed_scan_session_completed",
+                        {"result_scan_id": scan_id, "page_count": page_count},
+                    ),
+                ):
+                    connection.execute(
+                        """
+                        INSERT INTO audit_events(
+                            entity_type, entity_id, event_type,
+                            actor, payload_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            entity_type,
+                            entity_id,
+                            event_type,
+                            actor,
+                            json.dumps(payload, ensure_ascii=False),
+                            now,
+                        ),
+                    )
+        except Exception as exc:
+            shutil.rmtree(scan_dir, ignore_errors=True)
+            safe_message = (
+                str(exc)
+                if isinstance(exc, (WorkflowValidationError, OSError))
+                else "Не удалось завершить сессию сканирования"
+            )
+            self._set_signed_scan_session_error(
+                session_id,
+                safe_message,
+                actor=actor,
+            )
+            raise
+        return self.get_signed_response_scan(scan_id) or {}
+
+    def cancel_signed_scan_session(
+        self,
+        session_id: str,
+        *,
+        actor: str = "Сотрудник",
+    ) -> None:
+        session = self.get_signed_scan_session(session_id)
+        if not session or session["status"] not in {
+            "collecting",
+            "technical_error",
+        }:
+            raise WorkflowValidationError("Сессия сканирования не найдена или завершена")
+        now = utc_now()
+        with self.db.connect() as connection:
+            connection.execute(
+                """
+                UPDATE signed_scan_sessions
+                SET status = 'cancelled', error_message = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, session_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO audit_events(
+                    entity_type, entity_id, event_type,
+                    actor, payload_json, created_at
+                ) VALUES ('signed_scan_session', ?,
+                          'signed_scan_session_cancelled', ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    actor,
+                    json.dumps(
+                        {"page_count": len(session["pages"])},
+                        ensure_ascii=False,
+                    ),
+                    now,
+                ),
+            )
 
     def register_signed_response_scan(
         self,
@@ -4832,6 +6270,16 @@ class WorkflowService:
                         now,
                     ),
                 )
+                connection.execute(
+                    """
+                    UPDATE signed_scan_sessions
+                    SET status = 'cancelled', error_message = NULL,
+                        updated_at = ?
+                    WHERE response_letter_id = ?
+                      AND status IN ('collecting', 'technical_error')
+                    """,
+                    (now, letter_id),
+                )
         except Exception:
             shutil.rmtree(scan_dir, ignore_errors=True)
             raise
@@ -4888,27 +6336,15 @@ class WorkflowService:
         *,
         actor: str = "Сотрудник",
     ) -> dict[str, Any]:
-        if not self.get_response_letter(letter_id):
-            raise WorkflowValidationError("Готовое письмо не найдено")
-        temporary = ensure_within(
-            self.settings.runtime_dir
-            / "signed_scans"
-            / f".wia-{uuid4().hex}.png",
-            self.settings.runtime_dir,
+        session = self.start_signed_scan_session(letter_id, actor=actor)
+        session = self.acquire_signed_scan_session_page(
+            session["id"],
+            actor=actor,
         )
-        temporary.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            self.scanner.acquire_a4(temporary)
-            with temporary.open("rb") as stream:
-                return self.register_signed_response_scan(
-                    letter_id,
-                    "Скан WIA.png",
-                    stream,
-                    source="wia",
-                    actor=actor,
-                )
-        finally:
-            temporary.unlink(missing_ok=True)
+        return self.finalize_signed_scan_session(
+            session["id"],
+            actor=actor,
+        )
 
     def confirm_signed_response_scan(
         self,
@@ -5120,9 +6556,48 @@ class WorkflowService:
     def get_upload(self, upload_id: str) -> dict[str, Any] | None:
         return self.db.fetch_one("SELECT * FROM uploads WHERE id = ?", (upload_id,))
 
-    def list_uploads(self) -> list[dict[str, Any]]:
+    def list_uploads(
+        self,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        if limit is None:
+            return self.db.fetch_all(
+                "SELECT * FROM uploads ORDER BY created_at DESC"
+            )
+        safe_limit = max(1, min(int(limit), 200))
         return self.db.fetch_all(
-            "SELECT * FROM uploads ORDER BY created_at DESC"
+            "SELECT * FROM uploads ORDER BY created_at DESC LIMIT ?",
+            (safe_limit,),
+        )
+
+    def list_incoming_work(
+        self,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 100))
+        return self.db.fetch_all(
+            """
+            SELECT uploads.*,
+                   MIN(outlook_messages.received_at) AS received_at,
+                   GROUP_CONCAT(
+                       DISTINCT outlook_messages.sender_smtp
+                   ) AS sender_smtp,
+                   COUNT(
+                       DISTINCT outlook_messages.source_key
+                   ) AS source_count
+            FROM uploads
+            LEFT JOIN outlook_attachments
+              ON outlook_attachments.upload_id = uploads.id
+            LEFT JOIN outlook_messages
+              ON outlook_messages.source_key =
+                 outlook_attachments.message_key
+            GROUP BY uploads.id
+            ORDER BY COALESCE(
+                MIN(outlook_messages.received_at), uploads.created_at
+            ) DESC, uploads.id
+            LIMIT ?
+            """,
+            (safe_limit,),
         )
 
     def get_upload_pages(self, upload_id: str) -> list[dict[str, Any]]:
@@ -5175,8 +6650,814 @@ class WorkflowService:
             """
         )
 
+    def _case_match_common_key(self, case: dict[str, Any]) -> tuple[str, ...]:
+        district = clean_location(case.get("district_place") or "")
+        office = self.canonical_gns_office(district)
+        return (
+            str(office["office_key"] if office else district).casefold(),
+            self._normalize_group_value(case.get("recipient_position")),
+            self._normalize_group_value(case.get("recipient_full_name")),
+            str(case.get("period_start") or ""),
+            str(case.get("period_end") or ""),
+            str(case.get("period_route") or ""),
+            self._normalize_group_value(case.get("employee_name")),
+        )
+
+    def _case_match_name_key(self, taxpayer: dict[str, Any]) -> str:
+        """Normalize only the presentation-level ИП prefix for comparison."""
+        return self._normalize_group_value(
+            response_taxpayer_name(
+                taxpayer.get("name") or "",
+                taxpayer.get("inn") or "",
+            )
+        )
+
+    @staticmethod
+    def _case_match_signature(
+        left_case: dict[str, Any],
+        right_case: dict[str, Any],
+        left_taxpayer: dict[str, Any],
+        right_taxpayer: dict[str, Any],
+    ) -> str:
+        payload = {
+            "left": {
+                "case_id": left_case["id"],
+                "case_source": left_case.get("source_kind") or "",
+                "official_parse_version": int(
+                    left_case.get("official_parse_version") or 0
+                ),
+                "taxpayer_id": left_taxpayer["id"],
+                "name": clean_taxpayer_name(left_taxpayer.get("name") or ""),
+                "inn": re.sub(r"\D", "", left_taxpayer.get("inn") or ""),
+                "name_source": left_taxpayer.get("name_source") or "",
+                "inn_source": left_taxpayer.get("inn_source") or "",
+            },
+            "right": {
+                "case_id": right_case["id"],
+                "case_source": right_case.get("source_kind") or "",
+                "official_parse_version": int(
+                    right_case.get("official_parse_version") or 0
+                ),
+                "taxpayer_id": right_taxpayer["id"],
+                "name": clean_taxpayer_name(right_taxpayer.get("name") or ""),
+                "inn": re.sub(r"\D", "", right_taxpayer.get("inn") or ""),
+                "name_source": right_taxpayer.get("name_source") or "",
+                "inn_source": right_taxpayer.get("inn_source") or "",
+            },
+        }
+        return hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _case_match_candidates(self) -> list[dict[str, Any]]:
+        cases = self.db.fetch_all(
+            """
+            SELECT cases.*
+            FROM cases
+            WHERE cases.fields_confirmed = 1
+              AND cases.status NOT IN (
+                  'response_created', 'completed', 'technical_error'
+              )
+              AND EXISTS (
+                  SELECT 1 FROM taxpayers
+                  WHERE taxpayers.case_id = cases.id
+              )
+            ORDER BY cases.created_at, cases.id
+            """
+        )
+        if len(cases) < 2:
+            return []
+        taxpayers = self.db.fetch_all(
+            """
+            SELECT taxpayers.*
+            FROM taxpayers
+            JOIN cases ON cases.id = taxpayers.case_id
+            WHERE cases.fields_confirmed = 1
+              AND cases.status NOT IN (
+                  'response_created', 'completed', 'technical_error'
+              )
+            ORDER BY taxpayers.case_id, taxpayers.display_order
+            """
+        )
+        taxpayers_by_case: dict[str, list[dict[str, Any]]] = {}
+        for taxpayer in taxpayers:
+            taxpayers_by_case.setdefault(taxpayer["case_id"], []).append(
+                taxpayer
+            )
+        groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+        for case in cases:
+            groups.setdefault(self._case_match_common_key(case), []).append(case)
+
+        candidates: list[dict[str, Any]] = []
+        for matching_cases in groups.values():
+            for left_index, first_case in enumerate(matching_cases):
+                for second_case in matching_cases[left_index + 1 :]:
+                    left_case, right_case = sorted(
+                        (first_case, second_case), key=lambda item: item["id"]
+                    )
+                    left_taxpayers = taxpayers_by_case.get(left_case["id"], [])
+                    right_taxpayers = taxpayers_by_case.get(right_case["id"], [])
+                    if (
+                        not left_taxpayers
+                        or len(left_taxpayers) != len(right_taxpayers)
+                    ):
+                        continue
+                    differences: list[
+                        tuple[dict[str, Any], dict[str, Any], str]
+                    ] = []
+                    invalid_pair = False
+                    for left_taxpayer, right_taxpayer in zip(
+                        left_taxpayers, right_taxpayers, strict=True
+                    ):
+                        names_equal = self._case_match_name_key(
+                            left_taxpayer
+                        ) == self._case_match_name_key(right_taxpayer)
+                        inns_equal = re.sub(
+                            r"\D", "", left_taxpayer.get("inn") or ""
+                        ) == re.sub(
+                            r"\D", "", right_taxpayer.get("inn") or ""
+                        )
+                        if names_equal and inns_equal:
+                            continue
+                        if names_equal == inns_equal:
+                            invalid_pair = True
+                            break
+                        differences.append(
+                            (
+                                left_taxpayer,
+                                right_taxpayer,
+                                "inn" if names_equal else "name",
+                            )
+                        )
+                    if invalid_pair or len(differences) != 1:
+                        continue
+                    left_taxpayer, right_taxpayer, differing_field = (
+                        differences[0]
+                    )
+                    candidates.append(
+                        {
+                            "left_case_id": left_case["id"],
+                            "right_case_id": right_case["id"],
+                            "left_taxpayer_id": left_taxpayer["id"],
+                            "right_taxpayer_id": right_taxpayer["id"],
+                            "differing_field": differing_field,
+                            "signature_hash": self._case_match_signature(
+                                left_case,
+                                right_case,
+                                left_taxpayer,
+                                right_taxpayer,
+                            ),
+                        }
+                    )
+        return candidates
+
+    def reconcile_case_match_reviews(self) -> int:
+        candidates = self._case_match_candidates()
+        candidate_keys = {
+            (
+                item["left_case_id"],
+                item["right_case_id"],
+                item["signature_hash"],
+            )
+            for item in candidates
+        }
+        now = utc_now()
+        affected_case_ids: set[str] = set()
+        created_ids: list[str] = []
+        with self.db.connect() as connection:
+            pending_rows = connection.execute(
+                "SELECT * FROM case_match_reviews WHERE status = 'pending'"
+            ).fetchall()
+            for pending in pending_rows:
+                key = (
+                    pending["left_case_id"],
+                    pending["right_case_id"],
+                    pending["signature_hash"],
+                )
+                if key in candidate_keys:
+                    continue
+                connection.execute(
+                    """
+                    UPDATE case_match_reviews
+                    SET status = 'superseded', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, pending["id"]),
+                )
+                affected_case_ids.update(
+                    (pending["left_case_id"], pending["right_case_id"])
+                )
+
+            for candidate in candidates:
+                existing = connection.execute(
+                    """
+                    SELECT id, status
+                    FROM case_match_reviews
+                    WHERE left_case_id = ? AND right_case_id = ?
+                      AND signature_hash = ?
+                    LIMIT 1
+                    """,
+                    (
+                        candidate["left_case_id"],
+                        candidate["right_case_id"],
+                        candidate["signature_hash"],
+                    ),
+                ).fetchone()
+                if existing and existing["status"] != "pending":
+                    continue
+                if not existing:
+                    review_id = uuid4().hex
+                    connection.execute(
+                        """
+                        INSERT INTO case_match_reviews(
+                            id, left_case_id, right_case_id,
+                            left_taxpayer_id, right_taxpayer_id,
+                            signature_hash, differing_field, status,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                        """,
+                        (
+                            review_id,
+                            candidate["left_case_id"],
+                            candidate["right_case_id"],
+                            candidate["left_taxpayer_id"],
+                            candidate["right_taxpayer_id"],
+                            candidate["signature_hash"],
+                            candidate["differing_field"],
+                            now,
+                            now,
+                        ),
+                    )
+                    created_ids.append(review_id)
+                for case_id in (
+                    candidate["left_case_id"],
+                    candidate["right_case_id"],
+                ):
+                    connection.execute(
+                        """
+                        UPDATE cases
+                        SET match_review_previous_status = CASE
+                                WHEN status != 'needs_review' THEN status
+                                ELSE COALESCE(
+                                    match_review_previous_status, status
+                                )
+                            END,
+                            status = 'needs_review', updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now, case_id),
+                    )
+                    affected_case_ids.add(case_id)
+
+            for case_id in affected_case_ids:
+                pending_count = connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM case_match_reviews
+                    WHERE status = 'pending'
+                      AND (left_case_id = ? OR right_case_id = ?)
+                    """,
+                    (case_id, case_id),
+                ).fetchone()["count"]
+                if pending_count:
+                    continue
+                case = connection.execute(
+                    """
+                    SELECT status, match_review_previous_status
+                    FROM cases WHERE id = ?
+                    """,
+                    (case_id,),
+                ).fetchone()
+                if not case or not case["match_review_previous_status"]:
+                    continue
+                if case["status"] == CaseStatus.NEEDS_REVIEW:
+                    connection.execute(
+                        """
+                        UPDATE cases
+                        SET status = ?, match_review_previous_status = NULL,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (case["match_review_previous_status"], now, case_id),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        UPDATE cases
+                        SET match_review_previous_status = NULL,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now, case_id),
+                    )
+            for review_id in created_ids:
+                connection.execute(
+                    """
+                    INSERT INTO audit_events(
+                        entity_type, entity_id, event_type,
+                        actor, payload_json, created_at
+                    ) VALUES ('case_match_review', ?,
+                              'case_match_review_created', 'system', ?, ?)
+                    """,
+                    (
+                        review_id,
+                        json.dumps(
+                            {"automatic_decision": False},
+                            ensure_ascii=False,
+                        ),
+                        now,
+                    ),
+                )
+        return len(created_ids)
+
+    def has_pending_case_match_review(self, case_id: str) -> bool:
+        row = self.db.fetch_one(
+            """
+            SELECT 1 AS found
+            FROM case_match_reviews
+            WHERE status = 'pending'
+              AND (left_case_id = ? OR right_case_id = ?)
+            LIMIT 1
+            """,
+            (case_id, case_id),
+        )
+        return bool(row)
+
+    def list_case_match_reviews(self) -> list[dict[str, Any]]:
+        self.reconcile_case_match_reviews()
+        reviews = self.db.fetch_all(
+            """
+            SELECT case_match_reviews.*
+            FROM case_match_reviews
+            WHERE case_match_reviews.status = 'pending'
+            ORDER BY case_match_reviews.created_at,
+                     case_match_reviews.id
+            """
+        )
+        return [
+            self.get_case_match_review(item["id"]) or item
+            for item in reviews
+        ]
+
+    def _case_match_source(
+        self, case_id: str, taxpayer_id: str
+    ) -> dict[str, Any] | None:
+        case = self.db.fetch_one(
+            """
+            SELECT cases.*, uploads.original_filename,
+                (
+                    SELECT pages.id FROM pages
+                    WHERE pages.case_id = cases.id
+                    ORDER BY CASE WHEN pages.page_type = 'letter'
+                                  THEN 0 ELSE 1 END,
+                             pages.page_number
+                    LIMIT 1
+                ) AS source_page_id,
+                (
+                    SELECT pages.page_number FROM pages
+                    WHERE pages.case_id = cases.id
+                    ORDER BY CASE WHEN pages.page_type = 'letter'
+                                  THEN 0 ELSE 1 END,
+                             pages.page_number
+                    LIMIT 1
+                ) AS source_page_number
+            FROM cases
+            JOIN uploads ON uploads.id = cases.upload_id
+            WHERE cases.id = ?
+            """,
+            (case_id,),
+        )
+        if not case:
+            return None
+        taxpayer = self.db.fetch_one(
+            "SELECT * FROM taxpayers WHERE id = ? AND case_id = ?",
+            (taxpayer_id, case_id),
+        )
+        if not taxpayer:
+            return None
+        case["taxpayer"] = taxpayer
+        return case
+
+    def get_case_match_review(
+        self, review_id: str
+    ) -> dict[str, Any] | None:
+        review = self.db.fetch_one(
+            "SELECT * FROM case_match_reviews WHERE id = ?", (review_id,)
+        )
+        if not review:
+            return None
+        review["left"] = self._case_match_source(
+            review["left_case_id"], review["left_taxpayer_id"]
+        )
+        review["right"] = self._case_match_source(
+            review["right_case_id"], review["right_taxpayer_id"]
+        )
+        review["issue_message"] = (
+            "Совпадают письмо и наименование лица, но отличается ИНН."
+            if review["differing_field"] == "inn"
+            else "Совпадают письмо и ИНН, но отличается наименование лица."
+        )
+        return review
+
+    def _release_case_match_block(
+        self,
+        connection: sqlite3.Connection,
+        case_id: str,
+        now: str,
+        target_status: str | None = None,
+    ) -> None:
+        pending_count = connection.execute(
+            """
+            SELECT COUNT(*) AS count FROM case_match_reviews
+            WHERE status = 'pending'
+              AND (left_case_id = ? OR right_case_id = ?)
+            """,
+            (case_id, case_id),
+        ).fetchone()["count"]
+        case = connection.execute(
+            """
+            SELECT status, match_review_previous_status
+            FROM cases WHERE id = ?
+            """,
+            (case_id,),
+        ).fetchone()
+        if not case:
+            return
+        restored = target_status or case["match_review_previous_status"]
+        if pending_count:
+            connection.execute(
+                """
+                UPDATE cases
+                SET status = 'needs_review',
+                    match_review_previous_status = COALESCE(?,
+                        match_review_previous_status),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (restored, now, case_id),
+            )
+            return
+        connection.execute(
+            """
+            UPDATE cases
+            SET status = ?, match_review_previous_status = NULL,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (restored or CaseStatus.NEEDS_REVIEW, now, case_id),
+        )
+
+    def resolve_case_match_review(
+        self,
+        review_id: str,
+        *,
+        decision: str,
+        name_choice: str = "",
+        inn_choice: str = "",
+        manual_name: str = "",
+        manual_inn: str = "",
+        actor: str = "Сотрудник",
+    ) -> dict[str, Any]:
+        self.reconcile_case_match_reviews()
+        review = self.get_case_match_review(review_id)
+        if not review or review.get("status") != "pending":
+            raise WorkflowValidationError(
+                "Проверка уже завершена или исходные данные изменились"
+            )
+        left = review.get("left")
+        right = review.get("right")
+        if not left or not right:
+            raise WorkflowValidationError(
+                "Одна из версий изменилась. Обновите очередь проверки"
+            )
+        if decision not in {"same", "distinct"}:
+            raise WorkflowValidationError(
+                "Укажите, относится ли это к одному обращению"
+            )
+        now = utc_now()
+        case_ids = [review["left_case_id"], review["right_case_id"]]
+        recheck_case_ids: set[str] = set()
+        resolution_payload: dict[str, Any] = {"decision": decision}
+        with self.db.connect() as connection:
+            current = connection.execute(
+                "SELECT status FROM case_match_reviews WHERE id = ?",
+                (review_id,),
+            ).fetchone()
+            if not current or current["status"] != "pending":
+                raise WorkflowValidationError("Проверка уже завершена")
+
+            if decision == "same":
+                records = [left["taxpayer"], right["taxpayer"]]
+                records_by_id = {item["id"]: item for item in records}
+
+                def selected_value(
+                    field: str, choice: str, manual_value: str
+                ) -> tuple[str, str, str | None]:
+                    if choice == "manual":
+                        return manual_value, str(ValueSource.MANUAL), None
+                    record = records_by_id.get(choice)
+                    if not record:
+                        raise WorkflowValidationError(
+                            f"Выберите источник для поля «{field}»"
+                        )
+                    is_name = field == "Наименование"
+                    value_key = "name" if is_name else "inn"
+                    source_key = "name_source" if is_name else "inn_source"
+                    reference_key = (
+                        "name_source_reference"
+                        if is_name
+                        else "inn_source_reference"
+                    )
+                    return (
+                        str(record[value_key]),
+                        str(record.get(source_key) or ValueSource.MANUAL),
+                        record.get(reference_key) or f"taxpayer:{record['id']}",
+                    )
+
+                selected_name, name_source, name_reference = selected_value(
+                    "Наименование", name_choice, manual_name
+                )
+                selected_inn, inn_source, inn_reference = selected_value(
+                    "ИНН", inn_choice, manual_inn
+                )
+                clean_name = clean_taxpayer_name(selected_name)
+                clean_inn = re.sub(r"\D", "", selected_inn)
+                if not clean_name:
+                    raise WorkflowValidationError(
+                        "Укажите итоговое наименование"
+                    )
+                if len(clean_inn) != 14:
+                    raise WorkflowValidationError(
+                        "Итоговый ИНН должен содержать ровно 14 цифр"
+                    )
+                record_ids = [item["id"] for item in records]
+                placeholders = ",".join("?" for _ in record_ids)
+                for case_id in case_ids:
+                    duplicate = connection.execute(
+                        f"""
+                        SELECT id FROM taxpayers
+                        WHERE case_id = ? AND inn = ?
+                          AND id NOT IN ({placeholders})
+                        LIMIT 1
+                        """,
+                        (case_id, clean_inn, *record_ids),
+                    ).fetchone()
+                    if duplicate:
+                        raise WorkflowValidationError(
+                            "Итоговый ИНН уже указан для другого лица "
+                            "в одном из обращений"
+                        )
+                for record in records:
+                    inn_changed = str(record["inn"]) != clean_inn
+                    if inn_changed:
+                        recheck_case_ids.add(str(record["case_id"]))
+                    connection.execute(
+                        """
+                        UPDATE taxpayers
+                        SET name = ?, inn = ?,
+                            name_source = ?, inn_source = ?,
+                            name_source_reference = ?,
+                            inn_source_reference = ?,
+                            manually_confirmed = 1,
+                            abs_result = CASE WHEN ? THEN NULL
+                                              ELSE abs_result END,
+                            abs_account_result = CASE WHEN ? THEN NULL
+                                                      ELSE abs_account_result END,
+                            abs_active_account_count = CASE WHEN ? THEN NULL
+                                                            ELSE abs_active_account_count END,
+                            abs_closed_account_count = CASE WHEN ? THEN NULL
+                                                            ELSE abs_closed_account_count END,
+                            odb_result = CASE WHEN ? THEN NULL
+                                              ELSE odb_result END,
+                            registry_status = NULL, registry_name = NULL,
+                            registry_director = NULL,
+                            registry_checked_at = NULL,
+                            registry_provider = NULL, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            clean_name,
+                            clean_inn,
+                            name_source,
+                            inn_source,
+                            name_reference,
+                            inn_reference,
+                            int(inn_changed),
+                            int(inn_changed),
+                            int(inn_changed),
+                            int(inn_changed),
+                            int(inn_changed),
+                            now,
+                            record["id"],
+                        ),
+                    )
+                resolution_payload.update(
+                    {
+                        "name_choice": name_choice,
+                        "inn_choice": inn_choice,
+                        "requires_abs_recheck": bool(recheck_case_ids),
+                    }
+                )
+
+            connection.execute(
+                """
+                UPDATE case_match_reviews
+                SET status = 'resolved', resolution = ?,
+                    resolved_by = ?, resolved_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (decision, actor, now, now, review_id),
+            )
+            for case_id in case_ids:
+                target_status = (
+                    CaseStatus.READY_FOR_ABS
+                    if case_id in recheck_case_ids
+                    else None
+                )
+                if case_id in recheck_case_ids:
+                    connection.execute(
+                        """
+                        UPDATE cases
+                        SET abs_status = ?, response_status = NULL,
+                            response_path = NULL,
+                            response_page_overflow = NULL
+                        WHERE id = ?
+                        """,
+                        (AbsStatus.NOT_CHECKED, case_id),
+                    )
+                self._release_case_match_block(
+                    connection, case_id, now, target_status
+                )
+            connection.execute(
+                """
+                INSERT INTO audit_events(
+                    entity_type, entity_id, event_type,
+                    actor, payload_json, created_at
+                ) VALUES ('case_match_review', ?,
+                          'case_match_review_resolved', ?, ?, ?)
+                """,
+                (
+                    review_id,
+                    actor,
+                    json.dumps(resolution_payload, ensure_ascii=False),
+                    now,
+                ),
+            )
+
+        self.reconcile_case_match_reviews()
+        for case_id in case_ids:
+            self.auto_check_abs(case_id)
+        return {
+            "decision": decision,
+            "requires_abs_recheck": bool(recheck_case_ids),
+            "recheck_case_ids": sorted(recheck_case_ids),
+        }
+
     def get_case(self, case_id: str) -> dict[str, Any] | None:
         return self.db.fetch_one("SELECT * FROM cases WHERE id = ?", (case_id,))
+
+    def get_case_source_page(self, case_id: str) -> dict[str, Any] | None:
+        case = self.get_case(case_id)
+        if not case:
+            return None
+        linked = self.db.fetch_one(
+            """
+            SELECT * FROM pages
+            WHERE case_id = ?
+            ORDER BY CASE WHEN page_type = 'letter' THEN 0 ELSE 1 END,
+                     page_number
+            LIMIT 1
+            """,
+            (case_id,),
+        )
+        if linked:
+            return linked
+        event = self.db.fetch_one(
+            """
+            SELECT payload_json
+            FROM audit_events
+            WHERE entity_type = 'case' AND entity_id = ?
+              AND event_type = 'scan_case_created'
+            ORDER BY id LIMIT 1
+            """,
+            (case_id,),
+        )
+        if not event:
+            return None
+        try:
+            source_page_id = json.loads(event["payload_json"]).get(
+                "source_page_id"
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not source_page_id:
+            return None
+        source_page = self.get_page(str(source_page_id))
+        if not source_page or source_page.get("upload_id") != case.get(
+            "upload_id"
+        ):
+            return None
+        return source_page
+
+    def reopen_incomplete_case_review(
+        self,
+        case_id: str,
+        *,
+        actor: str = "Сотрудник",
+    ) -> dict[str, Any]:
+        case = self.get_case(case_id)
+        if not case:
+            raise WorkflowValidationError("Обращение не найдено")
+        if (
+            case.get("source_kind") != ValueSource.OCR_SCAN
+            or case.get("fields_confirmed")
+            or case.get("status")
+            not in {CaseStatus.NEEDS_REVIEW, CaseStatus.TECHNICAL_ERROR}
+        ):
+            raise WorkflowValidationError(
+                "Это обращение нельзя вернуть к ручной проверке"
+            )
+        source_page = self.get_case_source_page(case_id)
+        if not source_page:
+            raise WorkflowValidationError(
+                "Не найден исходный лист для сверки данных"
+            )
+        if source_page.get("upload_id") != case.get("upload_id"):
+            raise WorkflowValidationError(
+                "Исходный лист относится к другому PDF"
+            )
+        linked_case_id = source_page.get("case_id")
+        if linked_case_id not in {None, case_id}:
+            raise WorkflowValidationError(
+                "Исходный лист уже связан с другим обращением"
+            )
+        if (
+            linked_case_id == case_id
+            and source_page.get("status")
+            in {PageStatus.NEEDS_REVIEW, PageStatus.TECHNICAL_ERROR}
+        ):
+            return source_page
+
+        now = utc_now()
+        before = {
+            "case_id": linked_case_id,
+            "page_type": source_page.get("page_type"),
+            "status": source_page.get("status"),
+            "manual_confirmed": bool(source_page.get("manual_confirmed")),
+        }
+        self.db.execute(
+            """
+            UPDATE pages
+            SET case_id = ?, page_type = ?, type_confidence = 1,
+                manual_confirmed = 0, status = ?,
+                issue_code = ?, issue_message = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                case_id,
+                PageType.LETTER,
+                PageStatus.NEEDS_REVIEW,
+                "incomplete_letter_data",
+                "Заполните и подтвердите данные письма.",
+                now,
+                source_page["id"],
+            ),
+        )
+        self.db.execute(
+            "UPDATE cases SET status = ?, updated_at = ? WHERE id = ?",
+            (CaseStatus.NEEDS_REVIEW, now, case_id),
+        )
+        payload = {
+            "source_page_id": source_page["id"],
+            "before": before,
+            "after": {
+                "case_id": case_id,
+                "page_type": str(PageType.LETTER),
+                "status": str(PageStatus.NEEDS_REVIEW),
+                "manual_confirmed": False,
+            },
+        }
+        self.db.audit(
+            "case",
+            case_id,
+            "case_review_reopened",
+            payload,
+            actor=actor,
+        )
+        self.db.audit(
+            "page",
+            source_page["id"],
+            "page_reopened_for_case_review",
+            {"case_id": case_id, "before": before},
+            actor=actor,
+        )
+        self._refresh_upload_status(case["upload_id"])
+        return self.get_page(source_page["id"]) or source_page
 
     def get_taxpayers(self, case_id: str) -> list[dict[str, Any]]:
         return self.db.fetch_all(
@@ -5186,6 +7467,339 @@ class WorkflowService:
             """,
             (case_id,),
         )
+
+    def resolve_response_group_conflict(
+        self,
+        group_key: str,
+        conflict_inn: str,
+        *,
+        name_choice: str,
+        inn_choice: str,
+        manual_name: str = "",
+        manual_inn: str = "",
+        actor: str = "Сотрудник",
+    ) -> dict[str, Any]:
+        day = datetime.now(self.BUSINESS_TIMEZONE).date()
+        group = next(
+            (
+                item
+                for item in self._daily_response_groups(
+                    day, AbsStatus.NOT_FOUND
+                )
+                if item["group_key"] == group_key
+            ),
+            None,
+        )
+        if not group:
+            raise WorkflowValidationError(
+                "Группа изменилась. Обновите страницу и проверьте данные снова"
+            )
+        conflict = next(
+            (
+                item
+                for item in group["conflicts"]
+                if item["inn"] == re.sub(r"\D", "", conflict_inn)
+            ),
+            None,
+        )
+        if not conflict:
+            raise WorkflowValidationError(
+                "Конфликт уже разрешён или больше не относится к этой группе"
+            )
+        records = conflict["records"]
+        records_by_id = {record["taxpayer_id"]: record for record in records}
+
+        def selected_value(
+            field: str,
+            choice: str,
+            manual_value: str,
+        ) -> tuple[str, str, str | None]:
+            if choice == "manual":
+                return manual_value, str(ValueSource.MANUAL), None
+            record = records_by_id.get(choice)
+            if not record:
+                raise WorkflowValidationError(
+                    f"Выберите источник для поля «{field}»"
+                )
+            source_column = "name_source" if field == "Наименование" else "inn_source"
+            reference_column = (
+                "name_source_reference"
+                if field == "Наименование"
+                else "inn_source_reference"
+            )
+            value_column = "name" if field == "Наименование" else "inn"
+            reference = record.get(reference_column) or (
+                f"taxpayer:{record['taxpayer_id']}"
+            )
+            return (
+                str(record[value_column]),
+                str(record.get(source_column) or ValueSource.MANUAL),
+                reference,
+            )
+
+        selected_name, name_source, name_reference = selected_value(
+            "Наименование",
+            name_choice,
+            manual_name,
+        )
+        selected_inn, inn_source, inn_reference = selected_value(
+            "ИНН",
+            inn_choice,
+            manual_inn,
+        )
+        clean_name = clean_taxpayer_name(selected_name)
+        clean_inn = re.sub(r"\D", "", selected_inn)
+        if not clean_name:
+            raise WorkflowValidationError("Укажите итоговое наименование")
+        if len(clean_inn) != 14:
+            raise WorkflowValidationError(
+                "Итоговый ИНН должен содержать ровно 14 цифр"
+            )
+
+        record_ids = [record["taxpayer_id"] for record in records]
+        case_ids = sorted({record["source_case_id"] for record in records})
+        placeholders = ",".join("?" for _ in record_ids)
+        for case_id in case_ids:
+            duplicate = self.db.fetch_one(
+                f"""
+                SELECT id FROM taxpayers
+                WHERE case_id = ? AND inn = ?
+                  AND id NOT IN ({placeholders})
+                LIMIT 1
+                """,
+                (case_id, clean_inn, *record_ids),
+            )
+            if duplicate:
+                raise WorkflowValidationError(
+                    "Итоговый ИНН уже указан для другого лица в одном из писем"
+                )
+
+        now = utc_now()
+        recheck_case_ids: set[str] = set()
+        with self.db.connect() as connection:
+            current_rows = connection.execute(
+                f"SELECT * FROM taxpayers WHERE id IN ({placeholders})",
+                record_ids,
+            ).fetchall()
+            if len(current_rows) != len(record_ids):
+                raise WorkflowValidationError(
+                    "Одна из записей изменилась. Обновите страницу"
+                )
+            for row in current_rows:
+                inn_changed = str(row["inn"]) != clean_inn
+                if inn_changed:
+                    recheck_case_ids.add(str(row["case_id"]))
+                connection.execute(
+                    """
+                    UPDATE taxpayers
+                    SET name = ?, inn = ?,
+                        name_source = ?, inn_source = ?,
+                        name_source_reference = ?, inn_source_reference = ?,
+                        manually_confirmed = 1,
+                        abs_result = CASE WHEN ? THEN NULL ELSE abs_result END,
+                        abs_account_result = CASE WHEN ? THEN NULL ELSE abs_account_result END,
+                        abs_active_account_count = CASE WHEN ? THEN NULL ELSE abs_active_account_count END,
+                        abs_closed_account_count = CASE WHEN ? THEN NULL ELSE abs_closed_account_count END,
+                        odb_result = CASE WHEN ? THEN NULL ELSE odb_result END,
+                        registry_status = NULL, registry_name = NULL,
+                        registry_director = NULL, registry_checked_at = NULL,
+                        registry_provider = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        clean_name,
+                        clean_inn,
+                        name_source,
+                        inn_source,
+                        name_reference,
+                        inn_reference,
+                        int(inn_changed),
+                        int(inn_changed),
+                        int(inn_changed),
+                        int(inn_changed),
+                        int(inn_changed),
+                        now,
+                        row["id"],
+                    ),
+                )
+            for case_id in recheck_case_ids:
+                connection.execute(
+                    """
+                    UPDATE cases
+                    SET status = ?, abs_status = ?, response_status = NULL,
+                        response_path = NULL, response_page_overflow = NULL,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        CaseStatus.READY_FOR_ABS,
+                        AbsStatus.NOT_CHECKED,
+                        now,
+                        case_id,
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT INTO audit_events(
+                    entity_type, entity_id, event_type,
+                    actor, payload_json, created_at
+                ) VALUES ('response_group', ?,
+                          'response_group_conflict_resolved', ?, ?, ?)
+                """,
+                (
+                    group_key,
+                    actor,
+                    json.dumps(
+                        {
+                            "conflict_inn": conflict["inn"],
+                            "record_ids": record_ids,
+                            "name_choice": name_choice,
+                            "inn_choice": inn_choice,
+                            "recheck_case_ids": sorted(recheck_case_ids),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    now,
+                ),
+            )
+        return {
+            "updated_records": len(record_ids),
+            "requires_abs_recheck": bool(recheck_case_ids),
+            "recheck_case_ids": sorted(recheck_case_ids),
+        }
+
+    def correct_taxpayer(
+        self,
+        case_id: str,
+        taxpayer_id: str,
+        *,
+        name: str,
+        inn: str,
+        actor: str = "Сотрудник",
+    ) -> dict[str, Any]:
+        case = self.get_case(case_id)
+        if not case:
+            raise WorkflowValidationError("Обращение не найдено")
+        if case["status"] in {
+            CaseStatus.RESPONSE_CREATED,
+            CaseStatus.COMPLETED,
+        }:
+            raise WorkflowValidationError(
+                "Ответ уже создан. Исправление исходных данных заблокировано"
+            )
+        if self.has_pending_case_match_review(case_id):
+            raise WorkflowValidationError(
+                "Эти версии уже находятся в ручном сравнении. "
+                "Примените решение из очереди проверки"
+            )
+        taxpayer = self.db.fetch_one(
+            "SELECT * FROM taxpayers WHERE id = ? AND case_id = ?",
+            (taxpayer_id, case_id),
+        )
+        if not taxpayer:
+            raise WorkflowValidationError("Налогоплательщик не найден")
+
+        clean_name = clean_taxpayer_name(name)
+        clean_inn = re.sub(r"\D", "", inn)
+        if not clean_name:
+            raise WorkflowValidationError("Укажите наименование")
+        if len(clean_inn) != 14:
+            raise WorkflowValidationError("ИНН должен содержать ровно 14 цифр")
+        duplicate = self.db.fetch_one(
+            """
+            SELECT id FROM taxpayers
+            WHERE case_id = ? AND inn = ? AND id != ?
+            """,
+            (case_id, clean_inn, taxpayer_id),
+        )
+        if duplicate:
+            raise WorkflowValidationError(
+                "Такой ИНН уже есть в этом обращении. Исправьте существующую запись"
+            )
+
+        name_changed = clean_name != taxpayer["name"]
+        inn_changed = clean_inn != taxpayer["inn"]
+        if not name_changed and not inn_changed:
+            raise WorkflowValidationError(
+                "Данные не изменились. Исправьте неверное значение после сверки с письмом"
+            )
+
+        now = utc_now()
+        with self.db.connect() as connection:
+            connection.execute(
+                """
+                UPDATE taxpayers
+                SET name = ?, inn = ?, name_source = ?, inn_source = ?,
+                    name_source_reference = ?, inn_source_reference = ?,
+                    manually_confirmed = 1,
+                    abs_result = CASE WHEN ? THEN NULL ELSE abs_result END,
+                    abs_account_result = CASE WHEN ? THEN NULL ELSE abs_account_result END,
+                    abs_active_account_count = CASE WHEN ? THEN NULL ELSE abs_active_account_count END,
+                    abs_closed_account_count = CASE WHEN ? THEN NULL ELSE abs_closed_account_count END,
+                    odb_result = CASE WHEN ? THEN NULL ELSE odb_result END,
+                    registry_status = NULL, registry_name = NULL,
+                    registry_director = NULL, registry_checked_at = NULL,
+                    registry_provider = NULL, updated_at = ?
+                WHERE id = ? AND case_id = ?
+                """,
+                (
+                    clean_name,
+                    clean_inn,
+                    ValueSource.MANUAL if name_changed else taxpayer["name_source"],
+                    ValueSource.MANUAL if inn_changed else taxpayer["inn_source"],
+                    None if name_changed else taxpayer["name_source_reference"],
+                    None if inn_changed else taxpayer["inn_source_reference"],
+                    int(inn_changed),
+                    int(inn_changed),
+                    int(inn_changed),
+                    int(inn_changed),
+                    int(inn_changed),
+                    now,
+                    taxpayer_id,
+                    case_id,
+                ),
+            )
+            if inn_changed:
+                connection.execute(
+                    """
+                    UPDATE cases
+                    SET status = ?, abs_status = ?, response_status = NULL,
+                        response_path = NULL, response_page_overflow = NULL,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        CaseStatus.READY_FOR_ABS,
+                        AbsStatus.NOT_CHECKED,
+                        now,
+                        case_id,
+                    ),
+                )
+
+        changed_fields = [
+            field
+            for field, changed in (
+                ("name", name_changed),
+                ("inn", inn_changed),
+            )
+            if changed
+        ]
+        self.db.audit(
+            "taxpayer",
+            taxpayer_id,
+            "taxpayer_manually_corrected",
+            {
+                "case_id": case_id,
+                "changed_fields": changed_fields,
+                "requires_abs_recheck": inn_changed,
+            },
+            actor=actor,
+        )
+        self.reconcile_case_match_reviews()
+        return {
+            "changed_fields": changed_fields,
+            "requires_abs_recheck": inn_changed,
+        }
 
     def list_cases(self) -> list[dict[str, Any]]:
         return self.db.fetch_all(
@@ -5198,6 +7812,180 @@ class WorkflowService:
             ORDER BY cases.created_at DESC
             """
         )
+
+    def list_letter_history(
+        self,
+        query: str = "",
+        *,
+        page: int = 1,
+        page_size: int = 40,
+    ) -> dict[str, Any]:
+        search = " ".join(str(query or "").split())[:160]
+        page_size = max(10, min(int(page_size), 100))
+        requested_page = max(int(page), 1)
+        history_cte = """
+            WITH letter_history AS (
+                SELECT
+                    cases.id,
+                    cases.upload_id,
+                    cases.status,
+                    cases.created_at,
+                    cases.district_place,
+                    cases.recipient_display_name,
+                    uploads.original_filename,
+                    uploads.page_count,
+                    uploads.created_at AS uploaded_at,
+                    (SELECT COUNT(*) FROM taxpayers
+                     WHERE taxpayers.case_id = cases.id)
+                        AS taxpayer_count,
+                    (SELECT GROUP_CONCAT(taxpayers.name, ' · ')
+                     FROM taxpayers
+                     WHERE taxpayers.case_id = cases.id)
+                        AS taxpayer_names,
+                    (SELECT GROUP_CONCAT(taxpayers.inn, ' · ')
+                     FROM taxpayers
+                     WHERE taxpayers.case_id = cases.id)
+                        AS taxpayer_inns,
+                    (SELECT GROUP_CONCAT(page_numbers.page_number, ', ')
+                     FROM (
+                        SELECT pages.page_number
+                        FROM pages
+                        WHERE pages.case_id = cases.id
+                        ORDER BY pages.page_number
+                     ) AS page_numbers)
+                        AS source_page_numbers,
+                    (SELECT MIN(pages.page_number)
+                     FROM pages
+                     WHERE pages.case_id = cases.id)
+                        AS source_first_page,
+                    (SELECT outlook_messages.sender_smtp
+                     FROM outlook_attachments
+                     JOIN outlook_messages
+                       ON outlook_messages.source_key =
+                          outlook_attachments.message_key
+                     WHERE outlook_attachments.upload_id = cases.upload_id
+                     ORDER BY outlook_messages.received_at
+                     LIMIT 1) AS sender_smtp,
+                    (SELECT outlook_messages.received_at
+                     FROM outlook_attachments
+                     JOIN outlook_messages
+                       ON outlook_messages.source_key =
+                          outlook_attachments.message_key
+                     WHERE outlook_attachments.upload_id = cases.upload_id
+                     ORDER BY outlook_messages.received_at
+                     LIMIT 1) AS received_at,
+                    (SELECT response_groups.id
+                     FROM response_group_cases
+                     JOIN response_groups
+                       ON response_groups.id =
+                          response_group_cases.response_group_id
+                     WHERE response_group_cases.case_id = cases.id
+                     ORDER BY response_groups.created_at DESC
+                     LIMIT 1) AS response_group_id,
+                    (SELECT GROUP_CONCAT(response_letters.outgoing_number, ', ')
+                     FROM response_group_cases
+                     JOIN response_letters
+                       ON response_letters.response_group_id =
+                          response_group_cases.response_group_id
+                     WHERE response_group_cases.case_id = cases.id
+                       AND response_letters.outgoing_number IS NOT NULL
+                       AND response_letters.outgoing_number != '')
+                        AS outgoing_numbers,
+                    (SELECT signed_response_scans.id
+                     FROM response_group_cases
+                     JOIN response_letters
+                       ON response_letters.response_group_id =
+                          response_group_cases.response_group_id
+                     JOIN signed_response_scans
+                       ON signed_response_scans.response_letter_id =
+                          response_letters.id
+                     WHERE response_group_cases.case_id = cases.id
+                       AND signed_response_scans.status != 'superseded'
+                     ORDER BY signed_response_scans.created_at DESC
+                     LIMIT 1) AS signed_scan_id,
+                    (SELECT outlook_outgoing_messages.status
+                     FROM response_group_cases
+                     JOIN response_letters
+                       ON response_letters.response_group_id =
+                          response_group_cases.response_group_id
+                     JOIN outlook_outgoing_messages
+                       ON outlook_outgoing_messages.response_letter_id =
+                          response_letters.id
+                     WHERE response_group_cases.case_id = cases.id
+                     ORDER BY outlook_outgoing_messages.created_at DESC
+                     LIMIT 1) AS mail_status,
+                    (SELECT outlook_outgoing_messages.recipient_email
+                     FROM response_group_cases
+                     JOIN response_letters
+                       ON response_letters.response_group_id =
+                          response_group_cases.response_group_id
+                     JOIN outlook_outgoing_messages
+                       ON outlook_outgoing_messages.response_letter_id =
+                          response_letters.id
+                     WHERE response_group_cases.case_id = cases.id
+                     ORDER BY outlook_outgoing_messages.created_at DESC
+                     LIMIT 1) AS recipient_email,
+                    (SELECT outlook_outgoing_messages.sent_at
+                     FROM response_group_cases
+                     JOIN response_letters
+                       ON response_letters.response_group_id =
+                          response_group_cases.response_group_id
+                     JOIN outlook_outgoing_messages
+                       ON outlook_outgoing_messages.response_letter_id =
+                          response_letters.id
+                     WHERE response_group_cases.case_id = cases.id
+                     ORDER BY outlook_outgoing_messages.created_at DESC
+                     LIMIT 1) AS sent_at
+                FROM cases
+                JOIN uploads ON uploads.id = cases.upload_id
+            )
+        """
+        where = ""
+        search_parameters: tuple[Any, ...] = ()
+        if search:
+            where = """
+                WHERE original_filename LIKE ?
+                   OR district_place LIKE ?
+                   OR recipient_display_name LIKE ?
+                   OR taxpayer_names LIKE ?
+                   OR taxpayer_inns LIKE ?
+                   OR sender_smtp LIKE ?
+                   OR outgoing_numbers LIKE ?
+                   OR status LIKE ?
+            """
+            pattern = f"%{search}%"
+            search_parameters = (pattern,) * 8
+        total_row = self.db.fetch_one(
+            history_cte
+            + f"SELECT COUNT(*) AS count FROM letter_history {where}",
+            search_parameters,
+        ) or {"count": 0}
+        total = int(total_row.get("count") or 0)
+        page_count = max(1, (total + page_size - 1) // page_size)
+        selected_page = min(requested_page, page_count)
+        offset = (selected_page - 1) * page_size
+        items = self.db.fetch_all(
+            history_cte
+            + f"""
+                SELECT * FROM letter_history
+                {where}
+                ORDER BY COALESCE(received_at, uploaded_at) DESC,
+                         uploaded_at DESC,
+                         original_filename,
+                         COALESCE(source_first_page, 999999999),
+                         id
+                LIMIT ? OFFSET ?
+            """,
+            (*search_parameters, page_size, offset),
+        )
+        return {
+            "items": items,
+            "query": search,
+            "page": selected_page,
+            "page_count": page_count,
+            "page_size": page_size,
+            "total": total,
+        }
 
     def get_audit(self, limit: int = 200) -> list[dict[str, Any]]:
         rows = self.db.fetch_all(
@@ -5215,6 +8003,25 @@ class WorkflowService:
         return rows
 
     def dashboard_stats(self) -> dict[str, int]:
+        self.reconcile_case_match_reviews()
+        page_review_count = (
+            self.db.fetch_one(
+                """
+                SELECT COUNT(*) AS n FROM pages
+                WHERE status IN ('needs_review', 'technical_error')
+                """
+            )
+            or {"n": 0}
+        )["n"]
+        match_review_count = (
+            self.db.fetch_one(
+                """
+                SELECT COUNT(*) AS n FROM case_match_reviews
+                WHERE status = 'pending'
+                """
+            )
+            or {"n": 0}
+        )["n"]
         return {
             "uploads": (
                 self.db.fetch_one("SELECT COUNT(*) AS n FROM uploads") or {"n": 0}
@@ -5222,15 +8029,7 @@ class WorkflowService:
             "pages": (
                 self.db.fetch_one("SELECT COUNT(*) AS n FROM pages") or {"n": 0}
             )["n"],
-            "review": (
-                self.db.fetch_one(
-                    """
-                    SELECT COUNT(*) AS n FROM pages
-                    WHERE status IN ('needs_review', 'technical_error')
-                    """
-                )
-                or {"n": 0}
-            )["n"],
+            "review": int(page_review_count) + int(match_review_count),
             "ready_abs": (
                 self.db.fetch_one(
                     "SELECT COUNT(*) AS n FROM cases WHERE status = 'ready_for_abs'"

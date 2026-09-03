@@ -1,0 +1,296 @@
+<section class="work-section responses-workspace" data-testid="responses-workspace">
+  <nav class="response-state-tabs" aria-label="Состояние ответов"
+       data-tour-anchor="response-states">
+    <a href="/?tab=responses&amp;response_view=prepare"
+       {% if response_view == 'prepare' %}aria-current="page"{% endif %}>
+      К созданию <strong>{{ work_counts.ready_responses }}</strong>
+    </a>
+    <a href="/?tab=responses&amp;response_view=created"
+       {% if response_view == 'created' %}aria-current="page"{% endif %}>
+      Созданные <strong>{{ work_counts.created_responses }}</strong>
+    </a>
+    <a href="/?tab=responses&amp;response_view=manual"
+       {% if response_view == 'manual' %}aria-current="page"{% endif %}>
+      Ручной ответ <strong>{{ work_counts.manual_responses }}</strong>
+    </a>
+  </nav>
+
+  {% if response_view == 'prepare' %}
+    <div class="work-section-toolbar response-toolbar"
+         data-tour-anchor="prepare">
+      <div>
+        <h2>Ответы к созданию</h2>
+        <p>Готовые лица уже объединены по подразделению и адресату.</p>
+      </div>
+      <div class="work-toolbar-actions">
+        {% if overview.ready_abs %}
+          {% if abs_session_active %}
+            <form method="post" action="/today/abs">
+              <button class="button button-secondary" type="submit">
+                Проверить в АБС · {{ overview.ready_abs }}
+              </button>
+            </form>
+          {% else %}
+            <button class="button button-secondary" type="button"
+                    data-open-dialog="today-abs-dialog">
+              Проверить в АБС · {{ overview.ready_abs }}
+            </button>
+          {% endif %}
+        {% endif %}
+        {% if overview.not_found_groups|selectattr('can_generate')|list %}
+          <form method="post" action="/today/responses/create-all">
+            <button class="button button-primary" type="submit">
+              Создать все Word
+            </button>
+          </form>
+        {% endif %}
+      </div>
+    </div>
+
+    {% if overview.unresolved_pages or overview.unresolved_matches %}
+      <div class="inline-state inline-state-error">
+        Не включены в ответы: {{ overview.unresolved_pages + overview.unresolved_matches }}.
+        <a href="/?tab=review">Открыть проверку</a>
+      </div>
+    {% endif %}
+
+    <div class="response-list" data-testid="response-prepare-list">
+      {% for group in overview.not_found_groups %}
+        <article class="response-row {% if group.issues %}response-row-problem{% endif %}">
+          <div class="response-person">
+            <strong>{{ group.recipient_display_name }}</strong>
+            <span>УГНС {{ group.district_place }}</span>
+          </div>
+          <div class="response-metrics">
+            <span>Лиц: <strong>{{ group.taxpayer_count }}</strong></span>
+            <span>Обращений: <strong>{{ group.case_count }}</strong></span>
+          </div>
+          <div class="response-state">
+            {% if group.issues %}
+              <span class="status status-needs_review">Нужно уточнение</span>
+              <small>{{ group.issues|join(' ') }}</small>
+            {% else %}
+              <span class="status status-ready_for_response">Готово</span>
+            {% endif %}
+          </div>
+          <div class="response-row-actions">
+            <form method="post" action="/today/responses/{{ group.group_key }}">
+              <button class="button button-primary button-compact" type="submit"
+                      {% if not group.can_generate %}disabled{% endif %}>
+                Создать Word
+              </button>
+            </form>
+            <details class="action-menu">
+              <summary aria-label="Дополнительные действия">⋯</summary>
+              <div class="action-menu-panel">
+                <a href="/cases/{{ group.taxpayers[0].source_case_id }}?return_to=responses"
+                   data-testid="open-case-with-document">
+                  Открыть письмо и данные
+                </a>
+                {% if group.case_count > 1 %}
+                  <span class="action-menu-note">
+                    Остальные {{ group.case_count - 1 }} {{ case_word(group.case_count - 1) }} доступны в истории писем.
+                  </span>
+                {% endif %}
+              </div>
+            </details>
+          </div>
+        </article>
+      {% else %}
+        <div class="empty-state large">
+          <strong>Готовых данных пока нет</strong>
+          <span>После АБС и проверки ОДБ ответы появятся здесь.</span>
+        </div>
+      {% endfor %}
+    </div>
+
+  {% elif response_view == 'created' %}
+    <div class="work-section-toolbar response-toolbar"
+         data-tour-anchor="created">
+      <div>
+        <h2>Созданные ответы</h2>
+        <p>Номер, печать, сканирование и почта доступны прямо из строки письма.</p>
+      </div>
+    </div>
+
+    <div class="response-list" data-testid="created-response-list">
+      {% for group in overview.generated_groups %}
+        <article class="response-row created-response-row" id="group-{{ group.id }}">
+          <div class="response-person">
+            <strong>{{ group.recipient_display_name }}</strong>
+            <span>УГНС {{ group.district_place }}</span>
+            <small>Лиц: {{ group.taxpayer_count }}</small>
+          </div>
+          <div class="created-letter-list">
+            {% for letter in group.letters %}
+              <div class="created-letter-line" id="letter-{{ letter.id }}">
+                {% if group.letters|length > 1 %}
+                  <span class="letter-order">Письмо {{ letter.letter_order }}</span>
+                {% endif %}
+                <form class="inline-number-form" method="post"
+                      action="/response-letters/{{ letter.id }}/outgoing-number"
+                      data-inline-number-form data-letter-id="{{ letter.id }}">
+                  <input type="hidden" name="group_id" value="{{ group.id }}">
+                  <label>
+                    <span>Исх. №</span>
+                    <input name="outgoing_number" inputmode="numeric"
+                           value="{{ letter.outgoing_number or '' }}"
+                           placeholder="—" maxlength="9" pattern="[0-9]+"
+                           data-inline-number-input
+                           data-original-number="{{ letter.outgoing_number or '' }}"
+                           aria-label="Исходящий номер для {{ group.recipient_display_name }}{% if group.letters|length > 1 %}, письмо {{ letter.letter_order }}{% endif %}">
+                  </label>
+                  <button class="icon-button" type="submit"
+                          title="Сохранить номер" data-inline-number-submit>✓</button>
+                </form>
+
+                <div class="letter-progress">
+                  {% if letter.outlook_message and letter.outlook_message.status == 'sent' %}
+                    <span class="status status-completed">Отправлено</span>
+                  {% elif letter.outlook_message and letter.outlook_message.status == 'draft_created' %}
+                    <span class="status status-ready">Письмо подготовлено</span>
+                  {% elif letter.signed_scan and letter.signed_scan.status == 'confirmed' %}
+                    <span class="status status-ready">Скан подтверждён</span>
+                  {% elif letter.signed_scan %}
+                    <span class="status status-needs_review">Проверить скан</span>
+                  {% elif letter.scan_session %}
+                    <span class="status status-processing">Скан: {{ letter.scan_session.page_count }} {{ page_word(letter.scan_session.page_count) }}</span>
+                  {% else %}
+                    <span class="status status-response_created">Word создан</span>
+                  {% endif %}
+                </div>
+
+                <div class="letter-primary-action">
+                  {% if letter.scan_session %}
+                    <a class="button button-primary button-compact"
+                       href="/?tab=responses&amp;response_view=created&amp;focus_letter={{ letter.id }}#letter-workflow">
+                      Продолжить сканирование
+                    </a>
+                  {% elif letter.signed_scan and letter.signed_scan.status == 'needs_confirmation' %}
+                    <a class="button button-primary button-compact"
+                       href="/?tab=responses&amp;response_view=created&amp;focus_letter={{ letter.id }}#letter-workflow">
+                      Проверить скан
+                    </a>
+                  {% elif letter.signed_scan and letter.signed_scan.status == 'confirmed' %}
+                    {% if letter.outgoing_number and letter.gns_email %}
+                      <form method="post"
+                            action="/response-letters/{{ letter.id }}/outlook-draft">
+                        <input type="hidden" name="group_id" value="{{ group.id }}">
+                        <button class="button button-primary button-compact" type="submit">
+                          {% if letter.outlook_message and letter.outlook_message.status == 'draft_created' %}Открыть письмо{% else %}Отправить по почте{% endif %}
+                        </button>
+                      </form>
+                    {% elif not letter.outgoing_number %}
+                      <button class="button button-secondary button-compact" type="button" disabled>Укажите номер</button>
+                    {% else %}
+                      <button class="button button-secondary button-compact" type="button" disabled>Нет email УГНС</button>
+                    {% endif %}
+                  {% else %}
+                    <form method="post"
+                          action="/response-letters/{{ letter.id }}/scan-session/start">
+                      <input type="hidden" name="group_id" value="{{ group.id }}">
+                      <button class="button button-primary button-compact" type="submit">
+                        Сканировать
+                      </button>
+                    </form>
+                  {% endif %}
+                </div>
+
+                <details class="action-menu">
+                  <summary aria-label="Дополнительные действия">⋯</summary>
+                  <div class="action-menu-panel action-menu-panel-right">
+                    <form method="post" action="/response-groups/{{ group.id }}/open-for-print">
+                      <button type="submit">Открыть Word для печати</button>
+                    </form>
+                    <a href="/response-groups/{{ group.id }}">Скачать копию Word</a>
+                    <a href="/?tab=responses&amp;response_view=created&amp;focus_letter={{ letter.id }}#letter-workflow">
+                      Загрузить готовый скан
+                    </a>
+                  </div>
+                </details>
+              </div>
+            {% endfor %}
+          </div>
+        </article>
+      {% else %}
+        <div class="empty-state large">
+          <strong>Word-ответы ещё не создавались</strong>
+          <span>Создайте их во вкладке «К созданию».</span>
+        </div>
+      {% endfor %}
+    </div>
+
+    {% if active_letter and active_group %}
+      {% include "_response_letter_drawer.html" %}
+    {% endif %}
+
+  {% else %}
+    <div class="work-section-toolbar response-toolbar"
+         data-tour-anchor="manual">
+      <div>
+        <h2>Ручной ответ</h2>
+        <p>Здесь остаются лица, по которым подтверждено наличие счёта.</p>
+      </div>
+    </div>
+    <div class="response-list">
+      {% for group in overview.found_groups %}
+        <article class="response-row manual-response-row">
+          <div class="response-person">
+            <strong>{{ group.recipient_display_name }}</strong>
+            <span>УГНС {{ group.district_place }}</span>
+          </div>
+          <div class="response-metrics">
+            <span>Лиц: <strong>{{ group.taxpayer_count }}</strong></span>
+          </div>
+          <div class="response-state">
+            <span class="status status-needs_review">Ответ вручную</span>
+            <small>
+              {% for taxpayer in group.taxpayers %}
+                {{ taxpayer.name }}{% if not loop.last %}; {% endif %}
+              {% endfor %}
+            </small>
+          </div>
+          <div class="response-row-actions">
+            <a class="button button-primary button-compact"
+               href="/cases/{{ group.taxpayers[0].source_case_id }}?return_to=responses">Открыть</a>
+            <details class="action-menu">
+              <summary aria-label="Дополнительные действия">⋯</summary>
+              <div class="action-menu-panel action-menu-panel-right">
+                {% for taxpayer in group.taxpayers %}
+                  <a href="/cases/{{ taxpayer.source_case_id }}?return_to=responses">
+                    {{ taxpayer.name }} · {{ taxpayer.inn }}
+                  </a>
+                {% endfor %}
+              </div>
+            </details>
+          </div>
+        </article>
+      {% else %}
+        <div class="empty-state large">
+          <strong>Ручных ответов нет</strong>
+          <span>Лица с подтверждённым счётом появятся здесь.</span>
+        </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+</section>
+
+{% if response_view == 'prepare' and overview.ready_abs and not abs_session_active %}
+<dialog id="today-abs-dialog" class="modal">
+  <form method="post" action="/today/abs" autocomplete="off">
+    <div class="modal-heading">
+      <div>
+        <p class="eyebrow">{% if abs_is_fake %}ТЕСТОВАЯ АБС{% else %}АБС TOLUBAY{% endif %}</p>
+        <h2>Проверка АБС</h2>
+      </div>
+      <button type="button" class="modal-close" data-close-dialog>×</button>
+    </div>
+    <p class="warning-note">Логин и пароль используются только для этой проверки и не сохраняются.</p>
+    <label class="field"><span>Логин</span><input name="username" autocomplete="off" required></label>
+    <label class="field"><span>Пароль</span><input name="password" type="password" autocomplete="new-password" required></label>
+    <button class="button button-primary button-block" type="submit">
+      Проверить {{ overview.ready_abs }}
+    </button>
+  </form>
+</dialog>
+{% endif %}

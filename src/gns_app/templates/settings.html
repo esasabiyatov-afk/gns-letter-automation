@@ -1,270 +1,325 @@
 {% extends "base.html" %}
 {% block title %}Настройки · Автоматизатор писем{% endblock %}
+{% block body_class %}settings-page{% endblock %}
 {% block content %}
-<section class="panel settings-panel">
-  <p class="eyebrow">Настройки</p>
-  <h1>Ручная проверка</h1>
-  <p class="settings-intro">
-    Здесь можно включить дополнительные элементы формы. Основная обработка,
-    проверка QR и OCR от этих переключателей не меняются.
-  </p>
-  {% if message %}<div class="alert alert-success">{{ message }}</div>{% endif %}
-  {% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
+<header class="settings-header">
+  <div>
+    <h1>Настройки</h1>
+    <p>Обработка документов, Outlook и обслуживание приложения.</p>
+  </div>
+  <span class="settings-save-state" data-settings-save-state>
+    Все изменения сохранены
+  </span>
+</header>
 
-  <form method="post" action="/settings" class="settings-form">
-    <label class="setting-toggle">
-      <input type="checkbox" name="allow_multiple_taxpayers" value="true"
-             {% if ui_preferences.allow_multiple_taxpayers %}checked{% endif %}>
-      <span>
-        <strong>Разрешить добавление нескольких налогоплательщиков</strong>
-        <small>Показывает кнопку «Добавить» и удаление строк в ручной форме.</small>
-      </span>
-    </label>
+{% if message %}<div class="alert alert-success">{{ message }}</div>{% endif %}
+{% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
 
-    <label class="field setting-field">
-      <span>Порог периода для проверки ОДБ</span>
-      <input type="date" name="period_threshold" value="{{ threshold }}" required>
-      <small>Если начало периода раньше этой даты — после АБС нужна проверка ОДБ.</small>
-    </label>
+<nav class="settings-tabs" aria-label="Разделы настроек" role="tablist">
+  <button type="button" role="tab" aria-selected="true"
+          data-settings-tab="processing">Обработка</button>
+  <button type="button" role="tab" aria-selected="false"
+          data-settings-tab="outlook">Outlook</button>
+  <button type="button" role="tab" aria-selected="false"
+          data-settings-tab="service">Обслуживание</button>
+</nav>
 
-    <label class="field setting-field">
-      <span>Папка входящих писем PDF</span>
-      <input name="inbox_dir" value="{{ inbox_dir }}" required>
-      <small>Кнопка «Сканировать папку» будет брать PDF из этого пути.</small>
-    </label>
+<div class="settings-workspace">
+  <section class="settings-section" role="tabpanel"
+           data-settings-panel="processing">
+    <form method="post" action="/settings" class="settings-form"
+          data-settings-form>
+      <div class="settings-processing-grid">
+      <section class="settings-card">
+        <header>
+          <h2>Исполнитель</h2>
+          <p>Указывается в подтверждениях и готовых ответах.</p>
+        </header>
+        <div class="settings-capability">
+          <span class="status status-completed">Выбран</span>
+          <div>
+            <strong>{{ active_employee or 'Исполнитель не выбран' }}</strong>
+            <small>Смена и добавление имён выполняются на экране документов.</small>
+          </div>
+        </div>
+        <a class="button button-secondary settings-card-action"
+           href="/?employee=1#employee-entry">Изменить исполнителя</a>
+      </section>
 
-    <label class="field setting-field">
-      <span>Основной реестр для сверки названий</span>
-      <select name="registry_priority">
-        <option value="osoo" {% if registry_priority == 'osoo' %}selected{% endif %}>
-          ОсОО.KG (по умолчанию)
-        </option>
-        <option value="reestr_kg" {% if registry_priority == 'reestr_kg' %}selected{% endif %}>
-          reestr.kg
-        </option>
-      </select>
-      <small>
-        Сверка всегда идёт через выбранный реестр. Если он не отвечает
-        (сайт недоступен, изменилась разметка и т.п.), приложение
-        автоматически пробует второй реестр — без ручного переключения.
-      </small>
-    </label>
+      <section class="settings-card">
+        <header>
+          <h2>Документы и сканер</h2>
+          <p>Локальные источники входящих и подписанных ответов.</p>
+        </header>
+        <label class="field setting-field">
+            <span>Папка входящих PDF</span>
+            <input name="inbox_dir" value="{{ inbox_dir }}" required>
+            <small>Из этой папки команда «Проверить папку» забирает новые PDF.</small>
+        </label>
+        <div class="settings-capability settings-capability-compact">
+          <span class="status status-completed">WIA</span>
+          <div>
+            <strong>Несколько листов в один PDF</strong>
+            <small>Порядок и состав проверяются до создания файла.</small>
+          </div>
+        </div>
+      </section>
 
-    <label class="field setting-field">
-      <span>Одновременно обрабатывать страниц</span>
-      <select name="processing_workers">
-        <option value="2" {% if processing_workers == 2 %}selected{% endif %}>
-          2 страницы — быстрее
-        </option>
-        <option value="1" {% if processing_workers == 1 %}selected{% endif %}>
-          1 страница — для слабого компьютера
-        </option>
-      </select>
-      <small>
-        Если компьютер заметно тормозит или не хватает памяти, выберите одну
-        страницу. После сохранения новые загрузки используют этот режим.
-      </small>
-    </label>
+      <section class="settings-card">
+        <header>
+          <h2>OCR</h2>
+          <p>Локальное распознавание без передачи документов в облако.</p>
+        </header>
+        <label class="field setting-field">
+          <span>Параллельная обработка</span>
+          <select name="processing_workers">
+            <option value="2"
+                    {% if processing_workers == 2 %}selected{% endif %}>
+              2 страницы
+            </option>
+            <option value="1"
+                    {% if processing_workers == 1 %}selected{% endif %}>
+              1 страница
+            </option>
+          </select>
+          <small>Одна страница — режим для слабого компьютера.</small>
+        </label>
+        <div class="settings-capability settings-capability-compact">
+          <span class="status status-completed">Локально</span>
+          <div>
+            <strong>Русский + кыргызский</strong>
+            <small>Сомнения всегда направляются сотруднику.</small>
+          </div>
+        </div>
+      </section>
 
-    <label class="setting-toggle">
-      <input type="checkbox" name="require_review_checkbox" value="true"
-             {% if ui_preferences.require_review_checkbox %}checked{% endif %}>
-      <span>
-        <strong>Требовать отдельную галочку сверки</strong>
-        <small>Если выключено, нажатие «Подтвердить и продолжить» считается подтверждением сотрудника.</small>
-      </span>
-    </label>
+      <section class="settings-card settings-card-double">
+        <header>
+          <h2>АБС и реестры</h2>
+          <p>Маршрут проверок; логин и пароль АБС здесь не сохраняются.</p>
+        </header>
+        <div class="settings-field-grid settings-field-grid-compact">
+          <label class="field setting-field">
+            <span>Порог для проверки ОДБ</span>
+            <input type="date" name="period_threshold"
+                   value="{{ threshold }}" required>
+            <small>Более ранний период направляется на проверку ОДБ.</small>
+          </label>
 
-    <button class="button button-primary" type="submit">Сохранить настройки</button>
-  </form>
+          <label class="field setting-field">
+            <span>Основной реестр</span>
+            <select name="registry_priority">
+              <option value="osoo"
+                      {% if registry_priority == 'osoo' %}selected{% endif %}>
+                ОсОО.KG
+              </option>
+              <option value="reestr_kg"
+                      {% if registry_priority == 'reestr_kg' %}selected{% endif %}>
+                reestr.kg
+              </option>
+            </select>
+            <small>При технической ошибке используется второй реестр.</small>
+          </label>
+        </div>
+      </section>
 
-  <section class="settings-reset outlook-diagnostic">
-    <p class="eyebrow">OUTLOOK 2013 · АВТОМАТИЧЕСКАЯ ПРОВЕРКА</p>
-    <h2>Подключение к почте</h2>
-    <p>
-      Приложение подключается к локальному Outlook, получает почту и сохраняет
-      новые PDF только от разрешённых отправителей. Уже учтённые письма
-      повторно не скачиваются.
-    </p>
-    {% if outlook_test_mode %}
-      <div class="outlook-status outlook-status-ready">
-        <strong>Тестовый адрес: {{ outlook_test_email }}</strong>
-        <small>
-          Другие отправители игнорируются. Программная отправка на любые
-          другие адреса заблокирована.
-        </small>
+      <section class="settings-card">
+        <header>
+          <h2>Интерфейс</h2>
+          <p>Только элементы формы сотрудника; QR и OCR не меняются.</p>
+        </header>
+        <div class="settings-toggle-list">
+          <label class="setting-toggle">
+            <input type="checkbox" name="allow_multiple_taxpayers" value="true"
+                   {% if ui_preferences.allow_multiple_taxpayers %}checked{% endif %}>
+            <span>
+              <strong>Несколько налогоплательщиков в одном письме</strong>
+              <small>Показывает добавление и удаление строк.</small>
+            </span>
+          </label>
+          <label class="setting-toggle">
+            <input type="checkbox" name="require_review_checkbox" value="true"
+                   {% if ui_preferences.require_review_checkbox %}checked{% endif %}>
+            <span>
+              <strong>Отдельная галочка сверки</strong>
+              <small>Без неё кнопка подтверждения сама фиксирует сверку.</small>
+            </span>
+          </label>
+        </div>
+      </section>
       </div>
-    {% endif %}
 
-    <div class="outlook-status outlook-status-{{ outlook_status.state }}">
-      <strong>{{ outlook_status.message }}</strong>
-      {% if outlook_status.checked_at %}
-        <small>Последняя проверка: {{ outlook_status.checked_at }}</small>
-      {% endif %}
-    </div>
+      <div class="settings-submit-bar">
+        <button class="button button-primary" type="submit">
+          Сохранить обработку
+        </button>
+      </div>
+    </form>
+  </section>
 
-    {% if outlook_status.probe %}
-      <dl class="detail-list outlook-details">
-        <div><dt>Версия Outlook</dt><dd>{{ outlook_status.probe.outlook_version or 'не определена' }}</dd></div>
-        <div><dt>Профиль</dt><dd>{{ outlook_status.probe.profile_name or 'профиль по умолчанию' }}</dd></div>
-        <div><dt>Пользователь</dt><dd>{{ outlook_status.probe.current_user or 'не определён' }}</dd></div>
-        <div><dt>Хранилище</dt><dd>{{ outlook_status.probe.default_store or 'не определено' }}</dd></div>
-        <div><dt>Папка</dt><dd>{{ outlook_status.probe.inbox_path or outlook_status.probe.inbox_name }}</dd></div>
-        <div><dt>Писем локально</dt><dd>{{ outlook_status.probe.inbox_item_count }}</dd></div>
-        <div><dt>Режим</dt><dd>{% if outlook_status.probe.offline %}автономный{% else %}в сети{% endif %}</dd></div>
-      </dl>
-      {% if outlook_status.probe.accounts %}
-        <div class="outlook-accounts">
-          <strong>Учётные записи профиля</strong>
-          <ul>
-            {% for account in outlook_status.probe.accounts %}
-              <li>
-                {{ account.display_name or account.smtp_address or 'Без названия' }}
-                · {{ account.account_type }}
-                {% if account.smtp_address %}· {{ account.smtp_address }}{% endif %}
-              </li>
-            {% endfor %}
-          </ul>
+  <section class="settings-section" role="tabpanel"
+           data-settings-panel="outlook" hidden>
+    <section class="settings-card settings-status-card">
+      <header>
+        <h2>Подключение Outlook</h2>
+        <p>Локальный Outlook получает разрешённые письма и создаёт черновики.</p>
+      </header>
+      <div class="outlook-status outlook-status-{{ outlook_status.state }}">
+        <strong>{{ outlook_status.message }}</strong>
+        {% if outlook_status.checked_at %}
+          <small>Проверено: {{ outlook_status.checked_at }}</small>
+        {% endif %}
+      </div>
+      {% if outlook_test_mode %}
+        <div class="outlook-status outlook-status-ready">
+          <strong>Тестовый адрес: {{ outlook_test_email }}</strong>
+          <small>Получение и отправка на другие внешние адреса заблокированы.</small>
         </div>
       {% endif %}
-    {% endif %}
+      <div class="settings-action-row">
+        <form method="post" action="/settings/outlook/check">
+          <button class="button button-secondary" type="submit">
+            Проверить подключение
+          </button>
+        </form>
+        <form method="post" action="/settings/outlook/send-receive">
+          <button class="button button-secondary" type="submit">
+            Получить почту
+          </button>
+        </form>
+        <form method="post" action="/settings/outlook/import">
+          <button class="button button-primary" type="submit">
+            Загрузить новые PDF
+          </button>
+        </form>
+      </div>
+    </section>
 
     <form method="post" action="/settings/outlook/config"
-          class="outlook-config-form">
-      <label class="field setting-field">
-        <span>Почтовый ящик для получения</span>
-        <input name="outlook_mailbox"
-               value="{{ outlook_mailbox }}"
-               placeholder="mailbox@example.com">
-        <small>
-          Укажите адрес или точное имя хранилища из Outlook. Если поле пустое,
-          используется стандартная папка «Входящие».
-        </small>
-      </label>
-      <label class="field setting-field">
-        <span>Дополнительные разрешённые отправители</span>
-        <input name="outlook_allowed_senders"
-               value="{{ outlook_allowed_senders }}"
-               {% if outlook_test_mode %}readonly{% endif %}
-               placeholder="sender@gmail.com">
-        <small>
-          Несколько адресов указываются через запятую. Домены sti.gov.kg и
-          salyk.kg разрешены системно. Остальные отправители пропускаются.
-        </small>
-      </label>
-      <label class="field setting-field">
-        <span>Проверять письма начиная с даты</span>
-        <input type="date" name="outlook_import_since"
-               value="{{ outlook_import_since }}" required>
-        <small>
-          Дата остаётся постоянной, поэтому после перерыва приложение повторно
-          сверяет весь период и пропускает письма из своего реестра.
-        </small>
-      </label>
-      <label class="field setting-field">
-        <span>Интервал автоматической проверки, минут</span>
-        <input type="number" name="outlook_auto_interval"
-               value="{{ outlook_auto_interval }}" min="1" max="1440" required>
-        <small>
-          Outlook получит команду синхронизации, затем приложение проверит
-          локальную папку. При ошибке следующая попытка выполнится автоматически.
-        </small>
-      </label>
-      <label class="field setting-field">
-        <span>Тема исходящего письма по умолчанию</span>
-        <input name="outlook_subject_template"
-               value="{{ outlook_subject_template }}"
-               maxlength="200" required>
-        <small>
-          Подстановки: {outgoing_number} — исходящий номер,
-          {office_name} — подразделение, {recipient_name} — адресат,
-          {date} — дата ответа.
-        </small>
-      </label>
-      <label class="checkbox-row">
-        <input type="checkbox" name="outlook_auto_enabled" value="true"
-               {% if outlook_auto_enabled %}checked{% endif %}>
-        <span>Автоматически получать и загружать новые PDF</span>
-      </label>
-      <button class="button button-secondary" type="submit">
-        Сохранить правила Outlook
-      </button>
+          class="settings-form" data-settings-form>
+      <section class="settings-card">
+        <header>
+          <h2>Получение и отправка</h2>
+          <p>Правила фильтрации, расписание и тема исходящего письма.</p>
+        </header>
+        <div class="settings-field-grid">
+          <label class="field setting-field">
+            <span>Почтовый ящик</span>
+            <input name="outlook_mailbox" value="{{ outlook_mailbox }}"
+                   placeholder="mailbox@example.com">
+            <small>Пустое поле означает стандартную папку «Входящие».</small>
+          </label>
+          <label class="field setting-field">
+            <span>Разрешённые отправители</span>
+            <input name="outlook_allowed_senders"
+                   value="{{ outlook_allowed_senders }}"
+                   {% if outlook_test_mode %}readonly{% endif %}
+                   placeholder="sender@gmail.com">
+            <small>Несколько адресов — через запятую.</small>
+          </label>
+          <label class="field setting-field">
+            <span>Проверять начиная с</span>
+            <input type="date" name="outlook_import_since"
+                   value="{{ outlook_import_since }}" required>
+            <small>Известные письма повторно не загружаются.</small>
+          </label>
+          <label class="field setting-field">
+            <span>Интервал, минут</span>
+            <input type="number" name="outlook_auto_interval"
+                   value="{{ outlook_auto_interval }}" min="1" max="1440" required>
+            <small>Следующая попытка выполняется после технической ошибки.</small>
+          </label>
+          <label class="field setting-field setting-field-wide">
+            <span>Тема исходящего письма</span>
+            <input name="outlook_subject_template"
+                   value="{{ outlook_subject_template }}"
+                   maxlength="200" required>
+            <small>
+              Доступны: {outgoing_number}, {office_name}, {recipient_name}, {date}.
+            </small>
+          </label>
+        </div>
+        <label class="setting-toggle setting-toggle-inline">
+          <input type="checkbox" name="outlook_auto_enabled" value="true"
+                 {% if outlook_auto_enabled %}checked{% endif %}>
+          <span>
+            <strong>Автоматически загружать новые PDF</strong>
+            <small>{{ outlook_auto_status.message }}</small>
+          </span>
+        </label>
+      </section>
+      <div class="settings-submit-bar">
+        <button class="button button-primary" type="submit">
+          Сохранить Outlook
+        </button>
+      </div>
     </form>
 
-    <div class="outlook-status outlook-status-{{ outlook_auto_status.state }}">
-      <strong>{{ outlook_auto_status.message }}</strong>
-      {% if outlook_auto_status.checked_at %}
-        <small>Последний автоматический запуск: {{ outlook_auto_status.checked_at }}</small>
+    <details class="settings-card settings-details">
+      <summary>Технические сведения Outlook</summary>
+      {% if outlook_status.probe %}
+        <dl class="detail-list outlook-details">
+          <div><dt>Версия</dt><dd>{{ outlook_status.probe.outlook_version or 'не определена' }}</dd></div>
+          <div><dt>Профиль</dt><dd>{{ outlook_status.probe.profile_name or 'по умолчанию' }}</dd></div>
+          <div><dt>Пользователь</dt><dd>{{ outlook_status.probe.current_user or 'не определён' }}</dd></div>
+          <div><dt>Хранилище</dt><dd>{{ outlook_status.probe.default_store or 'не определено' }}</dd></div>
+          <div><dt>Папка</dt><dd>{{ outlook_status.probe.inbox_path or outlook_status.probe.inbox_name }}</dd></div>
+          <div><dt>Режим</dt><dd>{% if outlook_status.probe.offline %}автономный{% else %}в сети{% endif %}</dd></div>
+        </dl>
+      {% else %}
+        <p>Сначала выполните проверку подключения.</p>
       {% endif %}
-    </div>
-
-    <dl class="detail-list outlook-import-stats">
-      <div><dt>Учтено писем</dt><dd>{{ outlook_import_stats.messages }}</dd></div>
-      <div><dt>С PDF</dt><dd>{{ outlook_import_stats.completed }}</dd></div>
-      <div><dt>Без PDF</dt><dd>{{ outlook_import_stats.no_pdf }}</dd></div>
-      <div><dt>С ошибкой</dt><dd>{{ outlook_import_stats.errors }}</dd></div>
-    </dl>
-
-    <div class="settings-reset-actions">
-      <form method="post" action="/settings/outlook/check">
-        <button class="button button-secondary" type="submit">
-          Проверить подключение
-        </button>
-      </form>
-      <form method="post" action="/settings/outlook/send-receive">
-        <button class="button button-primary" type="submit">
-          Получить почту сейчас
-        </button>
-      </form>
-      <form method="post" action="/settings/outlook/import">
-        <button class="button button-primary" type="submit">
-          Получить и загрузить новые PDF
-        </button>
-      </form>
-    </div>
-    <p class="outlook-note">
-      Команда получения почты выполняется Outlook в фоне. Успешный запуск
-      команды не означает, что все письма уже поступили. Кнопка загрузки
-      сначала запускает получение, затем проверяет уже доступные локальные
-      письма. Если письмо только что отправлено, повторите проверку через минуту.
-    </p>
+      <dl class="detail-list outlook-import-stats">
+        <div><dt>Учтено писем</dt><dd>{{ outlook_import_stats.messages }}</dd></div>
+        <div><dt>С PDF</dt><dd>{{ outlook_import_stats.completed }}</dd></div>
+        <div><dt>Без PDF</dt><dd>{{ outlook_import_stats.no_pdf }}</dd></div>
+        <div><dt>С ошибкой</dt><dd>{{ outlook_import_stats.errors }}</dd></div>
+      </dl>
+    </details>
   </section>
 
-  <section class="settings-reset">
-    <p class="eyebrow">ДИАГНОСТИКА ОФИСНОГО ТЕСТА</p>
-    <h2>Журнал для разбора ошибок</h2>
-    <p>
-      После проверки Outlook, АБС и сканера скачайте архив и отправьте его
-      разработчику. В архив не входят документы, база, тексты писем, ИНН,
-      логины, пароли, cookies и токены.
-    </p>
-    <div class="settings-reset-actions">
-      <a class="button button-primary" href="/settings/diagnostics/download">
-        Скачать диагностический архив
-      </a>
-    </div>
-  </section>
+  <section class="settings-section" role="tabpanel"
+           data-settings-panel="service" hidden>
+    <section class="settings-card">
+      <header>
+        <h2>Диагностика</h2>
+        <p>
+          Архив содержит технические статусы без документов, ИНН, паролей,
+          cookies и токенов.
+        </p>
+      </header>
+      <div class="settings-action-row">
+        <a class="button button-primary" href="/settings/diagnostics/download">
+          Скачать диагностический архив
+        </a>
+        <a class="button button-secondary" href="/journal">
+          Технический журнал
+        </a>
+      </div>
+    </section>
 
-  <section class="settings-reset">
-    <h2>Сброс обработки</h2>
-    <p>
-      Очищаются загруженные копии, результаты OCR/QR, проверки и готовые ответы.
-      Настройки, исполнители, справочник ГНС и исходные PDF в папке входящих
-      сохраняются.
-    </p>
-    <form method="post" action="/settings/reset-processing"
-          class="settings-reset-actions">
-      <button class="button button-secondary" type="submit"
-              name="action" value="clear"
-              onclick="return confirm('Очистить все данные обработки? Исходные PDF в папке входящих останутся.');">
-        Очистить обработку
-      </button>
-      <button class="button button-danger" type="submit"
-              name="action" value="rescan"
-              onclick="return confirm('Очистить данные и заново обработать все PDF из выбранной папки?');">
-        Сбросить и проверить папку заново
-      </button>
-    </form>
+    <section class="settings-card settings-danger-card">
+      <header>
+        <h2>Сброс обработки</h2>
+        <p>
+          Удаляются рабочие копии, результаты распознавания, проверки и ответы.
+          Настройки, справочники и исходные PDF в папке входящих сохраняются.
+        </p>
+      </header>
+      <form method="post" action="/settings/reset-processing"
+            class="settings-action-row">
+        <button class="button button-secondary" type="submit"
+                name="action" value="clear"
+                onclick="return confirm('Очистить все данные обработки? Исходные PDF в папке входящих останутся.');">
+          Очистить обработку
+        </button>
+        <button class="button button-danger" type="submit"
+                name="action" value="rescan"
+                onclick="return confirm('Очистить данные и заново обработать все PDF из выбранной папки?');">
+          Очистить и обработать заново
+        </button>
+      </form>
+    </section>
   </section>
-</section>
+</div>
 {% endblock %}

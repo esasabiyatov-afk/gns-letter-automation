@@ -8,33 +8,29 @@
         href="{{ url_for('static', path='/styles.css') }}?v={{ asset_version }}">
   {% block head %}{% endblock %}
 </head>
-<body>
+<body class="{% block body_class %}{% endblock %}">
   <header class="app-header">
     <a class="brand" href="/">
       <span class="brand-mark">ГНС</span>
-      <span>
-        <strong>Автоматизатор писем</strong>
-        <small>Локальное приложение</small>
-      </span>
+      <strong>Автоматизатор писем</strong>
     </a>
-    <nav class="main-nav">
-      <a href="/">Главная</a>
-      <a href="/today">Готовые ответы</a>
-      <a href="/review">Ручная проверка</a>
-      <details class="nav-more">
-        <summary>Ещё</summary>
-        <div class="nav-more-menu">
-          <a href="/registry">Сверка ОсОО.KG</a>
-          <a href="/cases">Все обращения</a>
-          <a href="/journal">Журнал</a>
-          <a href="/settings">Настройки</a>
-        </div>
-      </details>
+    <nav class="main-nav" aria-label="Основные разделы">
+      <a href="/?tab=incoming"
+         {% if request.url.path == '/' or request.url.path.startswith('/today') or request.url.path.startswith('/review') or request.url.path.startswith('/uploads') or request.url.path.startswith('/response-') or request.url.path.startswith('/signed-') or (request.url.path.startswith('/cases') and request.query_params.get('return_to') == 'responses') %}aria-current="page"{% endif %}>Работа</a>
+      <a href="/history"
+         {% if request.url.path.startswith('/history') or (request.url.path.startswith('/cases') and request.query_params.get('return_to') != 'responses') %}aria-current="page"{% endif %}>История писем</a>
+      <a href="/settings"
+         {% if request.url.path.startswith('/settings') or request.url.path.startswith('/journal') or request.url.path.startswith('/registry') %}aria-current="page"{% endif %}>Настройки</a>
     </nav>
-    <a class="active-employee-chip" href="/#employee-entry">
-      <small>Исполнитель</small>
-      <strong>{{ active_employee or 'не выбран' }}</strong>
-    </a>
+    <div class="header-actions">
+      <button class="tour-launch" type="button" data-tour-start
+              aria-label="Экскурс по приложению"
+              title="Экскурс по приложению">?</button>
+      <a class="active-employee-chip" href="/?tab=incoming&amp;employee=1#employee-entry">
+        <small>Исполнитель</small>
+        <strong>{{ active_employee or 'не выбран' }}</strong>
+      </a>
+    </div>
   </header>
 
   <main class="page-shell">
@@ -57,19 +53,29 @@
         {{ outlook_test_email }}, отправка разрешена только на этот же адрес.
       </div>
     {% endif %}
-    {% if request.query_params.get('error') %}
-      <div class="alert alert-error">{{ request.query_params.get('error') }}</div>
-    {% endif %}
-    {% if request.query_params.get('message') %}
-      <div class="alert alert-success">{{ request.query_params.get('message') }}</div>
-    {% endif %}
     {% block content %}{% endblock %}
   </main>
-
-  <footer class="app-footer">
-    <span>Все документы обрабатываются локально.</span>
-    <span>Порог периода: {{ threshold }}</span>
-  </footer>
+  <aside class="tour-card" data-tour-card role="dialog"
+         aria-labelledby="tour-title" aria-describedby="tour-text"
+         aria-live="polite" aria-modal="false" hidden>
+    <div class="tour-card-topline">
+      <span data-tour-progress>1 из 7</span>
+      <button type="button" data-tour-close aria-label="Закрыть экскурс">×</button>
+    </div>
+    <p class="eyebrow">КРАТКИЙ ЭКСКУРС</p>
+    <h2 id="tour-title" data-tour-title></h2>
+    <p id="tour-text" data-tour-text></p>
+    <div class="tour-card-actions">
+      <button class="button button-quiet button-compact" type="button"
+              data-tour-skip>Пропустить</button>
+      <div>
+        <button class="button button-secondary button-compact" type="button"
+                data-tour-back>Назад</button>
+        <button class="button button-primary button-compact" type="button"
+                data-tour-next>Далее</button>
+      </div>
+    </div>
+  </aside>
   <script src="{{ url_for('static', path='/app.js') }}?v={{ asset_version }}"></script>
   {% block scripts %}{% endblock %}
 </body>

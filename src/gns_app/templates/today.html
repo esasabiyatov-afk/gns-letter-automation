@@ -1,84 +1,79 @@
 {% extends "base.html" %}
 {% block title %}Готовые ответы · Автоматизатор писем{% endblock %}
+{% block body_class %}workspace-page{% endblock %}
 {% block content %}
-<div class="page-heading">
+<div class="page-heading today-page-heading">
   <div>
     <a class="back-link" href="/">← Главная</a>
-    <p class="eyebrow">ВСЕ ПОДТВЕРЖДЁННЫЕ ПИСЬМА</p>
     <h1>Готовые ответы</h1>
-    <p>
-      Дата загрузки не ограничивает обработку. Одним запросом проверьте все готовые обращения
-      в АБС; старые периоды после этого будут направлены на проверку ОДБ.
-    </p>
+    <p>Проверка АБС, подготовка Word и ручные ответы.</p>
+  </div>
+  <div class="today-status-chips" aria-label="Текущие статусы">
+    <span>{{ overview.ready_response }} обращений готовы к ответу</span>
+    {% if overview.ready_abs %}<span>{{ overview.ready_abs }} ждут АБС</span>{% endif %}
+    {% if overview.odb_pending %}<span class="is-warning">{{ overview.odb_pending }} ждут ОДБ</span>{% endif %}
+    {% if overview.unresolved_pages %}<span class="is-problem">{{ overview.unresolved_pages }} проблемных страниц</span>{% endif %}
   </div>
 </div>
 
 {% if message %}<div class="alert alert-success">{{ message }}</div>{% endif %}
 {% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
 
-<section class="today-summary">
-  <article>
-    <strong>{{ overview.ready_qr }}</strong>
-    <span>QR-писем ждут АБС</span>
-  </article>
-  <article>
-    <strong>{{ overview.ready_abs }}</strong>
-    <span>всего готовы к АБС</span>
-  </article>
-  <article>
-    <strong>{{ overview.ready_response }}</strong>
-    <span>обращений готовы к ответу</span>
-  </article>
-  <article class="{% if overview.odb_pending %}summary-warning{% endif %}">
-    <strong>{{ overview.odb_pending }}</strong>
-    <span>ожидают ручную ОДБ</span>
-  </article>
-  <article class="{% if overview.unresolved_pages %}summary-problem{% endif %}">
-    <strong>{{ overview.unresolved_pages }}</strong>
-    <span>проблемных страниц</span>
-  </article>
-</section>
+<nav class="workflow-tabs" role="tablist" aria-label="Разделы готовых ответов">
+  <button type="button" class="active" role="tab" aria-selected="true"
+          data-workflow-tab="prepare">
+    К созданию
+    <span>{{ overview.not_found_groups|length }}</span>
+  </button>
+  <button type="button" role="tab" aria-selected="false"
+          data-workflow-tab="created">
+    Созданные
+    <span>{{ overview.generated_groups|length }}</span>
+  </button>
+  <button type="button" role="tab" aria-selected="false"
+          data-workflow-tab="manual">
+    Ручной ответ
+    <span>{{ overview.found_groups|length }}</span>
+  </button>
+</nav>
 
+<div class="workflow-panel" role="tabpanel" data-workflow-panel="prepare">
+{% if overview.ready_abs %}
 <section class="action-panel today-action">
   <div>
     <p class="eyebrow">ОДНО ДЕЙСТВИЕ</p>
-    {% if overview.ready_abs %}
-      <h2>Проверить все готовые обращения в АБС</h2>
-      <p>
-        {% if abs_session_active %}
-          Сеанс АБС активен: повторный логин не требуется.
-        {% elif abs_session_supported %}
-          Введите логин и пароль один раз. Они живут только в памяти до ошибки АБС
-          или перезапуска приложения и не записываются в журнал.
-        {% else %}
-          Введите логин и пароль для пакетной проверки. Они используются только
-          в этой операции и сразу очищаются.
-        {% endif %}
-      </p>
-    {% else %}
-      <h2>Все готовые обращения уже проверены</h2>
-      <p>Новые QR-письма появятся здесь автоматически после загрузки.</p>
-    {% endif %}
+    <h2>Проверить все готовые обращения в АБС</h2>
+    <p>
+      {% if abs_session_active %}
+        Сеанс АБС активен: повторный логин не требуется.
+      {% elif abs_session_supported %}
+        Введите логин и пароль один раз. Они живут только в памяти до ошибки АБС
+        или перезапуска приложения и не записываются в журнал.
+      {% else %}
+        Введите логин и пароль для пакетной проверки. Они используются только
+        в этой операции и сразу очищаются.
+      {% endif %}
+    </p>
   </div>
-  {% if overview.ready_abs %}
-    {% if abs_session_active %}
-      <form method="post" action="/today/abs">
-        <button class="button button-primary" type="submit">
-          Проверить {{ overview.ready_abs }} в АБС
-        </button>
-      </form>
-    {% else %}
-      <button class="button button-primary" type="button"
-              data-open-dialog="today-abs-dialog">
-        Войти и проверить {{ overview.ready_abs }} в АБС
+  {% if abs_session_active %}
+    <form method="post" action="/today/abs">
+      <button class="button button-primary" type="submit">
+        Проверить {{ overview.ready_abs }} в АБС
       </button>
-    {% endif %}
+    </form>
+  {% else %}
+    <button class="button button-primary" type="button"
+            data-open-dialog="today-abs-dialog">
+      Войти и проверить {{ overview.ready_abs }} в АБС
+    </button>
   {% endif %}
 </section>
+{% endif %}
 
-{% if overview.unresolved_pages %}
+{% if overview.unresolved_pages or overview.unresolved_matches %}
 <div class="alert alert-error today-review-alert">
-  {{ overview.unresolved_pages }} проблемных страниц не включены в ответы.
+  {{ overview.unresolved_pages + overview.unresolved_matches }} элементов
+  требуют подтверждения и не включены в ответы.
   <a class="text-link" href="/review">Открыть ручную проверку</a>
 </div>
 {% endif %}
@@ -165,71 +160,46 @@
         <div class="response-group-heading">
           <div>
             <h3>{{ group.recipient_display_name }}</h3>
-            <p>УГНС {{ group.district_place }}</p>
+            <p title="УГНС {{ group.district_place }}">УГНС {{ group.district_place }}</p>
           </div>
-          <span>{{ group.taxpayer_count }} {{ taxpayer_word(group.taxpayer_count) }}</span>
         </div>
-        <p class="group-position">
-          {{ group.recipient_position }} ·
-          {{ group.case_count }} {{ case_word(group.case_count) }}
+        <p class="group-counts">
+          <strong>{{ group.taxpayer_count }} {{ taxpayer_word(group.taxpayer_count) }}</strong>
+          <span>·</span>
+          <span>{{ group.case_count }} {{ case_word(group.case_count) }}</span>
         </p>
-        <ol class="group-taxpayers compact-taxpayers">
-        {% for taxpayer in group.taxpayers[:2] %}
-          <li>
-            <a href="/cases/{{ taxpayer.source_case_id }}">
-              {{ taxpayer.name }}
-            </a>
-            <strong>ИНН {{ taxpayer.inn }}</strong>
-            {% if taxpayer.source_page_id %}
-              <a class="letter-pdf-link"
-                 href="/pages/{{ taxpayer.source_page_id }}/pdf"
-                 target="_blank">Открыть письмо</a>
-            {% endif %}
-          </li>
-        {% endfor %}
-        </ol>
-        {% if group.taxpayer_count > 2 %}
-          <details class="group-more">
-            <summary>
-              Показать ещё {{ group.taxpayer_count - 2 }}
-            </summary>
-            <ol class="group-taxpayers" start="3">
-            {% for taxpayer in group.taxpayers[2:] %}
-              <li>
-                <a href="/cases/{{ taxpayer.source_case_id }}">
-                  {{ taxpayer.name }}
-                </a>
-                <strong>ИНН {{ taxpayer.inn }}</strong>
-                {% if taxpayer.source_page_id %}
-                  <a class="letter-pdf-link"
-                     href="/pages/{{ taxpayer.source_page_id }}/pdf"
-                     target="_blank">Открыть письмо</a>
-                {% endif %}
-              </li>
-            {% endfor %}
+        {% if group.issues %}
+          <div class="group-issues" role="alert">
+            {% for issue in group.issues %}<p>{{ issue }}</p>{% endfor %}
+          </div>
+        {% endif %}
+        <div class="group-card-actions">
+          <details class="group-more group-members">
+            <summary>Список лиц</summary>
+            <p class="group-expanded-context">{{ group.recipient_position }}</p>
+            <ol class="group-taxpayers">
+              {% for taxpayer in group.taxpayers %}
+                <li>
+                  <a href="/cases/{{ taxpayer.source_case_id }}">
+                    {{ taxpayer.name }}
+                  </a>
+                  <strong>ИНН {{ taxpayer.inn }}</strong>
+                  {% if taxpayer.source_page_id %}
+                    <a class="letter-pdf-link"
+                       href="/pages/{{ taxpayer.source_page_id }}/pdf"
+                       target="_blank">Открыть письмо</a>
+                  {% endif %}
+                </li>
+              {% endfor %}
             </ol>
           </details>
-        {% endif %}
-        {% if group.issues %}
-          <div class="group-issues">
-          {% for issue in group.issues %}<p>{{ issue }}</p>{% endfor %}
-          </div>
-        {% endif %}
-        <form method="post" action="/today/responses/{{ group.group_key }}">
-          {% if group.taxpayer_count > 1 %}
-            <label class="field response-split-field">
-              <span>Лиц на одной странице</span>
-              <input type="number" name="taxpayers_per_page" min="1"
-                     max="{{ group.taxpayer_count }}"
-                     value="{{ group.taxpayer_count }}">
-              <small>Меньшее число создаст в том же Word несколько отдельных писем с новой шапкой.</small>
-            </label>
-          {% endif %}
-          <button class="button button-primary" type="submit"
-                  {% if not group.can_generate %}disabled{% endif %}>
-            Создать общий Word
-          </button>
-        </form>
+          <form method="post" action="/today/responses/{{ group.group_key }}">
+            <button class="button button-primary" type="submit"
+                    {% if not group.can_generate %}disabled{% endif %}>
+              Создать Word
+            </button>
+          </form>
+        </div>
       </article>
     {% endfor %}
     </div>
@@ -240,6 +210,11 @@
   {% endif %}
 </section>
 
+</div>
+
+<div class="workflow-panel" role="tabpanel" data-workflow-panel="created" hidden>
+
+{% if overview.unnumbered_letters or outgoing_preview %}
 <section class="panel today-groups outgoing-number-panel">
   <div class="panel-heading">
     <div>
@@ -305,6 +280,11 @@
     </div>
   {% endif %}
 </section>
+{% endif %}
+
+</div>
+
+<div class="workflow-panel" role="tabpanel" data-workflow-panel="manual" hidden>
 
 <section class="panel today-groups found-groups">
   <div class="panel-heading">
@@ -324,10 +304,14 @@
         <div class="response-group-heading">
           <div>
             <h3>{{ group.recipient_display_name }}</h3>
-            <p>УГНС {{ group.district_place }}</p>
+            <p title="УГНС {{ group.district_place }}">УГНС {{ group.district_place }}</p>
           </div>
-          <span>{{ group.taxpayer_count }} {{ taxpayer_word(group.taxpayer_count) }}</span>
         </div>
+        <p class="group-counts">
+          <strong>{{ group.taxpayer_count }} {{ taxpayer_word(group.taxpayer_count) }}</strong>
+          <span>·</span>
+          <span>{{ group.case_count }} {{ case_word(group.case_count) }}</span>
+        </p>
         <ol class="group-taxpayers compact-taxpayers">
         {% for taxpayer in group.taxpayers %}
           <li>
@@ -371,6 +355,10 @@
     <div class="empty-state">Найденных в АБС или ОДБ лиц нет.</div>
   {% endif %}
 </section>
+
+</div>
+
+<div class="workflow-panel" role="tabpanel" data-workflow-panel="created" hidden>
 
 <section class="panel today-groups">
   <div class="panel-heading">
@@ -483,50 +471,169 @@
                   {% endif %}
                 {% endif %}
               {% else %}
-                <div class="scan-actions">
-                  <form method="post"
-                        action="/response-letters/{{ letter.id }}/scan-device">
-                    <input type="hidden" name="group_id" value="{{ group.id }}">
-                    <button class="button button-primary" type="submit">
-                      Сканировать A4
-                    </button>
-                  </form>
-                  <form class="scan-upload-form" method="post"
-                        enctype="multipart/form-data"
-                        action="/response-letters/{{ letter.id }}/scan-upload">
-                    <input type="hidden" name="group_id" value="{{ group.id }}">
-                    <label>
-                      <span>Или загрузить файл</span>
-                      <input type="file" name="scan_file"
-                             accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff" required>
-                      <small>PDF и TIFF могут содержать несколько страниц.</small>
-                    </label>
-                    <button class="button button-secondary" type="submit">
-                      Загрузить
-                    </button>
-                  </form>
-                </div>
+                {% if letter.scan_session %}
+                  <section class="scan-session-card">
+                    <div class="scan-session-heading">
+                      <div>
+                        <strong>Сканирование ответа</strong>
+                        <small>
+                          {{ letter.scan_session.pages|length }}
+                          {{ page_word(letter.scan_session.pages|length) }}
+                        </small>
+                      </div>
+                      {% if letter.scan_session.status == 'technical_error' %}
+                        <span class="status status-technical_error">Ошибка листа</span>
+                      {% else %}
+                        <span class="status status-processing">Сбор листов</span>
+                      {% endif %}
+                    </div>
+                    {% if letter.scan_session.error_message %}
+                      <div class="alert alert-error scan-session-error">
+                        {{ letter.scan_session.error_message }}
+                        Уже полученные листы сохранены.
+                      </div>
+                    {% endif %}
+                    {% if letter.scan_session.pages %}
+                      <div class="scan-session-pages">
+                      {% for page in letter.scan_session.pages %}
+                        <article class="scan-session-page">
+                          <a href="/signed-scan-sessions/{{ letter.scan_session.id }}/pages/{{ page.id }}"
+                             target="_blank">
+                            <img src="/signed-scan-sessions/{{ letter.scan_session.id }}/pages/{{ page.id }}"
+                                 alt="Лист {{ loop.index }}" loading="lazy">
+                          </a>
+                          <strong>Лист {{ loop.index }}</strong>
+                          <div class="scan-page-actions">
+                            <form method="post"
+                                  action="/signed-scan-sessions/{{ letter.scan_session.id }}/pages/{{ page.id }}/move">
+                              <input type="hidden" name="group_id" value="{{ group.id }}">
+                              <button type="submit" name="direction" value="up"
+                                      title="Переместить выше" {% if loop.first %}disabled{% endif %}>↑</button>
+                              <button type="submit" name="direction" value="down"
+                                      title="Переместить ниже" {% if loop.last %}disabled{% endif %}>↓</button>
+                            </form>
+                            <form method="post"
+                                  action="/signed-scan-sessions/{{ letter.scan_session.id }}/pages/{{ page.id }}/replace">
+                              <input type="hidden" name="group_id" value="{{ group.id }}">
+                              <button type="submit" title="Пересканировать лист">↻</button>
+                            </form>
+                            <form method="post"
+                                  action="/signed-scan-sessions/{{ letter.scan_session.id }}/pages/{{ page.id }}/remove">
+                              <input type="hidden" name="group_id" value="{{ group.id }}">
+                              <button class="scan-page-remove" type="submit"
+                                      title="Убрать лист из PDF">×</button>
+                            </form>
+                          </div>
+                        </article>
+                      {% endfor %}
+                      </div>
+                    {% else %}
+                      <p class="scan-session-empty">
+                        Листов пока нет. Нажмите «Добавить лист».
+                      </p>
+                    {% endif %}
+                    <div class="scan-session-actions">
+                      <form method="post"
+                            action="/signed-scan-sessions/{{ letter.scan_session.id }}/pages/acquire">
+                        <input type="hidden" name="group_id" value="{{ group.id }}">
+                        <button class="button button-secondary" type="submit">
+                          Добавить лист
+                        </button>
+                      </form>
+                      <form method="post"
+                            action="/signed-scan-sessions/{{ letter.scan_session.id }}/finalize">
+                        <input type="hidden" name="group_id" value="{{ group.id }}">
+                        <button class="button button-primary" type="submit"
+                                {% if not letter.scan_session.pages %}disabled{% endif %}>
+                          Создать PDF
+                        </button>
+                      </form>
+                      <form method="post"
+                            action="/signed-scan-sessions/{{ letter.scan_session.id }}/cancel"
+                            onsubmit="return confirm('Отменить эту сессию сканирования?');">
+                        <input type="hidden" name="group_id" value="{{ group.id }}">
+                        <button class="button button-quiet" type="submit">
+                          Отменить
+                        </button>
+                      </form>
+                    </div>
+                  </section>
+                {% else %}
+                  <div class="scan-actions">
+                    <form method="post"
+                          action="/response-letters/{{ letter.id }}/scan-session/start">
+                      <input type="hidden" name="group_id" value="{{ group.id }}">
+                      <button class="button button-primary" type="submit">
+                        Начать сканирование
+                      </button>
+                    </form>
+                    <form class="scan-upload-form" method="post"
+                          enctype="multipart/form-data"
+                          action="/response-letters/{{ letter.id }}/scan-upload">
+                      <input type="hidden" name="group_id" value="{{ group.id }}">
+                      <label>
+                        <span>Готовый файл с МФУ</span>
+                        <input type="file" name="scan_file"
+                               accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff" required>
+                        <small>PDF и TIFF могут содержать несколько страниц.</small>
+                      </label>
+                      <button class="button button-secondary" type="submit">
+                        Загрузить
+                      </button>
+                    </form>
+                  </div>
+                {% endif %}
               {% endif %}
               </div>
             </div>
           {% endfor %}
           </div>
           {% if group.response_page_overflow %}
-            <small class="page-overflow-warning">
-              ⚠ Похоже, письмо не уместится на одной странице — откройте
-              и проверьте перед отправкой.
+            <small class="page-overflow-warning"
+                   title="Письмо может не уместиться на одной странице. Откройте Word и проверьте перед отправкой.">
+              ⚠ Проверьте размещение на странице
             </small>
           {% endif %}
         </div>
         <div class="generated-response-actions">
+          {% set scan_letter = group.letters[0] if group.letters else none %}
+          {% if scan_letter and group.letter_count == 1 %}
+            <form method="post"
+                  action="/response-letters/{{ scan_letter.id }}/scan-session/start">
+              <input type="hidden" name="group_id" value="{{ group.id }}">
+              <button class="button button-secondary" type="submit">
+                Сканировать
+              </button>
+            </form>
+          {% elif group.letters %}
+            <details class="generated-scan-menu">
+              <summary class="button button-secondary">Сканировать</summary>
+              <div class="generated-scan-options">
+                <strong>Какое письмо?</strong>
+                {% for letter in group.letters %}
+                  <form method="post"
+                        action="/response-letters/{{ letter.id }}/scan-session/start">
+                    <input type="hidden" name="group_id" value="{{ group.id }}">
+                    <button class="button button-secondary" type="submit">
+                      Письмо {{ letter.letter_order }} из {{ group.letter_count }}
+                    </button>
+                  </form>
+                {% endfor %}
+              </div>
+            </details>
+          {% else %}
+            <button class="button button-secondary" type="button" disabled>
+              Сканировать
+            </button>
+          {% endif %}
           <form method="post"
                 action="/response-groups/{{ group.id }}/open-for-print">
             <button class="button button-primary" type="submit">
-              Открыть в Word для печати
+              Открыть Word
             </button>
           </form>
           <a class="button button-secondary"
-             href="/response-groups/{{ group.id }}">Скачать копию</a>
+             href="/response-groups/{{ group.id }}">Скачать</a>
         </div>
       </article>
     {% endfor %}
@@ -535,6 +642,8 @@
     <div class="empty-state">Общие ответы ещё не создавались.</div>
   {% endif %}
 </section>
+
+</div>
 
 <dialog id="today-abs-dialog" class="modal">
   <form method="post" action="/today/abs" autocomplete="off">

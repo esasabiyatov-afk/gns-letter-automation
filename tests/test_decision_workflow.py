@@ -105,6 +105,32 @@ def test_decision_can_be_removed_directly_from_review_queue(workflow):
     assert workflow.get_case("queue-draft-case") is None
 
 
+def test_manually_selected_non_letter_can_return_to_review(workflow):
+    _insert_upload(workflow, "undo-page-type")
+    _insert_page(
+        workflow,
+        "undo-page-type-page",
+        "undo-page-type",
+        1,
+        "unknown",
+        "needs_review",
+    )
+    workflow.mark_page_type_from_queue(
+        "undo-page-type-page", "attachment"
+    )
+
+    reopened = workflow.reopen_page_type_review("undo-page-type-page")
+
+    assert reopened["page_type"] == "unknown"
+    assert reopened["status"] == PageStatus.NEEDS_REVIEW
+    assert not reopened["manual_confirmed"]
+    assert reopened["issue_code"] == "page_type_reopened"
+    assert workflow.get_upload("undo-page-type")["status"] == "needs_review"
+    assert "undo-page-type-page" in {
+        page["id"] for page in workflow.list_review_pages()
+    }
+
+
 def test_confident_decision_does_not_block_packet_with_letter(workflow):
     _insert_upload(workflow, "letter-and-decision")
     _insert_page(

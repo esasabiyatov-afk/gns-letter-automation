@@ -1,0 +1,153 @@
+<section class="work-section" data-testid="manual-review-workspace"
+         data-tour-anchor="review">
+  <div class="work-section-toolbar">
+    <div>
+      <h2>Ручная проверка</h2>
+      <p>В одной очереди показаны только действия, где нужно решение сотрудника.</p>
+    </div>
+    <span class="count-pill {% if review_count %}count-pill-problem{% endif %}">
+      {{ review_count }}
+    </span>
+  </div>
+
+  <div class="task-list">
+    {% for item in review.match_reviews %}
+      <article class="task-row task-row-problem" data-task-kind="match">
+        <span class="task-kind">Сравнение</span>
+        <div class="task-main">
+          <strong>Это одно и то же обращение?</strong>
+          <span>{{ item.issue_message }}</span>
+          <small>
+            {{ item.left.taxpayer.name }} ↔ {{ item.right.taxpayer.name }} ·
+            {{ item.left.original_filename }} · {{ item.right.original_filename }}
+          </small>
+        </div>
+        <a class="button button-primary button-compact"
+           href="/review/matches/{{ item.id }}">Сравнить</a>
+      </article>
+    {% endfor %}
+
+    {% for group in review.account_groups %}
+      {% for taxpayer in group.taxpayers %}
+        <article class="task-row" data-task-kind="abs-account">
+          <span class="task-kind">АБС</span>
+          <div class="task-main">
+            <strong>{{ taxpayer.name }}</strong>
+            <span>ИНН {{ taxpayer.inn }} · {{ group.district_place }}</span>
+            {% if taxpayer.abs_active_account_count is not none or taxpayer.abs_closed_account_count is not none %}
+              <small>
+                Активных счетов: {{ taxpayer.abs_active_account_count or 0 }} ·
+                закрытых: {{ taxpayer.abs_closed_account_count or 0 }}
+              </small>
+            {% endif %}
+          </div>
+          <div class="task-decision" aria-label="Расчётный счёт">
+            <span>Расчётный счёт</span>
+            <form method="post"
+                  action="/cases/{{ taxpayer.source_case_id }}/abs-account/taxpayer">
+              <input type="hidden" name="taxpayer_inn" value="{{ taxpayer.inn }}">
+              <input type="hidden" name="return_to" value="review">
+              <button class="button button-secondary button-compact"
+                      name="account_result" value="found" type="submit">Есть</button>
+              <button class="button button-primary button-compact"
+                      name="account_result" value="not_found" type="submit">Нет</button>
+            </form>
+          </div>
+        </article>
+      {% endfor %}
+    {% endfor %}
+
+    {% for item in review.odb_cases %}
+      {% for taxpayer in item.taxpayers %}
+        <article class="task-row" data-task-kind="odb" data-odb-case>
+          <span class="task-kind">ОДБ</span>
+          <div class="task-main">
+            <strong>{{ taxpayer.name }}</strong>
+            <span>ИНН {{ taxpayer.inn }} · {{ item.district_place }}</span>
+            <small>Период начинается {{ item.period_start or 'до порога' }}</small>
+          </div>
+          <div class="task-decision" data-odb-row
+               data-odb-url="/cases/{{ item.id }}/odb/taxpayer">
+            <input type="hidden" name="taxpayer_inn" value="{{ taxpayer.inn }}">
+            <span>Найден в ОДБ</span>
+            <div>
+              <button class="button button-secondary button-compact"
+                      type="button" data-odb-result="found">Да</button>
+              <button class="button button-primary button-compact"
+                      type="button" data-odb-result="not_found">Нет</button>
+            </div>
+          </div>
+        </article>
+      {% endfor %}
+    {% endfor %}
+
+    {% for case in review.case_tasks %}
+      <article class="task-row task-row-problem" data-task-kind="case">
+        <span class="task-kind">Данные</span>
+        <div class="task-main">
+          <strong>{{ case.original_filename }}</strong>
+          <span>{{ case.district_place or 'Подразделение не определено' }}</span>
+          <small>{{ status_labels.get(case.status, case.status) }}</small>
+        </div>
+        {% if case.fields_confirmed %}
+          <a class="button button-primary button-compact" href="/cases/{{ case.id }}">Открыть</a>
+        {% else %}
+          <form method="post" action="/cases/{{ case.id }}/reopen-review">
+            <button class="button button-primary button-compact" type="submit">Исправить</button>
+          </form>
+        {% endif %}
+      </article>
+    {% endfor %}
+
+    {% for page in review.pages %}
+      <article class="task-row task-row-page {% if page.status == 'technical_error' %}task-row-problem{% endif %}"
+               data-task-kind="page">
+        <span class="task-kind">Лист {{ page.page_number }}</span>
+        <a class="task-thumb" href="/review/{{ page.id }}">
+          {% if page.preview_path %}
+            <img src="/pages/{{ page.id }}/image" alt="Лист {{ page.page_number }}">
+          {% else %}
+            <span>{{ page.page_number }}</span>
+          {% endif %}
+        </a>
+        <div class="task-main">
+          <strong>{{ page.original_filename }}</strong>
+          <span>{{ page.issue_message or 'Нужна ручная проверка.' }}</span>
+          <small>
+            QR: {{ qr_status_labels.get(page.qr_status, page.qr_status) }} ·
+            OCR: {{ (page.ocr_confidence * 100)|round|int }}%
+          </small>
+        </div>
+        <div class="task-page-actions">
+          <form method="post" action="/review/{{ page.id }}/type"
+                data-auto-submit-form>
+            <select name="page_type" aria-label="Тип страницы" data-auto-submit>
+              <option value="" disabled
+                      {% if page.page_type == 'unknown' %}selected{% endif %}>Тип</option>
+              <option value="letter" {% if page.page_type == 'letter' %}selected{% endif %}>Письмо</option>
+              <option value="decision" {% if page.page_type == 'decision' %}selected{% endif %}>Решение</option>
+              <option value="attachment" {% if page.page_type == 'attachment' %}selected{% endif %}>Приложение</option>
+              <option value="other" {% if page.page_type == 'other' %}selected{% endif %}>Прочее</option>
+            </select>
+          </form>
+          {% if page.status == 'technical_error' %}
+            <form method="post" action="/pages/{{ page.id }}/reprocess">
+              <button class="button button-danger button-compact" type="submit">Повторить</button>
+            </form>
+          {% else %}
+            <a class="button button-primary button-compact"
+               href="/review/{{ page.id }}">Проверить</a>
+          {% endif %}
+        </div>
+      </article>
+    {% endfor %}
+  </div>
+
+  {% if not review.pages and not review.match_reviews and not review.account_groups
+        and not review.odb_cases and not review.case_tasks %}
+    <div class="empty-state large">
+      <strong>Проверка не требуется</strong>
+      <span>Очередь пуста.</span>
+    </div>
+  {% endif %}
+</section>

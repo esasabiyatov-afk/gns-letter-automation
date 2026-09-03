@@ -1,23 +1,42 @@
 {% extends "base.html" %}
 {% block title %}Проверка страницы {{ page.page_number }} · ГНС{% endblock %}
+{% block body_class %}workspace-page{% endblock %}
 {% block content %}
 <div class="review-workspace">
   <section class="document-viewer">
     <div class="viewer-toolbar">
-      <a class="back-link" href="/review">← К очереди</a>
-      <strong>
-        {{ upload.get('original_filename') or 'Исходный PDF' }} ·
-        страница {{ page.page_number }}
-      </strong>
+      <div class="viewer-context">
+        <a class="back-link" href="/?tab=review">← К очереди</a>
+        <strong>
+          {{ upload.get('original_filename') or 'Исходный PDF' }} ·
+          страница {{ page.page_number }}
+        </strong>
+        <nav class="review-queue-nav" aria-label="Навигация по очереди">
+          {% if previous_review_page_id %}
+            <a href="/review/{{ previous_review_page_id }}" aria-label="Предыдущая страница">←</a>
+          {% else %}
+            <span aria-hidden="true">←</span>
+          {% endif %}
+          <strong>{{ review_position }} из {{ review_total }}</strong>
+          {% if next_review_page_id %}
+            <a href="/review/{{ next_review_page_id }}" aria-label="Следующая страница">→</a>
+          {% else %}
+            <span aria-hidden="true">→</span>
+          {% endif %}
+        </nav>
+      </div>
       <div class="viewer-actions">
-        <button type="button" class="active" data-viewer-tab="pdf">PDF</button>
-        <button type="button" data-viewer-tab="enhanced">Улучшенная</button>
-        <button type="button" data-viewer-tab="ocr">Текст OCR</button>
+        <button type="button" class="active" data-viewer-tab="pdf"
+                aria-pressed="true" title="PDF · Alt+1">PDF</button>
+        <button type="button" data-viewer-tab="enhanced"
+                aria-pressed="false" title="Улучшенная · Alt+2">Улучшенная</button>
+        <button type="button" data-viewer-tab="ocr"
+                aria-pressed="false" title="Текст OCR · Alt+3">Текст OCR</button>
       </div>
     </div>
     <div class="viewer-panel viewer-pdf" data-viewer-panel="pdf">
       <iframe
-        src="/pages/{{ page.id }}/pdf#page=1&zoom=page-width"
+        src="/pages/{{ page.id }}/pdf#page=1&zoom=page-fit"
         title="PDF, исходная страница {{ page.page_number }}">
       </iframe>
     </div>
@@ -53,10 +72,22 @@
   <aside class="review-form-panel">
     <div class="review-form-header">
       <p class="eyebrow">
-        {% if page.page_type == 'decision' %}ПРОВЕРКА ТИПА СТРАНИЦЫ{% else %}РУЧНАЯ ПРОВЕРКА{% endif %}
+        {% if page.issue_code == 'incomplete_letter_data' %}
+          ИСПРАВЛЕНИЕ ДАННЫХ
+        {% elif page.page_type == 'decision' %}
+          ПРОВЕРКА ТИПА СТРАНИЦЫ
+        {% else %}
+          РУЧНАЯ ПРОВЕРКА
+        {% endif %}
       </p>
       <h1>
-        {% if page.page_type == 'decision' %}Проверьте тип страницы{% else %}Обозначьте страницу{% endif %}
+        {% if page.issue_code == 'incomplete_letter_data' %}
+          Заполните данные письма
+        {% elif page.page_type == 'decision' %}
+          Проверьте тип страницы
+        {% else %}
+          Обозначьте страницу
+        {% endif %}
       </h1>
       <p class="issue-box">{{ page.issue_message or 'Проверьте данные.' }}</p>
     </div>
@@ -256,12 +287,14 @@
       </label>
       {% endif %}
 
-      <button class="button button-primary button-block" type="submit">
-        Подтвердить и продолжить
-      </button>
-      <p class="form-note">
-        Подтверждение и ручные изменения будут записаны в журнал.
-      </p>
+      <div class="review-submit-bar">
+        <button class="button button-primary button-block" type="submit">
+          Подтвердить и продолжить
+        </button>
+        <p class="form-note">
+          Изменения будут записаны в журнал.
+        </p>
+      </div>
     </form>
   </aside>
 </div>

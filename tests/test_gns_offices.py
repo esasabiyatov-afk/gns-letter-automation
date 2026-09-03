@@ -67,6 +67,53 @@ def test_old_jalal_abad_city_names_match_manas_but_not_manas_district(workflow):
     assert manas_district["email_address"] == "056manas@sti.gov.kg"
 
 
+def test_osh_city_email_is_not_mixed_with_osh_region_offices(workflow):
+    """Only the city УГНС may receive the city Ош address.
+
+    A response group can retain the short OCR/manual value ``по городу Ош``.
+    It must still resolve to the city УГНС, while names of regional or
+    specialised offices must never silently receive that address.
+    """
+    workflow.initialize_gns_offices()
+    workflow.initialize_gns_office_emails()
+
+    city_matches = [
+        workflow.match_gns_office("УГНС по г. Ош"),
+        workflow.match_gns_office("УГНС по городу Ош"),
+        workflow.match_gns_office("по городу Ош"),
+    ]
+
+    assert all(city_matches)
+    city = city_matches[0]
+    assert city is not None
+    assert {
+        office["office_key"]
+        for office in city_matches
+        if office is not None
+    } == {city["office_key"]}
+    assert city["office_name"] == "УГНС по г. Ош"
+    assert city["district_place"] == "по городу Ош"
+    assert city["email_address"] == "032oshg@sti.gov.kg"
+
+    for other_office_text in (
+        "ЦОП по г. Ош",
+        "УККН по г. Ош и Южному региону",
+        "УГНС по Алайскому району Ошской области",
+    ):
+        other = workflow.match_gns_office(other_office_text)
+        assert other is not None
+        assert other["office_key"] != city["office_key"]
+        assert other.get("email_address") != city["email_address"]
+
+    regional_wording = workflow.match_gns_office(
+        "УГНС по городу Ош и Ошской области"
+    )
+    assert (
+        regional_wording is None
+        or regional_wording["office_key"] != city["office_key"]
+    )
+
+
 def test_existing_jalal_abad_case_is_migrated_to_current_city_name(workflow):
     workflow.db.execute(
         """
@@ -119,6 +166,31 @@ def test_gns_offices_are_stored_and_matched_locally(workflow):
     assert len(offices) == 2
     assert match is not None
     assert match["district_place"] == "по Демо-району города Бишкек"
+
+
+def test_gns_office_directory_is_read_once_for_repeated_matches(
+    workflow,
+    monkeypatch,
+):
+    workflow.replace_gns_offices(_offices())
+    original_fetch_all = workflow.db.fetch_all
+    directory_reads = 0
+
+    def counted_fetch_all(sql, parameters=()):
+        nonlocal directory_reads
+        if "FROM gns_offices" in sql:
+            directory_reads += 1
+        return original_fetch_all(sql, parameters)
+
+    monkeypatch.setattr(workflow.db, "fetch_all", counted_fetch_all)
+
+    for _ in range(20):
+        office = workflow.canonical_gns_office(
+            "по Демо-району города Бишкек"
+        )
+        assert office is not None
+
+    assert directory_reads == 1
 
 
 def test_replacing_directory_expands_legacy_case_location(workflow):
@@ -375,11 +447,13 @@ def test_bundled_office_csv_contains_all_records(project_root):
     assert records[0]["postal_address"] == (
         "г. Бишкек, 10-й микрорайон, 29"
     )
-    assert all(
-        "области" in record["district_place"]
-        or "г. Бишкек" in record["district_place"]
+    assert all(record["district_place"] for record in records)
+    osh_city = next(
+        record
         for record in records
+        if record["office_name"] == "УГНС по г. Ош"
     )
+    assert osh_city["district_place"] == "по городу Ош"
 
 
 def test_noisy_ocr_office_is_offered_as_suggestion(workflow):
@@ -391,7 +465,7 @@ def test_noisy_ocr_office_is_offered_as_suggestion(workflow):
 
     assert suggestions
     assert suggestions[0]["office_name"] == (
-        "УГНС по Иссык-Атинскому району"
+        "УГНС по Ысык-Атинскому району"
     )
     assert len(suggestions) == 1
 
@@ -436,5 +510,31 @@ def test_unique_fuzzy_ocr_match_replaces_unconfirmed_raw_location(workflow):
 
     assert workflow.reconcile_gns_office_hints() == 1
     assert workflow.get_case(case_id)["district_place"] == (
-        "по Иссык-Атинскому району Чуйской области"
+        "по Ысык-Атинскому району Чуйской области"
+    )
+
+
+def test_saved_district_typo_is_canonicalized_from_directory(workflow):
+    workflow.initialize_gns_offices()
+    workflow.db.execute(
+        """
+        INSERT INTO uploads(
+            id, original_filename, stored_path, sha256,
+            page_count, status, created_at
+        ) VALUES ('panfilov-upload', 'scan.pdf', 'scan.pdf',
+                  'panfilov-hash', 1, 'ready',
+                  '2026-01-01T00:00:00+00:00')
+        """
+    )
+    case_id = workflow._create_scan_case("panfilov-upload", "panfilov-page")
+    workflow.db.execute(
+        "UPDATE cases SET district_place = ? WHERE id = ?",
+        ("по Панфиловсому району Чуйской области", case_id),
+    )
+
+    result = workflow.reconcile_gns_office_districts()
+
+    assert result == {"cases": 1, "response_groups": 0}
+    assert workflow.get_case(case_id)["district_place"] == (
+        "по Панфиловскому району Чуйской области"
     )

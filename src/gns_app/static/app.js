@@ -1,4 +1,220 @@
 (() => {
+  const employeeEntry = document.querySelector("#employee-entry");
+  if (employeeEntry && window.location.hash === "#employee-entry") {
+    employeeEntry.open = true;
+  }
+  document.querySelector(".active-employee-chip")?.addEventListener("click", () => {
+    if (employeeEntry) employeeEntry.open = true;
+  });
+
+  const tourCard = document.querySelector("[data-tour-card]");
+  const tourStart = document.querySelector("[data-tour-start]");
+  if (tourCard && tourStart) {
+    const tourSteps = [
+      {
+        id: "work-stages",
+        path: "/?tab=incoming",
+        selector: "[data-tour-anchor='work-tabs']",
+        title: "Работайте слева направо",
+        text: "Основной маршрут состоит из трёх этапов: «Входящие» → «Проверка» → «Ответы». Числа показывают, сколько работы сейчас находится на каждом этапе.",
+      },
+      {
+        id: "receive-mail",
+        path: "/?tab=incoming",
+        selector: "[data-tour-anchor='incoming']",
+        title: "Получите входящие письма",
+        text: "Нажмите «Получить письма»: PDF загрузятся из Outlook, а одинаковые файлы не будут обработаны повторно. Ручная загрузка и проверка папки находятся рядом.",
+      },
+      {
+        id: "review",
+        path: "/?tab=review",
+        selector: "[data-tour-anchor='review']",
+        title: "Проверьте только сомнения",
+        text: "В этой очереди появляются только решения, которые приложение не имеет права принимать само: проблемные страницы, расхождения, АБС и ОДБ.",
+      },
+      {
+        id: "prepare",
+        path: "/?tab=responses&response_view=prepare",
+        selector: "[data-tour-anchor='prepare']",
+        title: "Создайте готовые ответы",
+        text: "Во вкладке «К созданию» сформируйте один Word для срочного письма или сразу весь готовый пакет.",
+      },
+      {
+        id: "created",
+        path: "/?tab=responses&response_view=created",
+        selector: "[data-tour-anchor='created']",
+        title: "Присвойте номера и отсканируйте",
+        text: "Введите первый свободный исходящий номер — остальные заполнятся по порядку. Затем откройте Word, соберите подпись и печать и нажмите «Сканировать» у нужного письма.",
+      },
+      {
+        id: "manual",
+        path: "/?tab=responses&response_view=manual",
+        selector: "[data-tour-anchor='manual']",
+        title: "Не пропустите ручные ответы",
+        text: "Если подтверждено наличие расчётного счёта, обращение не попадёт в шаблон «счета отсутствуют» и останется здесь для отдельного ответа.",
+      },
+      {
+        id: "history",
+        path: "/history",
+        selector: "[data-tour-anchor='history']",
+        title: "Найдите любое письмо",
+        text: "История ищет по файлу, лицу, ИНН, отправителю и исходящему номеру. Связанные PDF, Word и сканы открываются через меню «⋯».",
+      },
+    ];
+    const storagePrefix = "gns-guided-tour-v1";
+    const activeKey = `${storagePrefix}:active`;
+    const stepKey = `${storagePrefix}:step`;
+    const seenKey = `${storagePrefix}:seen`;
+    const progress = tourCard.querySelector("[data-tour-progress]");
+    const title = tourCard.querySelector("[data-tour-title]");
+    const text = tourCard.querySelector("[data-tour-text]");
+    const back = tourCard.querySelector("[data-tour-back]");
+    const next = tourCard.querySelector("[data-tour-next]");
+    const skip = tourCard.querySelector("[data-tour-skip]");
+    const close = tourCard.querySelector("[data-tour-close]");
+    let activeTarget = null;
+    let volatileActive = false;
+    let volatileStep = 0;
+    let volatileSeen = false;
+
+    const sessionGet = (key) => {
+      try {
+        return window.sessionStorage.getItem(key);
+      } catch (_error) {
+        if (key === activeKey) return volatileActive ? "1" : null;
+        if (key === stepKey) return String(volatileStep);
+        return null;
+      }
+    };
+    const sessionSet = (key, value) => {
+      if (key === activeKey) volatileActive = value === "1";
+      if (key === stepKey) volatileStep = Number.parseInt(value, 10) || 0;
+      try {
+        window.sessionStorage.setItem(key, value);
+      } catch (_error) {
+        // В пределах страницы используется резервное состояние в памяти.
+      }
+    };
+    const sessionRemove = (key) => {
+      if (key === activeKey) volatileActive = false;
+      if (key === stepKey) volatileStep = 0;
+      try {
+        window.sessionStorage.removeItem(key);
+      } catch (_error) {
+        // Нечего очищать.
+      }
+    };
+    const completedGet = () => {
+      try {
+        return window.localStorage.getItem(seenKey);
+      } catch (_error) {
+        return volatileSeen ? "1" : null;
+      }
+    };
+    const completedSet = () => {
+      volatileSeen = true;
+      try {
+        window.localStorage.setItem(seenKey, "1");
+      } catch (_error) {
+        // Повторный автоматический показ подавляется в пределах страницы.
+      }
+    };
+    const clearTarget = () => {
+      activeTarget?.classList.remove("tour-target-active");
+      activeTarget = null;
+    };
+    const routeMatches = (path) => {
+      const expected = new URL(path, window.location.origin);
+      const current = new URL(window.location.href);
+      if (expected.pathname !== current.pathname) return false;
+      const expectedTab = expected.searchParams.get("tab");
+      const currentTab = current.searchParams.get("tab")
+        || (current.pathname === "/" ? "incoming" : "");
+      const expectedView = expected.searchParams.get("response_view");
+      if (expectedTab && expectedTab !== currentTab) return false;
+      if (expectedView
+          && expectedView !== current.searchParams.get("response_view")) {
+        return false;
+      }
+      return true;
+    };
+    const finishTour = () => {
+      clearTarget();
+      tourCard.hidden = true;
+      document.body.classList.remove("tour-is-active");
+      completedSet();
+      sessionRemove(activeKey);
+      sessionRemove(stepKey);
+    };
+    const renderTour = (allowNavigation = false) => {
+      const storedStep = Number.parseInt(sessionGet(stepKey) || "0", 10);
+      const index = Number.isFinite(storedStep)
+        ? Math.min(Math.max(storedStep, 0), tourSteps.length - 1)
+        : 0;
+      const step = tourSteps[index];
+      if (!routeMatches(step.path)) {
+        clearTarget();
+        tourCard.hidden = true;
+        document.body.classList.remove("tour-is-active");
+        if (allowNavigation) window.location.assign(step.path);
+        return;
+      }
+
+      clearTarget();
+      activeTarget = document.querySelector(step.selector);
+      activeTarget?.classList.add("tour-target-active");
+      if (activeTarget) {
+        const rectangle = activeTarget.getBoundingClientRect();
+        if (rectangle.top < 70 || rectangle.bottom > window.innerHeight - 150) {
+          activeTarget.scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+      }
+
+      progress.textContent = `${index + 1} из ${tourSteps.length}`;
+      title.textContent = step.title;
+      text.textContent = step.text;
+      back.hidden = index === 0;
+      next.textContent = index === tourSteps.length - 1 ? "Завершить" : "Далее";
+      tourCard.hidden = false;
+      document.body.classList.add("tour-is-active");
+    };
+    const goToStep = (index) => {
+      const bounded = Math.min(Math.max(index, 0), tourSteps.length - 1);
+      sessionSet(activeKey, "1");
+      sessionSet(stepKey, String(bounded));
+      renderTour(true);
+    };
+    const currentStep = () => Number.parseInt(sessionGet(stepKey) || "0", 10);
+
+    tourStart.addEventListener("click", () => {
+      goToStep(sessionGet(activeKey) === "1" ? currentStep() : 0);
+    });
+    back?.addEventListener("click", () => goToStep(currentStep() - 1));
+    next?.addEventListener("click", () => {
+      const index = currentStep();
+      if (index >= tourSteps.length - 1) {
+        finishTour();
+      } else {
+        goToStep(index + 1);
+      }
+    });
+    skip?.addEventListener("click", finishTour);
+    close?.addEventListener("click", finishTour);
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && !tourCard.hidden) finishTour();
+    });
+
+    const firstWorkScreen = window.location.pathname === "/"
+      && [null, "incoming"].includes(
+        new URL(window.location.href).searchParams.get("tab")
+      );
+    if (sessionGet(activeKey) === "1") {
+      renderTour(false);
+    } else if (completedGet() !== "1" && firstWorkScreen) {
+      window.setTimeout(() => goToStep(0), 350);
+    }
+  }
+
   const fileInput = document.querySelector("#pdf-file");
   const dropZone = document.querySelector(".drop-zone");
   if (fileInput && dropZone) {
@@ -24,6 +240,244 @@
   });
   document.querySelectorAll("[data-close-dialog]").forEach((button) => {
     button.addEventListener("click", () => button.closest("dialog")?.close());
+  });
+
+  const inlineNumberForms = [
+    ...document.querySelectorAll("form[data-inline-number-form]"),
+  ];
+  if (inlineNumberForms.length) {
+    const entries = inlineNumberForms.map((form) => ({
+      form,
+      input: form.querySelector("[data-inline-number-input]"),
+      submit: form.querySelector("[data-inline-number-submit]"),
+      letterId: form.dataset.letterId || "",
+      originalAction: form.getAttribute("action") || "",
+    })).filter((entry) => entry.input && entry.submit && entry.letterId);
+    const unnumbered = entries.filter(
+      (entry) => (entry.input.dataset.originalNumber || "") === "",
+    );
+
+    const addSequenceField = (form, name, value) => {
+      const field = document.createElement("input");
+      field.type = "hidden";
+      field.name = name;
+      field.value = value;
+      field.dataset.inlineSequenceField = "";
+      form.append(field);
+    };
+
+    const resetSequence = (source, typedValue) => {
+      entries.forEach((entry) => {
+        entry.form.querySelectorAll("[data-inline-sequence-field]")
+          .forEach((field) => field.remove());
+        entry.form.setAttribute("action", entry.originalAction);
+        entry.form.classList.remove("sequence-source");
+        entry.submit.disabled = false;
+        entry.submit.textContent = "✓";
+        entry.submit.title = "Сохранить номер";
+        if (entry.input.dataset.sequencePreview === "true") {
+          if (entry !== source) entry.input.value = "";
+          entry.input.classList.remove("sequence-preview");
+          delete entry.input.dataset.sequencePreview;
+        }
+      });
+      if (source) source.input.value = typedValue;
+    };
+
+    const renderSequence = (source) => {
+      const typedValue = source.input.value.trim();
+      resetSequence(source, typedValue);
+      const startIndex = unnumbered.indexOf(source);
+      if (startIndex < 0 || !/^\d{1,9}$/.test(typedValue)) return;
+      const firstNumber = Number.parseInt(typedValue, 10);
+      const suffix = unnumbered.slice(startIndex);
+      if (
+        firstNumber < 1
+        || firstNumber + Math.max(0, suffix.length - 1) > 999999999
+      ) return;
+
+      suffix.forEach((entry, offset) => {
+        entry.input.value = String(firstNumber + offset);
+        entry.input.classList.add("sequence-preview");
+        entry.input.dataset.sequencePreview = "true";
+        if (entry !== source) {
+          entry.submit.disabled = true;
+          entry.submit.title = "Сохранится вместе с первым номером";
+        }
+      });
+      source.form.setAttribute("action", "/today/outgoing-numbers/assign");
+      source.form.classList.add("sequence-source");
+      addSequenceField(source.form, "first_number", String(firstNumber));
+      suffix.forEach((entry) => {
+        addSequenceField(source.form, "letter_ids", entry.letterId);
+      });
+      source.submit.textContent = "✓";
+      source.submit.title = suffix.length > 1
+        ? `Сохранить номера для ${suffix.length} писем`
+        : "Сохранить номер";
+    };
+
+    unnumbered.forEach((entry) => {
+      entry.input.addEventListener("input", () => renderSequence(entry));
+    });
+  }
+
+  const actionMenus = [...document.querySelectorAll(".action-menu")];
+  actionMenus.forEach((menu) => {
+    menu.addEventListener("toggle", () => {
+      if (!menu.open) return;
+      actionMenus.forEach((other) => {
+        if (other !== menu) other.open = false;
+      });
+    });
+  });
+  document.addEventListener("click", (event) => {
+    actionMenus.forEach((menu) => {
+      if (menu.open && !menu.contains(event.target)) menu.open = false;
+    });
+  });
+
+  const workflowTabs = [...document.querySelectorAll("[data-workflow-tab]")];
+  const workflowPanels = [...document.querySelectorAll("[data-workflow-panel]")];
+  if (workflowTabs.length && workflowPanels.length) {
+    const activateWorkflowTab = (name) => {
+      workflowTabs.forEach((button) => {
+        const active = button.dataset.workflowTab === name;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-selected", active ? "true" : "false");
+      });
+      workflowPanels.forEach((panel) => {
+        panel.hidden = panel.dataset.workflowPanel !== name;
+      });
+    };
+    const hashTarget = window.location.hash
+      ? document.getElementById(window.location.hash.slice(1))
+      : null;
+    const hashPanel = hashTarget?.closest("[data-workflow-panel]");
+    const query = new URLSearchParams(window.location.search);
+    const initialTab = hashPanel?.dataset.workflowPanel
+      || (query.has("outgoing_start") ? "created" : "prepare");
+    activateWorkflowTab(initialTab);
+    workflowTabs.forEach((button) => {
+      button.addEventListener("click", () => {
+        activateWorkflowTab(button.dataset.workflowTab);
+      });
+    });
+  }
+
+  document.querySelectorAll(".response-group-card details").forEach((details) => {
+    details.addEventListener("toggle", () => {
+      const card = details.closest(".response-group-card");
+      if (!card) return;
+      card.classList.toggle(
+        "is-expanded",
+        Boolean(card.querySelector("details[open]"))
+      );
+    });
+  });
+
+  const settingsTabs = [...document.querySelectorAll("[data-settings-tab]")];
+  const settingsPanels = [...document.querySelectorAll("[data-settings-panel]")];
+  const settingsSaveState = document.querySelector("[data-settings-save-state]");
+  if (settingsTabs.length && settingsPanels.length) {
+    const sectionNames = settingsTabs.map((button) => button.dataset.settingsTab);
+    const selectSettingsSection = (name, updateHash = false) => {
+      const selected = sectionNames.includes(name) ? name : sectionNames[0];
+      settingsTabs.forEach((button) => {
+        const active = button.dataset.settingsTab === selected;
+        button.setAttribute("aria-selected", active ? "true" : "false");
+      });
+      settingsPanels.forEach((panel) => {
+        panel.hidden = panel.dataset.settingsPanel !== selected;
+      });
+      if (updateHash) {
+        window.history.replaceState(null, "", `#${selected}`);
+      }
+    };
+    selectSettingsSection(window.location.hash.slice(1));
+    settingsTabs.forEach((button) => {
+      button.addEventListener("click", () => {
+        selectSettingsSection(button.dataset.settingsTab, true);
+      });
+    });
+    window.addEventListener("hashchange", () => {
+      selectSettingsSection(window.location.hash.slice(1));
+    });
+  }
+
+  let settingsDirty = false;
+  document.querySelectorAll("[data-settings-form]").forEach((form) => {
+    const markDirty = () => {
+      settingsDirty = true;
+      if (settingsSaveState) {
+        settingsSaveState.textContent = "Есть несохранённые изменения";
+        settingsSaveState.classList.add("is-dirty");
+        settingsSaveState.classList.remove("is-saving");
+      }
+    };
+    form.addEventListener("input", markDirty);
+    form.addEventListener("change", markDirty);
+    form.addEventListener("submit", () => {
+      settingsDirty = false;
+      if (settingsSaveState) {
+        settingsSaveState.textContent = "Сохраняем…";
+        settingsSaveState.classList.remove("is-dirty");
+        settingsSaveState.classList.add("is-saving");
+      }
+    });
+  });
+  window.addEventListener("beforeunload", (event) => {
+    if (!settingsDirty) return;
+    event.preventDefault();
+    event.returnValue = "";
+  });
+
+  document.querySelectorAll("[data-paged-list]").forEach((list) => {
+    const items = [...list.children].filter((item) => item.hasAttribute("data-page-item"));
+    const configuredPageSize = Math.max(
+      1,
+      Number.parseInt(list.dataset.pageSize || "6", 10)
+    );
+    const responsivePageSize = window.matchMedia("(max-width: 720px)").matches
+      ? 1
+      : window.matchMedia("(max-width: 1050px)").matches
+        ? 2
+        : configuredPageSize;
+    const pageSize = Math.min(configuredPageSize, responsivePageSize);
+    const pageCount = Math.ceil(items.length / pageSize);
+    if (pageCount <= 1) return;
+    let page = 0;
+    const controls = document.createElement("nav");
+    controls.className = "pagination-controls";
+    controls.setAttribute("aria-label", "Страницы списка");
+    const previous = document.createElement("button");
+    previous.type = "button";
+    previous.textContent = "←";
+    previous.setAttribute("aria-label", "Предыдущая страница списка");
+    const indicator = document.createElement("strong");
+    const next = document.createElement("button");
+    next.type = "button";
+    next.textContent = "→";
+    next.setAttribute("aria-label", "Следующая страница списка");
+    controls.append(previous, indicator, next);
+    list.after(controls);
+    const render = () => {
+      items.forEach((item, index) => {
+        item.hidden = index < page * pageSize || index >= (page + 1) * pageSize;
+      });
+      indicator.textContent = `${page + 1} из ${pageCount}`;
+      previous.disabled = page === 0;
+      next.disabled = page === pageCount - 1;
+    };
+    previous.addEventListener("click", () => {
+      if (page > 0) page -= 1;
+      render();
+    });
+    next.addEventListener("click", () => {
+      if (page + 1 < pageCount) page += 1;
+      render();
+    });
+    render();
   });
 
   document.querySelectorAll("[data-odb-result]").forEach((button) => {
@@ -66,16 +520,26 @@
   const viewerTabs = document.querySelectorAll("[data-viewer-tab]");
   const viewerPanels = document.querySelectorAll("[data-viewer-panel]");
   if (viewerTabs.length && viewerPanels.length) {
-    viewerTabs.forEach((button) => {
-      button.addEventListener("click", () => {
-        const selected = button.dataset.viewerTab;
-        viewerTabs.forEach((tab) => {
-          tab.classList.toggle("active", tab === button);
-        });
-        viewerPanels.forEach((panel) => {
-          panel.hidden = panel.dataset.viewerPanel !== selected;
-        });
+    const selectViewerTab = (button) => {
+      const selected = button.dataset.viewerTab;
+      viewerTabs.forEach((tab) => {
+        const active = tab === button;
+        tab.classList.toggle("active", active);
+        tab.setAttribute("aria-pressed", active ? "true" : "false");
       });
+      viewerPanels.forEach((panel) => {
+        panel.hidden = panel.dataset.viewerPanel !== selected;
+      });
+    };
+    viewerTabs.forEach((button) => {
+      button.addEventListener("click", () => selectViewerTab(button));
+    });
+    document.addEventListener("keydown", (event) => {
+      if (!event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      const index = { "1": 0, "2": 1, "3": 2 }[event.key];
+      if (index === undefined || !viewerTabs[index]) return;
+      event.preventDefault();
+      selectViewerTab(viewerTabs[index]);
     });
   }
 
@@ -473,5 +937,14 @@
     };
     typeRadios.forEach((radio) => radio.addEventListener("change", update));
     update();
+  }
+
+  const selectedUploadPage = document.querySelector(
+    ".upload-page-row.is-selected"
+  );
+  if (selectedUploadPage) {
+    window.requestAnimationFrame(() => {
+      selectedUploadPage.scrollIntoView({ block: "nearest", inline: "nearest" });
+    });
   }
 })();

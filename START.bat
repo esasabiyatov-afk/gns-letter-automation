@@ -1,152 +1,88 @@
 @echo off
-setlocal enabledelayedexpansion
+chcp 65001 >nul
+setlocal
 cd /d "%~dp0"
 
-echo ================================================================
-echo   GNS Letter Automation - setup and start
-echo ================================================================
-echo.
-echo Working folder: %cd%
-echo.
+title ГНС — запуск приложения
+set "APP_URL=http://127.0.0.1:8765"
+set "APP_PYTHON=%~dp0.venv\Scripts\python.exe"
+set "APP_FAST_MODELS=%LOCALAPPDATA%\GNSLetterAutomation\models\tessdata_fast"
+set "APP_BEST_MODELS=%LOCALAPPDATA%\GNSLetterAutomation\models\tessdata_best"
 
-REM ---------------------------------------------------------------
-REM 1. Find Python 3.12 (required exactly - the tesserocr wheel is
-REM    built for cp312; newer versions like 3.14 will NOT work)
-REM ---------------------------------------------------------------
-where py >nul 2>nul
-if errorlevel 1 (
-    echo [ERROR] Python launcher "py" was not found.
-    echo Install Python 3.12 ^(64-bit^) from:
-    echo   https://www.python.org/downloads/release/python-3120/
-    echo During setup, make sure to check "Add python.exe to PATH".
-    echo.
-    pause
-    exit /b 1
-)
+rem Если приложение уже работает, просто открыть его и не запускать второй сервер.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "try { $r = Invoke-WebRequest -UseBasicParsing -Uri '%APP_URL%/health' -TimeoutSec 2; if ($r.StatusCode -eq 200) { Start-Process '%APP_URL%'; exit 0 } } catch {}; exit 1" >nul 2>nul
+if not errorlevel 1 exit /b 0
 
-py -3.12 --version >nul 2>nul
-if errorlevel 1 (
-    echo [ERROR] Python 3.12 is not installed ^(other versions, e.g. 3.14, will NOT work^).
-    echo Download the "Windows installer ^(64-bit^)" here:
-    echo   https://www.python.org/downloads/release/python-3120/
-    echo During setup, check "Add python.exe to PATH", then run this file again.
-    echo.
-    pause
-    exit /b 1
-)
+rem Обычный запуск ничего не устанавливает. Подготовка выполняется только
+rem при первом запуске или если обязательные компоненты действительно пропали.
+call :validate_runtime
+if errorlevel 1 goto setup
+goto launch
 
-echo [OK] Python 3.12 found.
+:setup
+echo Первый запуск: подготавливаю приложение. Это выполняется один раз.
 echo.
 
-REM ---------------------------------------------------------------
-REM 2. Create the virtual environment if it does not exist yet
-REM ---------------------------------------------------------------
-set "PYEXE=.venv\Scripts\python.exe"
-
-if not exist "%PYEXE%" (
-    echo Creating virtual environment ^(.venv^)...
+if not exist "%APP_PYTHON%" (
+    where py >nul 2>nul
+    if errorlevel 1 goto no_python
+    py -3.12 --version >nul 2>nul
+    if errorlevel 1 goto no_python
     py -3.12 -m venv .venv
-    if errorlevel 1 (
-        echo [ERROR] Failed to create the virtual environment.
-        pause
-        exit /b 1
-    )
-    echo [OK] Virtual environment created.
-) else (
-    echo [OK] Virtual environment already exists.
-)
-echo.
-
-REM ---------------------------------------------------------------
-REM 3. Install project dependencies
-REM ---------------------------------------------------------------
-echo Installing project dependencies ^(this can take a few minutes^)...
-"%PYEXE%" -m pip install --upgrade pip --quiet
-if errorlevel 1 (
-    echo [ERROR] Failed to upgrade pip. Check your internet connection.
-    pause
-    exit /b 1
+    if errorlevel 1 goto setup_error
 )
 
-"%PYEXE%" -m pip install -e ".[dev]" --quiet
-if errorlevel 1 (
-    echo [ERROR] Failed to install project dependencies.
-    pause
-    exit /b 1
-)
-echo [OK] Dependencies installed.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\setup.ps1"
+if errorlevel 1 goto setup_error
+call :validate_runtime
+if errorlevel 1 goto setup_error
+
+:launch
+echo Запускаю приложение: %APP_URL%
+echo Окно браузера откроется автоматически.
+echo Чтобы остановить приложение, закройте это окно.
 echo.
 
-REM ---------------------------------------------------------------
-REM 4. Check tesserocr, install the prebuilt Windows wheel if needed
-REM ---------------------------------------------------------------
-"%PYEXE%" -c "import tesserocr" >nul 2>nul
-if errorlevel 1 (
-    echo tesserocr not found, installing the prebuilt Windows wheel...
-    "%PYEXE%" -m pip install "https://github.com/simonflueckiger/tesserocr-windows_build/releases/download/tesserocr-v2.10.0-tesseract-5.5.2/tesserocr-2.10.0-cp312-cp312-win_amd64.whl"
-    if errorlevel 1 (
-        echo [ERROR] Failed to install tesserocr.
-        pause
-        exit /b 1
-    )
-    echo [OK] tesserocr installed.
-) else (
-    echo [OK] tesserocr already installed.
-)
-echo.
+"%APP_PYTHON%" -m gns_app.launcher
+set "APP_EXIT=%ERRORLEVEL%"
 
-REM ---------------------------------------------------------------
-REM 5. Lay out the OCR language models (rus/kir/osd)
-REM    First try the bundled models/ folder from this archive - it
-REM    is faster and needs no internet. Anything still missing gets
-REM    downloaded automatically.
-REM ---------------------------------------------------------------
-set "MODEL_ROOT=%LOCALAPPDATA%\GNSLetterAutomation\models"
-set "FAST_DST=%MODEL_ROOT%\tessdata_fast"
-set "BEST_DST=%MODEL_ROOT%\tessdata_best"
-
-if not exist "%FAST_DST%" mkdir "%FAST_DST%" >nul 2>nul
-if not exist "%BEST_DST%" mkdir "%BEST_DST%" >nul 2>nul
-
-if not exist "%FAST_DST%\rus.traineddata" (
-    echo Copying OCR language models...
-    if exist "models\tessdata_fast" (
-        xcopy /E /I /Y /Q "models\tessdata_fast" "%FAST_DST%" >nul
-    )
-    if exist "models\tessdata_best" (
-        xcopy /E /I /Y /Q "models\tessdata_best" "%BEST_DST%" >nul
-    )
-) else (
-    echo [OK] OCR language models already in place.
-)
-
-REM Download any language file still missing (e.g. if the models
-REM folder was removed from this archive for some reason).
-for %%L in (rus kir osd) do (
-    if not exist "%FAST_DST%\%%L.traineddata" (
-        echo Downloading model %%L ^(fast^)...
-        powershell -NoProfile -Command "try { Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main/%%L.traineddata' -OutFile '%FAST_DST%\%%L.traineddata' } catch { exit 1 }"
-    )
-    if not exist "%BEST_DST%\%%L.traineddata" (
-        echo Downloading model %%L ^(best^)...
-        powershell -NoProfile -Command "try { Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/tesseract-ocr/tessdata_best/main/%%L.traineddata' -OutFile '%BEST_DST%\%%L.traineddata' } catch { exit 1 }"
-    )
-)
-echo [OK] OCR language models are ready.
-echo.
-
-REM ---------------------------------------------------------------
-REM 6. Start the application
-REM ---------------------------------------------------------------
-echo ================================================================
-echo   Starting the application...
-echo   Open in your browser: http://127.0.0.1:8765
-echo   To stop the server, close this window or press Ctrl+C
-echo ================================================================
-echo.
-
-"%PYEXE%" -m gns_app.launcher
+rem Код 2 означает, что приложение уже было запущено; launcher уже открыл браузер.
+if "%APP_EXIT%"=="0" exit /b 0
+if "%APP_EXIT%"=="2" exit /b 0
 
 echo.
-echo Server stopped.
+echo Не удалось запустить приложение. Код ошибки: %APP_EXIT%
 pause
+exit /b %APP_EXIT%
+
+:no_python
+echo.
+echo Нужен Python 3.12 (64-bit). Установите его и снова откройте START.bat.
+echo https://www.python.org/downloads/release/python-3120/
+pause
+exit /b 1
+
+:setup_error
+echo.
+echo Не удалось подготовить приложение. Проверьте интернет и повторите запуск.
+pause
+exit /b 1
+
+:validate_runtime
+if not exist "%APP_PYTHON%" exit /b 1
+"%APP_PYTHON%" -c "import struct, sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) and struct.calcsize('P') * 8 == 64 else 1)" >nul 2>nul
+if errorlevel 1 exit /b 1
+"%APP_PYTHON%" -c "import gns_app, tesserocr" >nul 2>nul
+if errorlevel 1 exit /b 1
+for %%F in (
+    "%APP_FAST_MODELS%\rus.traineddata"
+    "%APP_FAST_MODELS%\kir.traineddata"
+    "%APP_FAST_MODELS%\osd.traineddata"
+    "%APP_BEST_MODELS%\rus.traineddata"
+    "%APP_BEST_MODELS%\kir.traineddata"
+    "%APP_BEST_MODELS%\osd.traineddata"
+) do (
+    if not exist "%%~F" exit /b 1
+    if %%~zF LEQ 0 exit /b 1
+)
+exit /b 0

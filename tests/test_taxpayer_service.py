@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from gns_app.services.taxpayer_service import TaxpayerKind, classify_taxpayer
+from gns_app.services.taxpayer_service import (
+    TaxpayerKind,
+    classify_taxpayer,
+    response_taxpayer_name,
+)
 
 
 def test_company_inn_prefixes_are_legal_entities():
@@ -23,3 +27,14 @@ def test_prefix_four_stays_unknown_without_organization_form():
 
 def test_legal_form_and_personal_pin_are_a_conflict():
     assert classify_taxpayer('ОсОО "Альфа"', "11412201510188") == TaxpayerKind.UNKNOWN
+
+
+def test_personal_name_gets_one_ip_prefix_in_response():
+    inn = "12909198201284"
+
+    assert response_taxpayer_name(
+        "Саматалиев Акмат Муратович", inn
+    ) == "ИП Саматалиев Акмат Муратович"
+    assert response_taxpayer_name(
+        "ИП Саматалиев Акмат Муратович", inn
+    ) == "ИП Саматалиев Акмат Муратович"
