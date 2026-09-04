@@ -376,6 +376,7 @@ CREATE TABLE IF NOT EXISTS outlook_outgoing_messages (
     subject TEXT NOT NULL,
     attachment_name TEXT NOT NULL,
     attachment_sha256 TEXT NOT NULL,
+    draft_key TEXT NOT NULL,
     outlook_entry_id TEXT,
     sent_at TEXT,
     error_message TEXT,
@@ -662,6 +663,21 @@ class Database:
         if "sent_at" not in existing:
             connection.execute(
                 "ALTER TABLE outlook_outgoing_messages ADD COLUMN sent_at TEXT"
+            )
+        if "draft_key" not in existing:
+            connection.execute(
+                "ALTER TABLE outlook_outgoing_messages ADD COLUMN draft_key TEXT"
+            )
+            connection.execute(
+                """
+                UPDATE outlook_outgoing_messages
+                SET draft_key = CASE
+                    WHEN lower(recipient_email) = 'esasabiyatov@gmail.com'
+                    THEN 'gns-test-scan-' || signed_scan_id
+                    ELSE 'gns-scan-' || signed_scan_id
+                END
+                WHERE draft_key IS NULL OR draft_key = ''
+                """
             )
 
     @staticmethod

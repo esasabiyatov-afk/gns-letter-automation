@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import shutil
 import subprocess
@@ -10,6 +11,7 @@ from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from pypdf import PdfWriter
 
 from gns_app.database import utc_now
@@ -27,6 +29,9 @@ from gns_app.services.outlook_service import (
     OutlookService,
     OutlookScannedAttachment,
     OutlookScannedMessage,
+    OutlookSentCandidate,
+    OutlookSentMatch,
+    OutlookSentScan,
     OutlookSendResult,
     PyWin32OutlookGateway,
     SubprocessOutlookGateway,
@@ -607,8 +612,13 @@ def test_com_gateway_creates_and_reopens_same_outlook_draft(
         def Display(self):
             self.display_count += 1
 
+    sending_account = SimpleNamespace(SmtpAddress="employee@bank.kg")
     namespace = SimpleNamespace(
-        GetDefaultFolder=lambda folder_id: SimpleNamespace(Items=items)
+        GetDefaultFolder=lambda folder_id: SimpleNamespace(Items=items),
+        Accounts=SimpleNamespace(
+            Count=1,
+            Item=lambda _index: sending_account,
+        ),
     )
     application = SimpleNamespace(
         GetNamespace=lambda name: namespace,
@@ -630,6 +640,7 @@ def test_com_gateway_creates_and_reopens_same_outlook_draft(
         body="",
         attachment_path=attachment,
         attachment_name=attachment.name,
+        sending_account="employee@bank.kg",
     )
     second = gateway.create_draft(
         draft_key="gns-scan-one",
@@ -638,15 +649,58 @@ def test_com_gateway_creates_and_reopens_same_outlook_draft(
         body="",
         attachment_path=attachment,
         attachment_name=attachment.name,
+        sending_account="employee@bank.kg",
     )
 
     assert not first.existing
     assert second.existing
     assert len(items.values) == 1
     assert len(items.values[0].Attachments.added) == 1
+    assert items.values[0].SendUsingAccount is sending_account
     assert items.values[0].display_count == 2
     assert items.values[0].GetInspector.WindowState == 2
     assert items.values[0].GetInspector.activate_count == 2
+
+    items.values.clear()
+    with pytest.raises(OutlookConnectionError, match="дождитесь обновления"):
+        gateway.create_draft(
+            draft_key="gns-scan-one",
+            recipient_email="recipient@example.test",
+            subject="Ответ № 9544",
+            body="",
+            attachment_path=attachment,
+            attachment_name=attachment.name,
+            create_if_missing=False,
+        )
+    assert items.values == []
+
+
+def test_com_gateway_selects_sent_folder_from_configured_account():
+    sent_folder = object()
+    delivery_store = SimpleNamespace(
+        GetDefaultFolder=lambda folder_id: (
+            sent_folder if folder_id == 5 else None
+        )
+    )
+    account = SimpleNamespace(
+        SmtpAddress="employee@bank.kg",
+        DeliveryStore=delivery_store,
+    )
+    namespace = SimpleNamespace(
+        Accounts=SimpleNamespace(Count=1, Item=lambda _index: account),
+        GetDefaultFolder=lambda _folder_id: pytest.fail(
+            "default store must not be used"
+        ),
+    )
+
+    selected = PyWin32OutlookGateway._select_default_folder(
+        namespace,
+        "employee@bank.kg",
+        5,
+        "Отправленные",
+    )
+
+    assert selected is sent_folder
 
 
 def test_com_gateway_sends_only_existing_pdf_draft_to_exact_account(
@@ -743,6 +797,338 @@ def test_com_gateway_sends_only_existing_pdf_draft_to_exact_account(
         raise AssertionError("Отправка не на тестовый адрес должна быть запрещена")
 
     assert mail.sent == 1
+
+
+def test_com_gateway_confirms_only_exact_sent_item(monkeypatch, tmp_path):
+    source_pdf = write_test_pdf(tmp_path / "Ответ_исх_9544.pdf")
+    expected_sha256 = hashlib.sha256(source_pdf.read_bytes()).hexdigest()
+
+    class Property:
+        Value = "gns-scan-confirmed"
+
+    class UserProperties:
+        @staticmethod
+        def Find(name):
+            return Property() if name == "GNS App Draft Key" else None
+
+    class Recipient:
+        Type = 1
+        Address = "recipient@example.test"
+        PropertyAccessor = SimpleNamespace(
+            GetProperty=lambda _schema: "recipient@example.test"
+        )
+
+    class Recipients:
+        Count = 1
+
+        @staticmethod
+        def Item(index):
+            assert index == 1
+            return Recipient()
+
+    class Attachment:
+        FileName = source_pdf.name
+        Size = source_pdf.stat().st_size
+
+        @staticmethod
+        def SaveAsFile(destination):
+            shutil.copyfile(source_pdf, destination)
+
+    class Attachments:
+        Count = 1
+
+        @staticmethod
+        def Item(index):
+            assert index == 1
+            return Attachment()
+
+    mail = SimpleNamespace(
+        Class=43,
+        EntryID="sent-entry-1",
+        SentOn=datetime(2026, 9, 4, 10, 30, 0),
+        Subject="Ответ № 9544",
+        UserProperties=UserProperties(),
+        Recipients=Recipients(),
+        Attachments=Attachments(),
+    )
+
+    class Items:
+        Count = 1
+
+        @staticmethod
+        def Sort(field, descending):
+            assert (field, descending) == ("[SentOn]", True)
+
+        @staticmethod
+        def Item(index):
+            assert index in {1, 2}
+            return mail
+
+    namespace = SimpleNamespace(
+        GetDefaultFolder=lambda folder_id: SimpleNamespace(Items=Items())
+    )
+    application = SimpleNamespace(GetNamespace=lambda _name: namespace)
+    monkeypatch.setitem(
+        sys.modules,
+        "pythoncom",
+        SimpleNamespace(CoInitialize=lambda: None, CoUninitialize=lambda: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "win32com",
+        SimpleNamespace(client=SimpleNamespace(Dispatch=lambda _name: application)),
+    )
+    from gns_app.services import outlook_service
+
+    watcher_finishes = []
+    monkeypatch.setattr(
+        outlook_service,
+        "start_outlook_certificate_dialog_watcher",
+        lambda **_kwargs: SimpleNamespace(
+            finish=lambda **kwargs: watcher_finishes.append(kwargs)
+        ),
+    )
+    staging_dir = outlook_service._prepare_outlook_staging_dir(
+        tmp_path / "sent-staging"
+    )
+    gateway = PyWin32OutlookGateway(allow_insecure_certificate=True)
+    scan = gateway.scan_sent_items(
+        candidates=(
+            OutlookSentCandidate(
+                draft_key="gns-scan-confirmed",
+                recipient_email="recipient@example.test",
+                subject="Ответ № 9544",
+                attachment_name=source_pdf.name,
+                attachment_sha256=expected_sha256,
+            ),
+        ),
+        sent_since=date(2026, 9, 3),
+        staging_dir=staging_dir,
+        max_attachment_bytes=10 * 1024 * 1024,
+    )
+
+    assert scan.inspected_mail_count == 1
+    assert scan.candidate_mail_count == 1
+    assert scan.rejected_mail_count == 0
+    assert scan.ambiguous_candidate_count == 0
+    assert scan.matches == (
+        OutlookSentMatch(
+            draft_key="gns-scan-confirmed",
+            entry_id="sent-entry-1",
+            sent_at="2026-09-04T10:30:00",
+        ),
+    )
+
+    Items.Count = 2
+    ambiguous = gateway.scan_sent_items(
+        candidates=(
+            OutlookSentCandidate(
+                draft_key="gns-scan-confirmed",
+                recipient_email="recipient@example.test",
+                subject="Ответ № 9544",
+                attachment_name=source_pdf.name,
+                attachment_sha256=expected_sha256,
+            ),
+        ),
+        sent_since=date(2026, 9, 3),
+        staging_dir=staging_dir,
+        max_attachment_bytes=10 * 1024 * 1024,
+    )
+    assert ambiguous.matches == ()
+    assert ambiguous.ambiguous_candidate_count == 1
+    assert watcher_finishes == [
+        {"grace_seconds": 0.0},
+        {"grace_seconds": 0.0},
+    ]
+
+
+def test_com_gateway_rejects_sent_item_with_different_recipient(
+    monkeypatch,
+    tmp_path,
+):
+    source_pdf = write_test_pdf(tmp_path / "Ответ.pdf")
+    expected_sha256 = hashlib.sha256(source_pdf.read_bytes()).hexdigest()
+    property_item = SimpleNamespace(Value="gns-scan-rejected")
+    recipient = SimpleNamespace(
+        Type=1,
+        Address="other@example.test",
+        PropertyAccessor=SimpleNamespace(
+            GetProperty=lambda _schema: "other@example.test"
+        ),
+    )
+    attachment = SimpleNamespace(
+        FileName=source_pdf.name,
+        Size=source_pdf.stat().st_size,
+        SaveAsFile=lambda destination: shutil.copyfile(source_pdf, destination),
+    )
+    mail = SimpleNamespace(
+        Class=43,
+        EntryID="sent-entry-rejected",
+        SentOn=datetime(2026, 9, 4, 11, 0, 0),
+        Subject="Ответ",
+        UserProperties=SimpleNamespace(
+            Find=lambda name: (
+                property_item if name == "GNS App Draft Key" else None
+            )
+        ),
+        Recipients=SimpleNamespace(Count=1, Item=lambda _index: recipient),
+        Attachments=SimpleNamespace(Count=1, Item=lambda _index: attachment),
+    )
+    items = SimpleNamespace(
+        Count=1,
+        Sort=lambda _field, _descending: None,
+        Item=lambda _index: mail,
+    )
+    application = SimpleNamespace(
+        GetNamespace=lambda _name: SimpleNamespace(
+            GetDefaultFolder=lambda _folder_id: SimpleNamespace(Items=items)
+        )
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "pythoncom",
+        SimpleNamespace(CoInitialize=lambda: None, CoUninitialize=lambda: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "win32com",
+        SimpleNamespace(client=SimpleNamespace(Dispatch=lambda _name: application)),
+    )
+    from gns_app.services import outlook_service
+
+    staging_dir = outlook_service._prepare_outlook_staging_dir(
+        tmp_path / "rejected-staging"
+    )
+    scan = PyWin32OutlookGateway().scan_sent_items(
+        candidates=(
+            OutlookSentCandidate(
+                draft_key="gns-scan-rejected",
+                recipient_email="recipient@example.test",
+                subject="Ответ",
+                attachment_name=source_pdf.name,
+                attachment_sha256=expected_sha256,
+            ),
+        ),
+        sent_since=date(2026, 9, 3),
+        staging_dir=staging_dir,
+        max_attachment_bytes=10 * 1024 * 1024,
+    )
+
+    assert scan.matches == ()
+    assert scan.rejected_mail_count == 1
+
+    recipient.Address = "recipient@example.test"
+    recipient.PropertyAccessor = SimpleNamespace(
+        GetProperty=lambda _schema: "recipient@example.test"
+    )
+    wrong_hash = PyWin32OutlookGateway().scan_sent_items(
+        candidates=(
+            OutlookSentCandidate(
+                draft_key="gns-scan-rejected",
+                recipient_email="recipient@example.test",
+                subject="Ответ",
+                attachment_name=source_pdf.name,
+                attachment_sha256="b" * 64,
+            ),
+        ),
+        sent_since=date(2026, 9, 3),
+        staging_dir=staging_dir,
+        max_attachment_bytes=10 * 1024 * 1024,
+    )
+    assert wrong_hash.matches == ()
+    assert wrong_hash.rejected_mail_count == 1
+
+
+def test_subprocess_gateway_serializes_sent_scan(monkeypatch, tmp_path):
+    from gns_app.services import outlook_service
+
+    watcher_finishes = []
+    monkeypatch.setattr(
+        outlook_service,
+        "start_outlook_certificate_dialog_watcher",
+        lambda **_kwargs: SimpleNamespace(
+            finish=lambda **kwargs: watcher_finishes.append(kwargs)
+        ),
+    )
+    gateway = SubprocessOutlookGateway(allow_insecure_certificate=True)
+    captured = {}
+
+    def fake_bridge(action, *, input_payload, timeout_seconds):
+        captured.update(
+            action=action,
+            input_payload=input_payload,
+            timeout_seconds=timeout_seconds,
+        )
+        return {
+            "ok": True,
+            "sent_scan": {
+                "inspected_mail_count": 1,
+                "candidate_mail_count": 0,
+                "rejected_mail_count": 0,
+                "ambiguous_candidate_count": 0,
+                "matches": [],
+            },
+        }
+
+    monkeypatch.setattr(gateway, "_call_bridge", fake_bridge)
+    staging_dir = outlook_service._prepare_outlook_staging_dir(
+        tmp_path / "subprocess-sent-staging"
+    )
+    candidate = OutlookSentCandidate(
+        draft_key="gns-scan-one",
+        recipient_email="recipient@example.test",
+        subject="Ответ",
+        attachment_name="Ответ.pdf",
+        attachment_sha256="a" * 64,
+    )
+
+    result = gateway.scan_sent_items(
+        candidates=(candidate,),
+        sent_since=date(2026, 9, 3),
+        staging_dir=staging_dir,
+        max_attachment_bytes=1024,
+        mailbox="mailbox@example.test",
+    )
+
+    assert result.matches == ()
+    assert captured["action"] == "sent"
+    assert captured["input_payload"]["candidates"] == [
+        {
+            "draft_key": "gns-scan-one",
+            "recipient_email": "recipient@example.test",
+            "subject": "Ответ",
+            "attachment_name": "Ответ.pdf",
+            "attachment_sha256": "a" * 64,
+        }
+    ]
+    assert captured["input_payload"]["mailbox"] == "mailbox@example.test"
+    assert captured["input_payload"]["allow_insecure_certificate"] is True
+    assert watcher_finishes == [{"grace_seconds": 0.0}]
+
+
+def test_sent_status_loop_runs_without_inbox_automation(monkeypatch):
+    from gns_app import main
+
+    class FakeOutgoing:
+        calls = 0
+
+        @classmethod
+        def reconcile_sent_messages(cls):
+            cls.calls += 1
+            return {"pending": 0, "confirmed": 0}
+
+    async def stop_after_first_check(_delay):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(main, "outlook_outgoing", FakeOutgoing())
+    monkeypatch.setattr(main.asyncio, "sleep", stop_after_first_check)
+
+    try:
+        asyncio.run(main._outlook_sent_status_loop())
+    except asyncio.CancelledError:
+        pass
+
+    assert FakeOutgoing.calls == 1
 
 
 def test_outlook_subject_template_accepts_only_known_placeholders(workflow):

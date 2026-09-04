@@ -24,9 +24,12 @@ from gns_app.domain import (
 from gns_app.services.workflow import WorkflowValidationError
 from gns_app.services.scanner_service import ScannerError
 from gns_app.services.outlook_service import (
+    OutlookConnectionError,
     OutlookDraftResult,
     OutlookIntegrationError,
     OutlookOutgoingService,
+    OutlookSentMatch,
+    OutlookSentScan,
     OutlookService,
 )
 
@@ -1407,10 +1410,13 @@ def test_confirmed_multi_page_scan_creates_one_idempotent_outlook_draft(
     class DraftGateway:
         def __init__(self):
             self.requests = []
+            self.missing_existing = False
 
         def create_draft(self, **request):
             assert request["attachment_path"].is_file()
             self.requests.append(request)
+            if self.missing_existing and not request["create_if_missing"]:
+                raise OutlookConnectionError("Черновик не найден")
             return OutlookDraftResult(
                 entry_id="outlook-entry-1",
                 recipient_email=request["recipient_email"],
@@ -1431,6 +1437,9 @@ def test_confirmed_multi_page_scan_creates_one_idempotent_outlook_draft(
 
     created = outgoing.create_draft(workflow, letter["id"])
     reopened = outgoing.create_draft(workflow, letter["id"])
+    gateway.missing_existing = True
+    with pytest.raises(OutlookConnectionError, match="не найден"):
+        outgoing.create_draft(workflow, letter["id"])
 
     assert created["status"] == "draft_created"
     assert created["recipient_email"] == "002lenin@sti.gov.kg"
@@ -1440,11 +1449,144 @@ def test_confirmed_multi_page_scan_creates_one_idempotent_outlook_draft(
     assert created["attachment_name"] == "Ответ_исх_9544.pdf"
     assert not created["existing_outlook_draft"]
     assert reopened["existing_outlook_draft"]
-    assert len(gateway.requests) == 2
+    assert len(gateway.requests) == 3
     assert gateway.requests[0]["draft_key"] == f"gns-scan-{scan['id']}"
+    assert gateway.requests[0]["create_if_missing"] is True
+    assert gateway.requests[1]["create_if_missing"] is False
+    assert gateway.requests[2]["create_if_missing"] is False
+    assert workflow.db.fetch_one(
+        "SELECT status FROM outlook_outgoing_messages WHERE id = ?",
+        (created["id"],),
+    ) == {"status": "draft_created"}
     assert workflow.db.fetch_one(
         "SELECT COUNT(*) AS count FROM outlook_outgoing_messages"
     )["count"] == 1
+
+
+def test_outlook_sent_reconciliation_updates_status_once(workflow, monkeypatch):
+    workflow.initialize_gns_offices()
+    workflow.initialize_gns_office_emails()
+    _, letter = _ready_response_letter(workflow)
+    workflow.set_outgoing_number(letter["id"], "9546")
+    scan = workflow.register_signed_response_scan(
+        letter["id"], "scan.png", _png_scan()
+    )
+    workflow.confirm_signed_response_scan(
+        scan["id"],
+        correct_letter=True,
+        signature_present=True,
+        bank_seal_present=True,
+    )
+
+    class Gateway:
+        def __init__(self):
+            self.draft_calls = 0
+            self.sent_scans = 0
+            self.fail_scan = True
+            self.simulate_competing_update = False
+
+        def create_draft(self, **request):
+            self.draft_calls += 1
+            return OutlookDraftResult(
+                entry_id="draft-entry",
+                recipient_email=request["recipient_email"],
+                subject=request["subject"],
+                attachment_name=request["attachment_name"],
+            )
+
+        def scan_sent_items(self, **request):
+            self.sent_scans += 1
+            if self.fail_scan:
+                raise OutlookConnectionError("Outlook временно недоступен")
+            candidate = request["candidates"][0]
+            if self.simulate_competing_update:
+                workflow.db.execute(
+                    "UPDATE outlook_outgoing_messages SET status = 'sent' "
+                    "WHERE draft_key = ?",
+                    (candidate.draft_key,),
+                )
+            return OutlookSentScan(
+                inspected_mail_count=1,
+                candidate_mail_count=1,
+                rejected_mail_count=0,
+                ambiguous_candidate_count=0,
+                matches=(
+                    OutlookSentMatch(
+                        draft_key=candidate.draft_key,
+                        entry_id="sent-entry",
+                        sent_at="2026-09-04T10:30:00+06:00",
+                    ),
+                ),
+            )
+
+    gateway = Gateway()
+    outgoing = OutlookOutgoingService(
+        workflow.db,
+        workflow.settings,
+        OutlookService(gateway),
+    )
+    created = outgoing.create_draft(workflow, letter["id"])
+    with pytest.raises(OutlookConnectionError, match="временно недоступен"):
+        outgoing.reconcile_sent_messages()
+    unchanged = workflow.db.fetch_one(
+        "SELECT status FROM outlook_outgoing_messages WHERE id = ?",
+        (created["id"],),
+    )
+    gateway.fail_scan = False
+    first = outgoing.reconcile_sent_messages()
+    second = outgoing.reconcile_sent_messages()
+
+    stored = workflow.db.fetch_one(
+        "SELECT status, outlook_entry_id, sent_at, draft_key "
+        "FROM outlook_outgoing_messages WHERE id = ?",
+        (created["id"],),
+    )
+    workflow.db.execute(
+        "UPDATE outlook_outgoing_messages SET status = 'draft_created' "
+        "WHERE id = ?",
+        (created["id"],),
+    )
+    gateway.simulate_competing_update = True
+    raced = outgoing.reconcile_sent_messages()
+    audits = workflow.db.fetch_one(
+        "SELECT COUNT(*) AS count FROM audit_events "
+        "WHERE entity_id = ? AND event_type = 'outlook_sent_confirmed'",
+        (created["id"],),
+    )
+    assert first["confirmed"] == 1
+    assert unchanged == {"status": "draft_created"}
+    assert second["pending"] == 0
+    assert raced["confirmed"] == 0
+    assert gateway.sent_scans == 3
+    assert stored == {
+        "status": "sent",
+        "outlook_entry_id": "sent-entry",
+        "sent_at": "2026-09-04T10:30:00+06:00",
+        "draft_key": f"gns-scan-{scan['id']}",
+    }
+    assert audits["count"] == 1
+    with pytest.raises(OutlookIntegrationError, match="уже отправлено"):
+        outgoing.create_draft(workflow, letter["id"])
+    assert gateway.draft_calls == 1
+
+    from starlette.testclient import TestClient
+
+    from gns_app import main
+
+    monkeypatch.setattr(main, "workflow", workflow)
+    client = TestClient(main.app)
+    page = client.get(
+        "/?tab=responses&response_view=created"
+    )
+    assert page.status_code == 200
+    assert "Отправлено" in page.text
+    assert "2026-09-04 10:30" in page.text
+    assert "Подтверждено Outlook" in page.text
+    assert "Подготовить письмо в Outlook" not in page.text
+    history = client.get("/history")
+    assert history.status_code == 200
+    assert "Отправлено" in history.text
+    assert "2026-09-04 10:30" in history.text
 
 
 def test_outlook_draft_requires_confirmed_scan(workflow):

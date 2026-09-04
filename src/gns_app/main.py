@@ -71,6 +71,7 @@ outlook_importer = OutlookInboxImporter(db, settings, outlook)
 outlook_outgoing = OutlookOutgoingService(db, settings, outlook)
 _outlook_import_activity_lock = Lock()
 _outlook_import_active = False
+OUTLOOK_SENT_CHECK_INTERVAL_SECONDS = 30
 
 
 def _claim_outlook_import() -> bool:
@@ -200,6 +201,22 @@ async def _outlook_automation_loop() -> None:
         await asyncio.sleep(delay_seconds)
 
 
+async def _outlook_sent_status_loop() -> None:
+    while True:
+        delay_seconds = OUTLOOK_SENT_CHECK_INTERVAL_SECONDS
+        try:
+            await asyncio.to_thread(outlook_outgoing.reconcile_sent_messages)
+        except OutlookIntegrationError as exc:
+            record_exception("outlook", "scan_sent_items", exc)
+            delay_seconds = 5 * 60
+        except Exception as exc:
+            # Ошибка Outlook не означает, что письмо не отправлено. Статус
+            # черновика сохраняется, а следующая проверка повторит попытку.
+            record_exception("outlook", "scan_sent_items", exc)
+            delay_seconds = 5 * 60
+        await asyncio.sleep(delay_seconds)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     record_event(
@@ -257,12 +274,16 @@ async def lifespan(_: FastAPI):
     if resume_ids:
         asyncio.create_task(_resume_interrupted_uploads(resume_ids))
     outlook_task = asyncio.create_task(_outlook_automation_loop())
+    outlook_sent_task = asyncio.create_task(_outlook_sent_status_loop())
     try:
         yield
     finally:
         outlook_task.cancel()
+        outlook_sent_task.cancel()
         with suppress(asyncio.CancelledError):
             await outlook_task
+        with suppress(asyncio.CancelledError):
+            await outlook_sent_task
         record_event(
             "application",
             "shutdown",
@@ -410,6 +431,7 @@ EVENT_LABELS = {
     "outlook_draft_failed": "Ошибка создания черновика Outlook",
     "outlook_test_message_sent": "Отправлено тестовое письмо Outlook",
     "outlook_test_send_failed": "Ошибка тестовой отправки Outlook",
+    "outlook_sent_confirmed": "Отправка подтверждена папкой Outlook",
     "gns_offices_replaced": "Обновлён справочник налоговых органов",
     "gns_office_emails_updated": "Обновлены официальные email подразделений",
     "gns_office_location_expanded": "Район дополнен областью или городом",

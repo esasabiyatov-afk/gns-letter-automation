@@ -35,6 +35,7 @@ from gns_app.services.windows_focus import (
 
 
 OL_FOLDER_INBOX = 6
+OL_FOLDER_SENT_MAIL = 5
 OL_FOLDER_DRAFTS = 16
 OL_MAIL_ITEM = 0
 OL_WINDOW_STATE_MINIMIZED = 1
@@ -473,6 +474,65 @@ class OutlookSendResult:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class OutlookSentCandidate:
+    draft_key: str
+    recipient_email: str
+    subject: str
+    attachment_name: str
+    attachment_sha256: str
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "OutlookSentCandidate":
+        return cls(
+            draft_key=str(payload.get("draft_key") or ""),
+            recipient_email=str(payload.get("recipient_email") or ""),
+            subject=str(payload.get("subject") or ""),
+            attachment_name=str(payload.get("attachment_name") or ""),
+            attachment_sha256=str(payload.get("attachment_sha256") or ""),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OutlookSentMatch:
+    draft_key: str
+    entry_id: str
+    sent_at: str
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "OutlookSentMatch":
+        return cls(
+            draft_key=str(payload.get("draft_key") or ""),
+            entry_id=str(payload.get("entry_id") or ""),
+            sent_at=str(payload.get("sent_at") or ""),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class OutlookSentScan:
+    inspected_mail_count: int
+    candidate_mail_count: int
+    rejected_mail_count: int
+    ambiguous_candidate_count: int
+    matches: tuple[OutlookSentMatch, ...]
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "OutlookSentScan":
+        return cls(
+            inspected_mail_count=int(payload.get("inspected_mail_count") or 0),
+            candidate_mail_count=int(payload.get("candidate_mail_count") or 0),
+            rejected_mail_count=int(payload.get("rejected_mail_count") or 0),
+            ambiguous_candidate_count=int(
+                payload.get("ambiguous_candidate_count") or 0
+            ),
+            matches=tuple(
+                OutlookSentMatch.from_dict(item)
+                for item in payload.get("matches", [])
+                if isinstance(item, dict)
+            ),
+        )
+
+
 class OutlookGateway(Protocol):
     def inspect(
         self,
@@ -490,6 +550,8 @@ class OutlookGateway(Protocol):
         body: str,
         attachment_path: Path,
         attachment_name: str,
+        sending_account: str = "",
+        create_if_missing: bool = True,
     ) -> OutlookDraftResult: ...
 
     def send_draft(
@@ -499,6 +561,16 @@ class OutlookGateway(Protocol):
         recipient_email: str,
         sending_account: str,
     ) -> OutlookSendResult: ...
+
+    def scan_sent_items(
+        self,
+        *,
+        candidates: tuple[OutlookSentCandidate, ...],
+        sent_since: date,
+        staging_dir: Path,
+        max_attachment_bytes: int,
+        mailbox: str = "",
+    ) -> OutlookSentScan: ...
 
 
 class OutlookWorkflow(Protocol):
@@ -578,10 +650,45 @@ class PyWin32OutlookGateway:
             return
 
     @staticmethod
-    def _select_inbox(namespace: Any, mailbox: str) -> Any:
+    def _select_default_folder(
+        namespace: Any,
+        mailbox: str,
+        folder_id: int,
+        folder_label: str,
+    ) -> Any:
         mailbox_name = mailbox.strip().casefold()
         if not mailbox_name:
-            return namespace.GetDefaultFolder(OL_FOLDER_INBOX)
+            return namespace.GetDefaultFolder(folder_id)
+
+        accounts = _safe_attribute(namespace, "Accounts", None)
+        account_count = int(_safe_attribute(accounts, "Count", 0) or 0)
+        account_matches: list[Any] = []
+        for index in range(1, account_count + 1):
+            try:
+                account = accounts.Item(index)
+                smtp_address = _safe_text(
+                    _safe_attribute(account, "SmtpAddress")
+                ).casefold()
+                delivery_store = _safe_attribute(account, "DeliveryStore", None)
+                store_name = _safe_text(
+                    _safe_attribute(delivery_store, "DisplayName")
+                ).casefold()
+                if mailbox_name in {smtp_address, store_name}:
+                    account_matches.append(account)
+            except Exception:
+                continue
+        if len(account_matches) == 1:
+            delivery_store = _safe_attribute(
+                account_matches[0], "DeliveryStore", None
+            )
+            if delivery_store is not None:
+                try:
+                    return delivery_store.GetDefaultFolder(folder_id)
+                except Exception as exc:
+                    raise OutlookConnectionError(
+                        f"Outlook не открыл папку «{folder_label}» "
+                        "выбранной учётной записи."
+                    ) from exc
 
         stores = _safe_attribute(namespace, "Stores", None)
         store_count = int(_safe_attribute(stores, "Count", 0) or 0)
@@ -610,11 +717,20 @@ class PyWin32OutlookGateway:
                 "Укажите его точное имя."
             )
         try:
-            return matches[0].GetDefaultFolder(OL_FOLDER_INBOX)
+            return matches[0].GetDefaultFolder(folder_id)
         except Exception as exc:
             raise OutlookConnectionError(
-                "Outlook не открыл папку «Входящие» выбранного ящика."
+                f"Outlook не открыл папку «{folder_label}» выбранного ящика."
             ) from exc
+
+    @classmethod
+    def _select_inbox(cls, namespace: Any, mailbox: str) -> Any:
+        return cls._select_default_folder(
+            namespace,
+            mailbox,
+            OL_FOLDER_INBOX,
+            "Входящие",
+        )
 
     def inspect(
         self,
@@ -762,6 +878,8 @@ class PyWin32OutlookGateway:
         body: str,
         attachment_path: Path,
         attachment_name: str,
+        sending_account: str = "",
+        create_if_missing: bool = True,
     ) -> OutlookDraftResult:
         if sys.platform != "win32":
             raise OutlookUnsupportedPlatformError(
@@ -771,6 +889,15 @@ class PyWin32OutlookGateway:
             raise OutlookConnectionError("Получатель Outlook указан неверно.")
         if not draft_key.strip() or len(draft_key) > 128:
             raise OutlookConnectionError("Ключ черновика Outlook указан неверно.")
+        account_identifier = sending_account.strip().casefold()
+        if (
+            len(account_identifier) > 255
+            or "\n" in account_identifier
+            or "\r" in account_identifier
+        ):
+            raise OutlookConnectionError(
+                "Учётная запись отправителя Outlook указана неверно."
+            )
         if not subject.strip() or len(subject) > 255 or "\n" in subject or "\r" in subject:
             raise OutlookConnectionError("Тема письма Outlook указана неверно.")
         source = attachment_path.resolve()
@@ -795,12 +922,43 @@ class PyWin32OutlookGateway:
             mail = self._find_existing_draft(namespace, draft_key)
             existing = mail is not None
             if mail is None:
+                if not create_if_missing:
+                    raise OutlookConnectionError(
+                        "Черновик уже был создан, но сейчас не найден в Outlook. "
+                        "Если письмо отправлено, дождитесь обновления статуса."
+                    )
                 stage = "create_item"
                 mail = application.CreateItem(OL_MAIL_ITEM)
                 stage = "fill_fields"
                 mail.To = recipient_email.strip().casefold()
                 mail.Subject = subject.strip()
                 mail.Body = body
+                if account_identifier:
+                    stage = "select_account"
+                    accounts = _safe_attribute(namespace, "Accounts", None)
+                    account_count = int(
+                        _safe_attribute(accounts, "Count", 0) or 0
+                    )
+                    matches = []
+                    for index in range(1, account_count + 1):
+                        account = accounts.Item(index)
+                        smtp = _safe_text(
+                            _safe_attribute(account, "SmtpAddress")
+                        ).casefold()
+                        delivery_store = _safe_attribute(
+                            account, "DeliveryStore", None
+                        )
+                        store_name = _safe_text(
+                            _safe_attribute(delivery_store, "DisplayName")
+                        ).casefold()
+                        if account_identifier in {smtp, store_name}:
+                            matches.append(account)
+                    if len(matches) != 1:
+                        raise OutlookConnectionError(
+                            "Учётная запись отправителя не выбрана однозначно. "
+                            "Проверьте почтовый ящик в настройках Outlook."
+                        )
+                    mail.SendUsingAccount = matches[0]
                 stage = "set_deduplication_key"
                 properties = mail.UserProperties
                 property_item = properties.Add(
@@ -980,6 +1138,242 @@ class PyWin32OutlookGateway:
                 f"Этап: {stage}."
             ) from exc
         finally:
+            pythoncom.CoUninitialize()
+
+    @classmethod
+    def _single_recipient_smtp(cls, mail: Any) -> str:
+        recipients = _safe_attribute(mail, "Recipients", None)
+        if int(_safe_attribute(recipients, "Count", 0) or 0) != 1:
+            return ""
+        try:
+            recipient = recipients.Item(1)
+        except Exception:
+            return ""
+        if int(_safe_attribute(recipient, "Type", 1) or 0) != 1:
+            return ""
+        address = cls._mapi_property(recipient, PR_SMTP_ADDRESS)
+        if not address:
+            address_entry = _safe_attribute(recipient, "AddressEntry", None)
+            address = cls._mapi_property(address_entry, PR_SMTP_ADDRESS)
+        if not address:
+            address = _safe_text(_safe_attribute(recipient, "Address"))
+        return address.casefold()
+
+    @staticmethod
+    def _saved_attachment_sha256(
+        attachment: Any,
+        destination: Path,
+        max_attachment_bytes: int,
+    ) -> str:
+        try:
+            attachment.SaveAsFile(str(destination))
+            digest = hashlib.sha256()
+            total = 0
+            with destination.open("rb") as source:
+                if source.read(5) != b"%PDF-":
+                    return ""
+                source.seek(0)
+                while chunk := source.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > max_attachment_bytes:
+                        return ""
+                    digest.update(chunk)
+            return digest.hexdigest()
+        except (OSError, RuntimeError):
+            return ""
+        finally:
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def scan_sent_items(
+        self,
+        *,
+        candidates: tuple[OutlookSentCandidate, ...],
+        sent_since: date,
+        staging_dir: Path,
+        max_attachment_bytes: int,
+        mailbox: str = "",
+    ) -> OutlookSentScan:
+        """Find sent copies that exactly match app-created Outlook drafts."""
+
+        if not candidates:
+            return OutlookSentScan(0, 0, 0, 0, ())
+        if sys.platform != "win32":
+            raise OutlookUnsupportedPlatformError(
+                "Интеграция Outlook доступна только в Windows."
+            )
+        candidate_by_key: dict[str, OutlookSentCandidate] = {}
+        for candidate in candidates:
+            key = candidate.draft_key.strip()
+            recipient = candidate.recipient_email.strip().casefold()
+            digest = candidate.attachment_sha256.strip().casefold()
+            if (
+                not key
+                or len(key) > 128
+                or key in candidate_by_key
+                or not EMAIL_RE.fullmatch(recipient)
+                or not candidate.subject.strip()
+                or len(candidate.subject) > 255
+                or not candidate.attachment_name.strip()
+                or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            ):
+                raise OutlookConnectionError(
+                    "Данные ожидаемого исходящего письма некорректны."
+                )
+            candidate_by_key[key] = OutlookSentCandidate(
+                draft_key=key,
+                recipient_email=recipient,
+                subject=candidate.subject.strip(),
+                attachment_name=candidate.attachment_name.strip(),
+                attachment_sha256=digest,
+            )
+        staging_dir = _require_outlook_worker_staging_dir(staging_dir)
+        try:
+            import pythoncom  # type: ignore[import-not-found]
+            from win32com import client  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise OutlookComponentMissingError(
+                "Не установлен локальный компонент связи с Outlook. "
+                "Повторно запустите START.bat."
+            ) from exc
+
+        pythoncom.CoInitialize()
+        certificate_watcher = (
+            start_outlook_certificate_dialog_watcher()
+            if self.allow_insecure_certificate
+            else None
+        )
+        stage = "connect"
+        try:
+            application = self._connect_outlook_application(client)
+            stage = "open_mapi"
+            namespace = application.GetNamespace("MAPI")
+            stage = "open_sent_items"
+            sent_folder = self._select_default_folder(
+                namespace,
+                mailbox,
+                OL_FOLDER_SENT_MAIL,
+                "Отправленные",
+            )
+            items = sent_folder.Items
+            sorted_by_sent_time = False
+            try:
+                items.Sort("[SentOn]", True)
+                sorted_by_sent_time = True
+            except Exception:
+                pass
+
+            inspected = 0
+            candidate_mails = 0
+            rejected = 0
+            exact_by_key: dict[str, list[OutlookSentMatch]] = {}
+            item_count = int(_safe_attribute(items, "Count", 0) or 0)
+            for item_index in range(1, item_count + 1):
+                try:
+                    mail = items.Item(item_index)
+                    if int(_safe_attribute(mail, "Class", 0) or 0) != 43:
+                        continue
+                    inspected += 1
+                    sent_on = _safe_attribute(mail, "SentOn", None)
+                    if sent_on is None:
+                        continue
+                    try:
+                        sent_day = sent_on.date()
+                    except (AttributeError, TypeError, ValueError):
+                        continue
+                    if sent_day < sent_since:
+                        if sorted_by_sent_time:
+                            break
+                        continue
+                    draft_key = self._draft_key(mail)
+                    candidate = candidate_by_key.get(draft_key)
+                    if candidate is None:
+                        continue
+                    candidate_mails += 1
+                    if self._single_recipient_smtp(mail) != (
+                        candidate.recipient_email
+                    ):
+                        rejected += 1
+                        continue
+                    if _safe_text(_safe_attribute(mail, "Subject")) != (
+                        candidate.subject
+                    ):
+                        rejected += 1
+                        continue
+                    attachments = _safe_attribute(mail, "Attachments", None)
+                    if int(_safe_attribute(attachments, "Count", 0) or 0) != 1:
+                        rejected += 1
+                        continue
+                    attachment = attachments.Item(1)
+                    filename = _safe_text(
+                        _safe_attribute(attachment, "FileName")
+                    )
+                    if (
+                        filename.casefold()
+                        != candidate.attachment_name.casefold()
+                        or not filename.casefold().endswith(".pdf")
+                        or int(_safe_attribute(attachment, "Size", 0) or 0)
+                        > max_attachment_bytes
+                    ):
+                        rejected += 1
+                        continue
+                    temporary_path = ensure_within(
+                        staging_dir
+                        / f"sent-{hashlib.sha256(draft_key.encode()).hexdigest()[:20]}-{item_index}.pdf.part",
+                        staging_dir,
+                    )
+                    actual_sha256 = self._saved_attachment_sha256(
+                        attachment,
+                        temporary_path,
+                        max_attachment_bytes,
+                    )
+                    entry_id = _safe_text(_safe_attribute(mail, "EntryID"))
+                    if actual_sha256 != candidate.attachment_sha256 or not entry_id:
+                        rejected += 1
+                        continue
+                    exact_by_key.setdefault(draft_key, []).append(
+                        OutlookSentMatch(
+                            draft_key=draft_key,
+                            entry_id=entry_id,
+                            sent_at=sent_on.isoformat(),
+                        )
+                    )
+                except Exception:
+                    rejected += 1
+                    continue
+            ambiguous = sum(
+                1 for values in exact_by_key.values() if len(values) > 1
+            )
+            matches = tuple(
+                values[0]
+                for values in exact_by_key.values()
+                if len(values) == 1
+            )
+            return OutlookSentScan(
+                inspected_mail_count=inspected,
+                candidate_mail_count=candidate_mails,
+                rejected_mail_count=rejected,
+                ambiguous_candidate_count=ambiguous,
+                matches=matches,
+            )
+        except OutlookIntegrationError:
+            raise
+        except Exception as exc:
+            record_exception(
+                "outlook_worker",
+                "scan_sent_items",
+                exc,
+                details={"stage": stage},
+            )
+            raise OutlookConnectionError(
+                "Outlook не смог проверить папку «Отправленные». "
+                f"Этап: {stage}."
+            ) from exc
+        finally:
+            if certificate_watcher is not None:
+                certificate_watcher.finish(grace_seconds=0.0)
             pythoncom.CoUninitialize()
 
     @staticmethod
@@ -1436,6 +1830,8 @@ class SubprocessOutlookGateway:
         body: str,
         attachment_path: Path,
         attachment_name: str,
+        sending_account: str = "",
+        create_if_missing: bool = True,
     ) -> OutlookDraftResult:
         payload = self._call_bridge(
             "draft",
@@ -1447,6 +1843,8 @@ class SubprocessOutlookGateway:
                 "body": body,
                 "attachment_path": str(attachment_path),
                 "attachment_name": attachment_name,
+                "sending_account": sending_account,
+                "create_if_missing": create_if_missing,
             },
             timeout_seconds=max(120, self.timeout_seconds),
         )
@@ -1480,6 +1878,44 @@ class SubprocessOutlookGateway:
                 "Модуль Outlook не вернул результат тестовой отправки."
             )
         return OutlookSendResult.from_dict(send_payload)
+
+    def scan_sent_items(
+        self,
+        *,
+        candidates: tuple[OutlookSentCandidate, ...],
+        sent_since: date,
+        staging_dir: Path,
+        max_attachment_bytes: int,
+        mailbox: str = "",
+    ) -> OutlookSentScan:
+        staging_dir = _require_outlook_worker_staging_dir(staging_dir)
+        certificate_watcher = (
+            start_outlook_certificate_dialog_watcher(timeout_seconds=20.0)
+            if self.allow_insecure_certificate
+            else None
+        )
+        try:
+            payload = self._call_bridge(
+                "sent",
+                input_payload={
+                    "allow_insecure_certificate": self.allow_insecure_certificate,
+                    "candidates": [asdict(candidate) for candidate in candidates],
+                    "sent_since": sent_since.isoformat(),
+                    "staging_dir": str(staging_dir),
+                    "max_attachment_bytes": max_attachment_bytes,
+                    "mailbox": mailbox,
+                },
+                timeout_seconds=max(120, self.timeout_seconds),
+            )
+        finally:
+            if certificate_watcher is not None:
+                certificate_watcher.finish(grace_seconds=0.0)
+        scan_payload = payload.get("sent_scan")
+        if not isinstance(scan_payload, dict):
+            raise OutlookConnectionError(
+                "Модуль Outlook не вернул результат проверки отправки."
+            )
+        return OutlookSentScan.from_dict(scan_payload)
 
     def _call_bridge(
         self,
@@ -1585,6 +2021,7 @@ class OutlookService:
     def __init__(self, gateway: OutlookGateway | None = None):
         self.gateway = gateway or SubprocessOutlookGateway()
         self._lock = RLock()
+        self._operation_lock = RLock()
         self._last_result = OutlookDiagnosticResult(
             state="not_checked",
             checked_at="",
@@ -1622,16 +2059,17 @@ class OutlookService:
             raise OutlookConnectionError(
                 "Текущий адаптер Outlook не поддерживает импорт вложений."
             )
-        return scanner(
-            allowed_senders=allowed_senders,
-            allowed_domains=allowed_domains,
-            received_since=received_since,
-            known_message_keys=known_message_keys,
-            staging_dir=staging_dir,
-            max_attachment_bytes=max_attachment_bytes,
-            forwarding_senders=forwarding_senders,
-            mailbox=mailbox,
-        )
+        with self._operation_lock:
+            return scanner(
+                allowed_senders=allowed_senders,
+                allowed_domains=allowed_domains,
+                received_since=received_since,
+                known_message_keys=known_message_keys,
+                staging_dir=staging_dir,
+                max_attachment_bytes=max_attachment_bytes,
+                forwarding_senders=forwarding_senders,
+                mailbox=mailbox,
+            )
 
     def create_draft(
         self,
@@ -1642,20 +2080,25 @@ class OutlookService:
         body: str,
         attachment_path: Path,
         attachment_name: str,
+        sending_account: str = "",
+        create_if_missing: bool = True,
     ) -> OutlookDraftResult:
         creator = getattr(self.gateway, "create_draft", None)
         if creator is None:
             raise OutlookConnectionError(
                 "Текущий адаптер Outlook не поддерживает исходящие черновики."
             )
-        return creator(
-            draft_key=draft_key,
-            recipient_email=recipient_email,
-            subject=subject,
-            body=body,
-            attachment_path=attachment_path,
-            attachment_name=attachment_name,
-        )
+        with self._operation_lock:
+            return creator(
+                draft_key=draft_key,
+                recipient_email=recipient_email,
+                subject=subject,
+                body=body,
+                attachment_path=attachment_path,
+                attachment_name=attachment_name,
+                sending_account=sending_account,
+                create_if_missing=create_if_missing,
+            )
 
     def send_draft(
         self,
@@ -1669,11 +2112,35 @@ class OutlookService:
             raise OutlookConnectionError(
                 "Текущий адаптер Outlook не поддерживает тестовую отправку."
             )
-        return sender(
-            draft_key=draft_key,
-            recipient_email=recipient_email,
-            sending_account=sending_account,
-        )
+        with self._operation_lock:
+            return sender(
+                draft_key=draft_key,
+                recipient_email=recipient_email,
+                sending_account=sending_account,
+            )
+
+    def scan_sent_items(
+        self,
+        *,
+        candidates: tuple[OutlookSentCandidate, ...],
+        sent_since: date,
+        staging_dir: Path,
+        max_attachment_bytes: int,
+        mailbox: str = "",
+    ) -> OutlookSentScan:
+        scanner = getattr(self.gateway, "scan_sent_items", None)
+        if scanner is None:
+            raise OutlookConnectionError(
+                "Текущий адаптер Outlook не поддерживает проверку отправки."
+            )
+        with self._operation_lock:
+            return scanner(
+                candidates=candidates,
+                sent_since=sent_since,
+                staging_dir=staging_dir,
+                max_attachment_bytes=max_attachment_bytes,
+                mailbox=mailbox,
+            )
 
     def _run(
         self,
@@ -1684,10 +2151,11 @@ class OutlookService:
         started = time.monotonic()
         checked_at = datetime.now().astimezone().strftime("%d.%m.%Y %H:%M:%S")
         try:
-            probe = self.gateway.inspect(
-                request_sync=request_sync,
-                mailbox=mailbox,
-            )
+            with self._operation_lock:
+                probe = self.gateway.inspect(
+                    request_sync=request_sync,
+                    mailbox=mailbox,
+                )
             if request_sync:
                 state = "sync_requested"
                 message = (
@@ -1785,11 +2253,14 @@ class OutlookOutgoingService:
         )
 
     def get_sending_account(self) -> str:
+        value = self.get_mailbox().casefold()
+        return value if EMAIL_RE.fullmatch(value) else ""
+
+    def get_mailbox(self) -> str:
         row = self.db.fetch_one(
             "SELECT value FROM settings WHERE key = 'outlook_mailbox'"
         )
-        value = str(row["value"]).strip().casefold() if row else ""
-        return value if EMAIL_RE.fullmatch(value) else ""
+        return str(row["value"]).strip() if row else ""
 
     @classmethod
     def validate_subject_template(cls, value: str) -> str:
@@ -1968,46 +2439,57 @@ class OutlookOutgoingService:
             f"Ответ_исх_{outgoing_number}.pdf"
         )
         attachment_sha256 = self._sha256_file(pdf_path)
+        draft_key = (
+            f"gns-test-scan-{scan['id']}"
+            if test_recipient
+            else f"gns-scan-{scan['id']}"
+        )
         message_id = uuid4().hex
         existing = self.db.fetch_one(
             "SELECT * FROM outlook_outgoing_messages WHERE signed_scan_id = ?",
             (scan["id"],),
         )
+        reopening_existing = bool(
+            existing and existing.get("status") == "draft_created"
+        )
         if existing:
-            if test_recipient and existing.get("status") == "sent":
+            if existing.get("status") == "sent":
                 raise OutlookIntegrationError(
-                    "Тестовое письмо с этим PDF уже отправлено."
+                    "Письмо с этим PDF уже отправлено."
                 )
             message_id = str(existing["id"])
         now = utc_now()
-        self.db.execute(
-            """
-            INSERT INTO outlook_outgoing_messages(
-                id, response_letter_id, signed_scan_id, status,
-                recipient_email, subject, attachment_name,
-                attachment_sha256, created_at, updated_at
-            ) VALUES (?, ?, ?, 'creating', ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(signed_scan_id) DO UPDATE SET
-                status = 'creating',
-                recipient_email = excluded.recipient_email,
-                subject = excluded.subject,
-                attachment_name = excluded.attachment_name,
-                attachment_sha256 = excluded.attachment_sha256,
-                error_message = NULL,
-                updated_at = excluded.updated_at
-            """,
-            (
-                message_id,
-                letter_id,
-                scan["id"],
-                recipient_email,
-                subject,
-                attachment_name,
-                attachment_sha256,
-                now,
-                now,
-            ),
-        )
+        if not reopening_existing:
+            self.db.execute(
+                """
+                INSERT INTO outlook_outgoing_messages(
+                    id, response_letter_id, signed_scan_id, status,
+                    recipient_email, subject, attachment_name,
+                    attachment_sha256, draft_key, created_at, updated_at
+                ) VALUES (?, ?, ?, 'creating', ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(signed_scan_id) DO UPDATE SET
+                    status = 'creating',
+                    recipient_email = excluded.recipient_email,
+                    subject = excluded.subject,
+                    attachment_name = excluded.attachment_name,
+                    attachment_sha256 = excluded.attachment_sha256,
+                    draft_key = excluded.draft_key,
+                    error_message = NULL,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    message_id,
+                    letter_id,
+                    scan["id"],
+                    recipient_email,
+                    subject,
+                    attachment_name,
+                    attachment_sha256,
+                    draft_key,
+                    now,
+                    now,
+                ),
+            )
 
         staging_root = ensure_within(
             self.settings.runtime_dir / "outlook_outgoing_staging",
@@ -2019,26 +2501,25 @@ class OutlookOutgoingService:
             run_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(pdf_path, attachment_path)
             result = self.outlook.create_draft(
-                draft_key=(
-                    f"gns-test-scan-{scan['id']}"
-                    if test_recipient
-                    else f"gns-scan-{scan['id']}"
-                ),
+                draft_key=draft_key,
                 recipient_email=recipient_email,
                 subject=subject,
                 body="",
                 attachment_path=attachment_path,
                 attachment_name=attachment_name,
+                sending_account=self.get_mailbox(),
+                create_if_missing=not reopening_existing,
             )
         except OutlookIntegrationError as exc:
-            self.db.execute(
-                """
-                UPDATE outlook_outgoing_messages
-                SET status = 'technical_error', error_message = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (str(exc)[:500], utc_now(), message_id),
-            )
+            if not reopening_existing:
+                self.db.execute(
+                    """
+                    UPDATE outlook_outgoing_messages
+                    SET status = 'technical_error', error_message = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (str(exc)[:500], utc_now(), message_id),
+                )
             self.db.audit(
                 "outlook_outgoing_message",
                 message_id,
@@ -2049,14 +2530,15 @@ class OutlookOutgoingService:
             raise
         except OSError as exc:
             message = "Не удалось подготовить PDF для Outlook."
-            self.db.execute(
-                """
-                UPDATE outlook_outgoing_messages
-                SET status = 'technical_error', error_message = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (message, utc_now(), message_id),
-            )
+            if not reopening_existing:
+                self.db.execute(
+                    """
+                    UPDATE outlook_outgoing_messages
+                    SET status = 'technical_error', error_message = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (message, utc_now(), message_id),
+                )
             raise OutlookIntegrationError(message) from exc
         finally:
             if run_dir.exists():
@@ -2090,6 +2572,14 @@ class OutlookOutgoingService:
         return row
 
     def send_test_message(
+        self,
+        workflow: OutlookWorkflow,
+        letter_id: str,
+    ) -> dict[str, Any]:
+        with self._draft_lock:
+            return self._send_test_message_locked(workflow, letter_id)
+
+    def _send_test_message_locked(
         self,
         workflow: OutlookWorkflow,
         letter_id: str,
@@ -2131,7 +2621,10 @@ class OutlookOutgoingService:
         started = time.monotonic()
         try:
             result = self.outlook.send_draft(
-                draft_key=f"gns-test-scan-{scan['id']}",
+                draft_key=str(
+                    row.get("draft_key")
+                    or f"gns-test-scan-{scan['id']}"
+                ),
                 recipient_email=recipient,
                 sending_account=self.get_sending_account(),
             )
@@ -2192,6 +2685,144 @@ class OutlookOutgoingService:
         ) or {}
         updated["already_sent"] = False
         return updated
+
+    def reconcile_sent_messages(self) -> dict[str, int]:
+        """Confirm manually sent drafts by exact copies in Outlook Sent Items."""
+
+        with self._draft_lock:
+            rows = self.db.fetch_all(
+                """
+                SELECT *
+                FROM outlook_outgoing_messages
+                WHERE status = 'draft_created'
+                ORDER BY created_at, id
+                """
+            )
+            if not rows:
+                return {
+                    "pending": 0,
+                    "confirmed": 0,
+                    "rejected": 0,
+                    "ambiguous": 0,
+                }
+            candidates = tuple(
+                OutlookSentCandidate(
+                    draft_key=str(row.get("draft_key") or ""),
+                    recipient_email=str(row.get("recipient_email") or ""),
+                    subject=str(row.get("subject") or ""),
+                    attachment_name=str(row.get("attachment_name") or ""),
+                    attachment_sha256=str(
+                        row.get("attachment_sha256") or ""
+                    ),
+                )
+                for row in rows
+            )
+            created_days: list[date] = []
+            for row in rows:
+                try:
+                    created_days.append(
+                        datetime.fromisoformat(str(row["created_at"])).date()
+                    )
+                except (TypeError, ValueError):
+                    continue
+            sent_since = (
+                min(created_days) - timedelta(days=1)
+                if created_days
+                else date.today() - timedelta(days=1)
+            )
+            staging = _create_outlook_staging_directory(
+                _outlook_staging_roots(self.settings.runtime_dir),
+                run_id=f"gns-sent-{uuid4().hex}",
+            )
+            try:
+                scan = self.outlook.scan_sent_items(
+                    candidates=candidates,
+                    sent_since=sent_since,
+                    staging_dir=staging.worker_dir,
+                    max_attachment_bytes=self.settings.max_upload_bytes,
+                    mailbox=self.get_mailbox(),
+                )
+            finally:
+                if staging.canonical_dir.exists():
+                    ensure_within(
+                        staging.canonical_dir,
+                        staging.canonical_root,
+                    )
+                    shutil.rmtree(staging.canonical_dir, ignore_errors=True)
+
+            rows_by_key = {
+                str(row.get("draft_key") or ""): row for row in rows
+            }
+            confirmed = 0
+            confirmed_keys: set[str] = set()
+            for match in scan.matches:
+                if match.draft_key in confirmed_keys:
+                    continue
+                row = rows_by_key.get(match.draft_key)
+                try:
+                    datetime.fromisoformat(match.sent_at)
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    not row
+                    or not match.entry_id
+                    or len(match.entry_id) > 1024
+                ):
+                    continue
+                now = utc_now()
+                audit_payload = {
+                    "signed_scan_id": row["signed_scan_id"],
+                    "sent_at": match.sent_at,
+                }
+                with self.db.connect() as connection:
+                    updated = connection.execute(
+                        """
+                        UPDATE outlook_outgoing_messages
+                        SET status = 'sent', outlook_entry_id = ?, sent_at = ?,
+                            error_message = NULL, updated_at = ?
+                        WHERE id = ? AND status = 'draft_created'
+                        """,
+                        (match.entry_id, match.sent_at, now, row["id"]),
+                    )
+                    if updated.rowcount != 1:
+                        continue
+                    connection.execute(
+                        """
+                        INSERT INTO audit_events(
+                            entity_type, entity_id, event_type, actor,
+                            payload_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            "outlook_outgoing_message",
+                            str(row["id"]),
+                            "outlook_sent_confirmed",
+                            "Система",
+                            json.dumps(audit_payload, ensure_ascii=False),
+                            now,
+                        ),
+                    )
+                confirmed += 1
+                confirmed_keys.add(match.draft_key)
+            record_event(
+                "outlook",
+                "scan_sent_items",
+                "success",
+                details={
+                    "pending": len(rows),
+                    "inspected": scan.inspected_mail_count,
+                    "candidate_messages": scan.candidate_mail_count,
+                    "confirmed": confirmed,
+                    "rejected": scan.rejected_mail_count,
+                    "ambiguous": scan.ambiguous_candidate_count,
+                },
+            )
+            return {
+                "pending": len(rows),
+                "confirmed": confirmed,
+                "rejected": scan.rejected_mail_count,
+                "ambiguous": scan.ambiguous_candidate_count,
+            }
 
 
 class OutlookInboxImporter:
@@ -2865,6 +3496,10 @@ def _bridge_payload(
                     str(payload.get("attachment_path") or "")
                 ),
                 attachment_name=str(payload.get("attachment_name") or ""),
+                sending_account=str(payload.get("sending_account") or ""),
+                create_if_missing=bool(
+                    payload.get("create_if_missing", True)
+                ),
             )
             return {"ok": True, "draft": asdict(draft)}
         if action == "send":
@@ -2874,6 +3509,24 @@ def _bridge_payload(
                 sending_account=str(payload.get("sending_account") or ""),
             )
             return {"ok": True, "send": asdict(sent)}
+        if action == "sent":
+            candidates = tuple(
+                OutlookSentCandidate.from_dict(item)
+                for item in payload.get("candidates", [])
+                if isinstance(item, dict)
+            )
+            sent_scan = gateway.scan_sent_items(
+                candidates=candidates,
+                sent_since=date.fromisoformat(
+                    str(payload.get("sent_since") or "")
+                ),
+                staging_dir=Path(str(payload.get("staging_dir") or "")),
+                max_attachment_bytes=int(
+                    payload.get("max_attachment_bytes") or 0
+                ),
+                mailbox=str(payload.get("mailbox") or ""),
+            )
+            return {"ok": True, "sent_scan": asdict(sent_scan)}
         if action == "scan":
             scan = gateway.scan_inbox(
                 allowed_senders=frozenset(
@@ -2950,12 +3603,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
         "--bridge-action",
-        choices=("diagnose", "sync", "scan", "draft", "send"),
+        choices=("diagnose", "sync", "scan", "draft", "send", "sent"),
         required=True,
     )
     arguments = parser.parse_args()
     input_payload: dict[str, Any] | None = None
-    if arguments.bridge_action in {"diagnose", "sync", "scan", "draft", "send"}:
+    if arguments.bridge_action in {
+        "diagnose",
+        "sync",
+        "scan",
+        "draft",
+        "send",
+        "sent",
+    }:
         try:
             parsed = json.loads(sys.stdin.read() or "{}")
             input_payload = parsed if isinstance(parsed, dict) else None

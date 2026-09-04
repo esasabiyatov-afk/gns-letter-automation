@@ -143,6 +143,54 @@ def test_initialize_adds_original_sender_to_legacy_outlook_messages(tmp_path):
     }
 
 
+def test_initialize_backfills_legacy_outlook_draft_key(tmp_path):
+    path = tmp_path / "legacy-outgoing.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE outlook_outgoing_messages (
+                id TEXT PRIMARY KEY,
+                response_letter_id TEXT NOT NULL,
+                signed_scan_id TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                recipient_email TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                attachment_name TEXT NOT NULL,
+                attachment_sha256 TEXT NOT NULL,
+                outlook_entry_id TEXT,
+                sent_at TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO outlook_outgoing_messages(
+                id, response_letter_id, signed_scan_id, status,
+                recipient_email, subject, attachment_name,
+                attachment_sha256, created_at, updated_at
+            ) VALUES (
+                'legacy-outgoing', 'letter', 'scan', 'draft_created',
+                'recipient@sti.gov.kg', 'Ответ', 'Ответ.pdf',
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                '2026-09-04T09:00:00+00:00',
+                '2026-09-04T09:00:00+00:00'
+            )
+            """
+        )
+
+    db = Database(path)
+    db.initialize()
+
+    row = db.fetch_one(
+        "SELECT draft_key FROM outlook_outgoing_messages "
+        "WHERE id = 'legacy-outgoing'"
+    )
+    assert row == {"draft_key": "gns-scan-scan"}
+
+
 def test_initialize_marks_legacy_upload_source_as_unknown(tmp_path):
     path = tmp_path / "legacy-upload.sqlite3"
     with sqlite3.connect(path) as connection:

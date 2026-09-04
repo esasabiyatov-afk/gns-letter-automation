@@ -88,7 +88,15 @@
               title="Подписанный ответ, {{ scan.page_count }} {{ page_word(scan.page_count) }}">
       </iframe>
     </section>
-    {% if scan.status == 'needs_confirmation' %}
+    {% if active_letter.outlook_message and active_letter.outlook_message.status == 'sent' %}
+      <div class="inline-state inline-state-success">
+        <strong>Отправлено</strong>
+        {% if active_letter.outlook_message.sent_at %}
+          · {{ active_letter.outlook_message.sent_at[:16].replace('T', ' ') }}
+        {% endif %}
+        <small>Отправка подтверждена Outlook.</small>
+      </div>
+    {% elif scan.status == 'needs_confirmation' %}
       <form class="scan-confirm-action" method="post"
             action="/signed-response-scans/{{ scan.id }}/confirm">
         <input type="hidden" name="group_id" value="{{ active_group.id }}">

@@ -199,15 +199,15 @@
           </div>
           <div class="period-route-choice">
             <span>Если даты не читаются:</span>
-            <label>
+            <label class="period-route-option">
               <input type="radio" name="period_route" value="odb"
                      {% if case.get('period_route') == 'odb' %}checked{% endif %}>
-              Проверить в ОДБ
+              <span>Проверить в ОДБ</span>
             </label>
-            <label>
+            <label class="period-route-option">
               <input type="radio" name="period_route" value="no_odb"
                      {% if case.get('period_route') == 'no_odb' %}checked{% endif %}>
-              ОДБ не требуется
+              <span>ОДБ не требуется</span>
             </label>
           </div>
         </details>

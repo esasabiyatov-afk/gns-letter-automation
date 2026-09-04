@@ -166,6 +166,9 @@
                 <div class="letter-progress">
                   {% if letter.outlook_message and letter.outlook_message.status == 'sent' %}
                     <span class="status status-completed">Отправлено</span>
+                    {% if letter.outlook_message.sent_at %}
+                      <small>{{ letter.outlook_message.sent_at[:16].replace('T', ' ') }}</small>
+                    {% endif %}
                   {% elif letter.outlook_message and letter.outlook_message.status == 'draft_created' %}
                     <span class="status status-ready">Письмо подготовлено</span>
                   {% elif letter.signed_scan and letter.signed_scan.status == 'confirmed' %}
@@ -182,7 +185,9 @@
                 </div>
 
                 <div class="letter-primary-action">
-                  {% if letter.scan_session %}
+                  {% if letter.outlook_message and letter.outlook_message.status == 'sent' %}
+                    <span class="sent-confirmed-note">Подтверждено Outlook</span>
+                  {% elif letter.scan_session %}
                     <a class="button button-primary button-compact"
                        href="/?tab=responses&amp;response_view=created&amp;focus_letter={{ letter.id }}#letter-workflow">
                       Продолжить сканирование

@@ -435,8 +435,8 @@
                           <strong>Черновик Outlook создан</strong>
                           <small>{{ letter.outlook_message.subject }}</small>
                         {% elif letter.outlook_message.status == 'sent' %}
-                          <strong>✓ Тестовое письмо отправлено</strong>
-                          <small>{{ letter.outlook_message.sent_at }}</small>
+                          <strong>✓ Письмо отправлено</strong>
+                          <small>{{ letter.outlook_message.sent_at[:16].replace('T', ' ') }}</small>
                         {% elif letter.outlook_message.status == 'technical_error' %}
                           <strong>Ошибка Outlook</strong>
                           <small>{{ letter.outlook_message.error_message }}</small>
