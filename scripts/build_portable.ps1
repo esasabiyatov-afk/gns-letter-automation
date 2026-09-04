@@ -35,7 +35,10 @@ foreach ($Required in @(
     (Join-Path $ProjectRoot "models\tessdata_best\rus.traineddata"),
     (Join-Path $ProjectRoot "models\tessdata_best\kir.traineddata"),
     (Join-Path $ProjectRoot "УГНС\шаблон ответа одиночный.docx"),
-    (Join-Path $ProjectRoot "УГНС\шаблон ответа много.docx")
+    (Join-Path $ProjectRoot "УГНС\шаблон ответа много.docx"),
+    (Join-Path $ProjectRoot "packaging\assets\gns-document-seal.ico"),
+    (Join-Path $ProjectRoot "packaging\assets\gns-folder-mail.ico"),
+    (Join-Path $ProjectRoot "packaging\assets\gns-shield-document.ico")
 )) {
     if (-not (Test-Path -LiteralPath $Required -PathType Leaf)) {
         throw "Обязательный файл сборки не найден: $Required"
@@ -74,6 +77,8 @@ Copy-Item -LiteralPath (Join-Path $ProjectRoot "packaging\START_PORTABLE.bat") `
     -Destination (Join-Path $ReleaseDir "START.bat")
 Copy-Item -LiteralPath (Join-Path $ProjectRoot "packaging\PORTABLE_README_RU.txt") `
     -Destination (Join-Path $ReleaseDir "README.txt")
+Copy-Item -LiteralPath (Join-Path $ProjectRoot "packaging\assets") `
+    -Destination (Join-Path $ReleaseDir "Иконки") -Recurse
 New-Item -ItemType Directory -Force -Path `
     (Join-Path $ReleaseDir "runtime"), `
     (Join-Path $ReleaseDir "Входящие") | Out-Null

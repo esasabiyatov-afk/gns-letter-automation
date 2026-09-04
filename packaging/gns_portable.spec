@@ -6,6 +6,7 @@ from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_sub
 
 project_root = Path(SPECPATH).resolve().parent
 app_name = "GNS-Portable"
+app_icon = project_root / "packaging" / "assets" / "gns-document-seal.ico"
 
 datas = [
     (str(project_root / "src" / "gns_app" / "templates"), "gns_app/templates"),
@@ -64,6 +65,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name=app_name,
+    icon=str(app_icon),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

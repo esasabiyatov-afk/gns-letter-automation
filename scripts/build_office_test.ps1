@@ -48,6 +48,8 @@ if ($LASTEXITCODE -ne 0) {
 Copy-Item -LiteralPath `
     (Join-Path $ProjectRoot "packaging\OFFICE_TEST_README_RU.txt") `
     -Destination (Join-Path $ReleaseDir "OFFICE_TEST_README_RU.txt")
+Copy-Item -LiteralPath (Join-Path $ProjectRoot "packaging\assets") `
+    -Destination (Join-Path $ReleaseDir "Иконки") -Recurse
 New-Item -ItemType Directory -Force -Path (Join-Path $ReleaseDir "runtime") | Out-Null
 
 Write-Output $ReleaseDir
