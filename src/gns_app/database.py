@@ -8,7 +8,12 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 from uuid import uuid4
 
-from gns_app.text_cleanup import clean_location, clean_taxpayer_name
+from gns_app.text_cleanup import (
+    clean_location,
+    clean_taxpayer_name,
+    fuzzy_search_match,
+    normalize_search_text,
+)
 
 
 def utc_now() -> str:
@@ -380,6 +385,12 @@ CREATE TABLE IF NOT EXISTS outlook_outgoing_messages (
     outlook_entry_id TEXT,
     sent_at TEXT,
     error_message TEXT,
+    resend_sequence INTEGER NOT NULL DEFAULT 0,
+    resend_status TEXT,
+    resend_draft_key TEXT,
+    resend_outlook_entry_id TEXT,
+    resent_at TEXT,
+    resend_error_message TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(signed_scan_id)
@@ -398,6 +409,12 @@ class Database:
     def connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
+        connection.create_function(
+            "gns_search_normalize", 1, normalize_search_text, deterministic=True
+        )
+        connection.create_function(
+            "gns_fuzzy_match", 2, fuzzy_search_match, deterministic=True
+        )
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")
         try:
@@ -679,6 +696,20 @@ class Database:
                 WHERE draft_key IS NULL OR draft_key = ''
                 """
             )
+        additions = {
+            "resend_sequence": "INTEGER NOT NULL DEFAULT 0",
+            "resend_status": "TEXT",
+            "resend_draft_key": "TEXT",
+            "resend_outlook_entry_id": "TEXT",
+            "resent_at": "TEXT",
+            "resend_error_message": "TEXT",
+        }
+        for column, definition in additions.items():
+            if column not in existing:
+                connection.execute(
+                    f"ALTER TABLE outlook_outgoing_messages "
+                    f"ADD COLUMN {column} {definition}"
+                )
 
     @staticmethod
     def _clean_legacy_district_places(

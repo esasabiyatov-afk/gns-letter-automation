@@ -7,16 +7,25 @@
     <p class="eyebrow">ПОИСК И ПРОВЕРКА</p>
     <h1>История писем</h1>
   </div>
-  <form class="history-search" method="get" action="/history">
+  <form class="history-search" method="get" action="/history" data-history-search>
     <input name="query" value="{{ history.query }}"
-           placeholder="Файл, ИНН, адресат, отправитель или исх. №"
+           placeholder="Название, район, ИНН или исх. №"
            aria-label="Поиск по истории">
+    <select name="sort_order" aria-label="Сортировка истории">
+      <option value="date_desc" {% if history.sort_order == 'date_desc' %}selected{% endif %}>Сначала новые</option>
+      <option value="date_asc" {% if history.sort_order == 'date_asc' %}selected{% endif %}>Сначала старые</option>
+      <option value="district_asc" {% if history.sort_order == 'district_asc' %}selected{% endif %}>Район А–Я</option>
+      <option value="district_desc" {% if history.sort_order == 'district_desc' %}selected{% endif %}>Район Я–А</option>
+    </select>
     <button class="button button-primary button-compact" type="submit">Найти</button>
     {% if history.query %}<a class="button button-quiet button-compact" href="/history">Сбросить</a>{% endif %}
   </form>
 </header>
 
-<section class="work-section history-section">
+{% if message %}<div class="inline-state">{{ message }}</div>{% endif %}
+{% if error %}<div class="inline-state inline-state-error">{{ error }}</div>{% endif %}
+
+<section class="work-section history-section" data-history-results>
   <div class="work-section-toolbar">
     <div>
       <h2>{% if history.query %}Результаты поиска{% else %}Все обращения{% endif %}</h2>
@@ -62,6 +71,11 @@
           {% if item.mail_status == 'sent' %}
             <span class="status status-completed">Отправлено</span>
             <small>{{ item.recipient_email }}{% if item.sent_at %} · {{ item.sent_at[:16].replace('T', ' ') }}{% endif %}</small>
+            {% if item.resend_status == 'draft_created' %}
+              <small>Повторный черновик подготовлен</small>
+            {% elif item.resent_at %}
+              <small>Повторно: {{ item.resent_at[:16].replace('T', ' ') }}</small>
+            {% endif %}
           {% elif item.mail_status == 'draft_created' %}
             <span class="status status-ready">Письмо Outlook подготовлено</span>
             <small>{{ item.recipient_email }}</small>
@@ -80,6 +94,17 @@
             <a href="/uploads/{{ item.upload_id }}">Открыть входящий PDF</a>
             {% if item.response_group_id %}<a href="/response-groups/{{ item.response_group_id }}">Скачать Word</a>{% endif %}
             {% if item.signed_scan_id %}<a href="/signed-response-scans/{{ item.signed_scan_id }}" target="_blank">Открыть подписанный PDF</a>{% endif %}
+            {% if item.mail_status == 'sent' and item.outlook_message_id and item.signed_scan_id %}
+              <form method="post" action="/outlook-messages/{{ item.outlook_message_id }}/resend-draft"
+                    onsubmit="return confirm('Создать повторный черновик с сохранённым подписанным PDF?');">
+                <input type="hidden" name="query" value="{{ history.query }}">
+                <input type="hidden" name="sort_order" value="{{ history.sort_order }}">
+                <input type="hidden" name="page" value="{{ history.page }}">
+                <button type="submit">
+                  {% if item.resend_status == 'draft_created' %}Открыть повторный черновик{% else %}Отправить повторно{% endif %}
+                </button>
+              </form>
+            {% endif %}
           </div>
         </details>
       </article>
@@ -95,12 +120,12 @@
     <nav class="server-pagination" aria-label="Страницы истории">
       {% if history.page > 1 %}
         <a class="button button-secondary button-compact"
-           href="/history?query={{ history.query|urlencode }}&amp;page={{ history.page - 1 }}">← Назад</a>
+           href="/history?query={{ history.query|urlencode }}&amp;sort_order={{ history.sort_order }}&amp;page={{ history.page - 1 }}">← Назад</a>
       {% endif %}
       <strong>{{ history.page }} из {{ history.page_count }}</strong>
       {% if history.page < history.page_count %}
         <a class="button button-secondary button-compact"
-           href="/history?query={{ history.query|urlencode }}&amp;page={{ history.page + 1 }}">Дальше →</a>
+           href="/history?query={{ history.query|urlencode }}&amp;sort_order={{ history.sort_order }}&amp;page={{ history.page + 1 }}">Дальше →</a>
       {% endif %}
     </nav>
   {% endif %}

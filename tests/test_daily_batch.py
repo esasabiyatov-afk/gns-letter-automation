@@ -1589,6 +1589,88 @@ def test_outlook_sent_reconciliation_updates_status_once(workflow, monkeypatch):
     assert "2026-09-04 10:30" in history.text
 
 
+def test_repeat_draft_reuses_exact_confirmed_scan_and_is_confirmed(workflow):
+    workflow.initialize_gns_offices()
+    workflow.initialize_gns_office_emails()
+    _, letter = _ready_response_letter(workflow)
+    workflow.set_outgoing_number(letter["id"], "9550")
+    scan = workflow.register_signed_response_scan(
+        letter["id"], "scan.png", _png_scan()
+    )
+    workflow.confirm_signed_response_scan(
+        scan["id"],
+        correct_letter=True,
+        signature_present=True,
+        bank_seal_present=True,
+    )
+    expected_pdf = Path(scan["pdf_path"]).read_bytes()
+
+    class Gateway:
+        def __init__(self):
+            self.requests = []
+            self.attachments = []
+
+        def create_draft(self, **request):
+            self.requests.append(request)
+            self.attachments.append(request["attachment_path"].read_bytes())
+            return OutlookDraftResult(
+                entry_id=f"draft-{len(self.requests)}",
+                recipient_email=request["recipient_email"],
+                subject=request["subject"],
+                attachment_name=request["attachment_name"],
+                existing=not request["create_if_missing"],
+            )
+
+        def scan_sent_items(self, **request):
+            candidate = request["candidates"][0]
+            return OutlookSentScan(
+                inspected_mail_count=1,
+                candidate_mail_count=1,
+                rejected_mail_count=0,
+                ambiguous_candidate_count=0,
+                matches=(OutlookSentMatch(
+                    draft_key=candidate.draft_key,
+                    entry_id="resent-entry",
+                    sent_at="2026-09-04T11:00:00+06:00",
+                ),),
+            )
+
+    gateway = Gateway()
+    outgoing = OutlookOutgoingService(
+        workflow.db, workflow.settings, OutlookService(gateway)
+    )
+    original = outgoing.create_draft(workflow, letter["id"])
+    workflow.db.execute(
+        "UPDATE outlook_outgoing_messages SET status = 'sent', sent_at = ? "
+        "WHERE id = ?",
+        ("2026-09-04T10:30:00+06:00", original["id"]),
+    )
+
+    first = outgoing.create_resend_draft(workflow, original["id"])
+    reopened = outgoing.create_resend_draft(workflow, original["id"])
+    confirmed = outgoing.reconcile_sent_messages()
+    stored = workflow.db.fetch_one(
+        "SELECT resend_sequence, resend_status, resend_draft_key, "
+        "resend_outlook_entry_id, resent_at FROM outlook_outgoing_messages "
+        "WHERE id = ?",
+        (original["id"],),
+    )
+    second = outgoing.create_resend_draft(workflow, original["id"])
+
+    assert first["resend_sequence"] == 1
+    assert not first["existing_outlook_draft"]
+    assert reopened["existing_outlook_draft"]
+    assert confirmed["confirmed"] == 1
+    assert stored["resend_status"] == "sent"
+    assert stored["resend_outlook_entry_id"] == "resent-entry"
+    assert stored["resent_at"] == "2026-09-04T11:00:00+06:00"
+    assert second["resend_sequence"] == 2
+    assert gateway.requests[1]["create_if_missing"] is True
+    assert gateway.requests[2]["create_if_missing"] is False
+    assert gateway.requests[3]["create_if_missing"] is True
+    assert gateway.attachments == [expected_pdf] * 4
+
+
 def test_outlook_draft_requires_confirmed_scan(workflow):
     workflow.initialize_gns_offices()
     workflow.initialize_gns_office_emails()

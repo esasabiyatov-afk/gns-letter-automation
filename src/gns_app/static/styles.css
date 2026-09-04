@@ -2254,6 +2254,7 @@ pre { white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow
 
 .history-search { display: flex; align-items: center; gap: 5px; }
 .history-search input { width: min(520px, 48vw); min-height: 32px; }
+.history-search select { min-height: 32px; border: 1px solid var(--line); border-radius: 8px; background: white; }
 .history-list-grid { grid-template-columns: 150px minmax(210px, 1fr) minmax(200px, 1fr) minmax(180px, .9fr) 30px; }
 .history-received,
 .history-recipient,

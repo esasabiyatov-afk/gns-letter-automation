@@ -3,7 +3,7 @@
     <div>
       <h2>Входящие письма</h2>
       <p>
-        Всего PDF: {{ uploads|length }} ·
+        Всего PDF: {{ incoming_page.total }} ·
         {% if outlook_auto_enabled %}
           Автопроверка включена{% if outlook_auto_status.checked_at %} · {{ outlook_auto_status.checked_at[:16].replace('T', ' ') }}{% endif %}
         {% else %}
@@ -119,4 +119,18 @@
       </div>
     {% endfor %}
   </div>
+
+  {% if incoming_page.page_count > 1 %}
+    <nav class="server-pagination" aria-label="Страницы входящих писем">
+      {% if incoming_page.page > 1 %}
+        <a class="button button-secondary button-compact"
+           href="/?tab=incoming&amp;incoming_sort={{ incoming_sort }}&amp;incoming_page={{ incoming_page.page - 1 }}">← Назад</a>
+      {% endif %}
+      <strong>{{ incoming_page.page }} из {{ incoming_page.page_count }}</strong>
+      {% if incoming_page.page < incoming_page.page_count %}
+        <a class="button button-secondary button-compact"
+           href="/?tab=incoming&amp;incoming_sort={{ incoming_sort }}&amp;incoming_page={{ incoming_page.page + 1 }}">Дальше →</a>
+      {% endif %}
+    </nav>
+  {% endif %}
 </section>

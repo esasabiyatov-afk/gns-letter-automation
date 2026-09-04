@@ -105,18 +105,18 @@ def test_work_incoming_is_compact_and_mail_first(
     assert '<details id="employee-entry"' in employee_response.text
 
 
-def test_work_incoming_shows_all_pdfs_and_sorts_by_date(workflow, monkeypatch):
+def test_work_incoming_paginates_50_pdfs_and_keeps_sort(workflow, monkeypatch):
     from starlette.testclient import TestClient
 
     rows = []
-    for index in range(21):
+    for index in range(51):
         rows.append(
             (
                 f"incoming-{index:02d}",
                 f"document-{index:02d}.pdf",
                 f"document-{index:02d}.pdf",
                 f"incoming-hash-{index:02d}",
-                f"2026-09-{index + 1:02d}T08:00:00+00:00",
+                f"2026-09-04T08:{index:02d}:00+00:00",
             )
         )
     workflow.db.executemany(
@@ -132,17 +132,28 @@ def test_work_incoming_shows_all_pdfs_and_sorts_by_date(workflow, monkeypatch):
     client = TestClient(main.app)
 
     newest = client.get("/?tab=incoming")
-    assert newest.text.count('data-testid="incoming-row"') == 21
-    assert newest.text.index("document-20.pdf") < newest.text.index(
-        "document-00.pdf"
-    )
+    assert newest.text.count('data-testid="incoming-row"') == 50
+    assert "Всего PDF: 51" in newest.text
+    assert "document-50.pdf" in newest.text
+    assert "document-00.pdf" not in newest.text
+    assert "1 из 2" in newest.text
+    assert "incoming_page=2" in newest.text
     assert 'value="newest" selected' in newest.text
 
-    oldest = client.get("/?tab=incoming&incoming_sort=oldest")
-    assert oldest.text.index("document-00.pdf") < oldest.text.index(
-        "document-20.pdf"
+    newest_second = client.get(
+        "/?tab=incoming&incoming_sort=newest&incoming_page=2"
     )
+    assert newest_second.text.count('data-testid="incoming-row"') == 1
+    assert "document-00.pdf" in newest_second.text
+    assert "document-50.pdf" not in newest_second.text
+    assert "2 из 2" in newest_second.text
+
+    oldest = client.get("/?tab=incoming&incoming_sort=oldest")
+    assert oldest.text.count('data-testid="incoming-row"') == 50
+    assert "document-00.pdf" in oldest.text
+    assert "document-50.pdf" not in oldest.text
     assert 'value="oldest" selected' in oldest.text
+    assert "incoming_sort=oldest&amp;incoming_page=2" in oldest.text
 
 
 def test_upload_page_combines_pdf_and_compact_page_list(
@@ -688,3 +699,42 @@ def test_history_search_combines_incoming_word_number_and_scan(
     assert "Есть подписанный скан" in response.text
     assert f'href="/response-groups/{group_id}"' in response.text
     assert f'href="/signed-response-scans/{scan["id"]}"' in response.text
+    assert 'name="sort_order"' in response.text
+    assert "data-history-search" in response.text
+
+
+def test_history_search_accepts_prefix_typo_and_sorts(workflow):
+    from test_daily_batch import _insert_ready_case
+
+    older_id = _insert_ready_case(
+        workflow,
+        "12345678901234",
+        'ОсОО "Первый Альфа"',
+        district_place="по Ленинскому району города Бишкек",
+    )
+    newer_id = _insert_ready_case(
+        workflow,
+        "22345678901234",
+        'ОсОО "Второй Бета"',
+        district_place="по Аламудунскому району Чуйской области",
+    )
+    workflow.db.execute(
+        "UPDATE uploads SET created_at = '2026-09-01T08:00:00+00:00' "
+        "WHERE id = (SELECT upload_id FROM cases WHERE id = ?)",
+        (older_id,),
+    )
+    workflow.db.execute(
+        "UPDATE uploads SET created_at = '2026-09-02T08:00:00+00:00' "
+        "WHERE id = (SELECT upload_id FROM cases WHERE id = ?)",
+        (newer_id,),
+    )
+
+    assert workflow.list_letter_history("первы")["items"][0]["id"] == older_id
+    assert workflow.list_letter_history("первыи")["items"][0]["id"] == older_id
+    district_items = workflow.list_letter_history(
+        "", sort_order="district_asc"
+    )["items"]
+    date_items = workflow.list_letter_history("", sort_order="date_asc")["items"]
+
+    assert [item["id"] for item in district_items] == [newer_id, older_id]
+    assert [item["id"] for item in date_items] == [older_id, newer_id]

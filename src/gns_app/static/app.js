@@ -253,11 +253,12 @@
     );
   };
 
-  const refreshIncomingWorkspace = async (sort) => {
+  const refreshIncomingWorkspace = async (sort, page = 1) => {
     const current = document.querySelector(incomingWorkspaceSelector);
     if (!current) return null;
     const url = new URL("/work/incoming", window.location.origin);
     url.searchParams.set("incoming_sort", sort || "newest");
+    url.searchParams.set("incoming_page", String(page));
     const response = await fetch(url, { headers: { Accept: "text/html" } });
     if (!response.ok) throw new Error("incoming_refresh_failed");
     const documentBody = new DOMParser().parseFromString(
@@ -287,7 +288,12 @@
       }
       incomingImportPoll = null;
       const sort = workspace?.querySelector("[name='incoming_sort']")?.value;
-      await refreshIncomingWorkspace(sort);
+      const url = new URL(window.location.href);
+      url.searchParams.set("tab", "incoming");
+      url.searchParams.set("incoming_sort", sort || "newest");
+      url.searchParams.set("incoming_page", "1");
+      window.history.replaceState(null, "", url);
+      await refreshIncomingWorkspace(sort, 1);
     } catch (_error) {
       incomingImportPoll = null;
       const workspace = document.querySelector(incomingWorkspaceSelector);
@@ -311,9 +317,10 @@
       const url = new URL(window.location.href);
       url.searchParams.set("tab", "incoming");
       url.searchParams.set("incoming_sort", sort);
+      url.searchParams.set("incoming_page", "1");
       window.history.replaceState(null, "", url);
       try {
-        await refreshIncomingWorkspace(sort);
+        await refreshIncomingWorkspace(sort, 1);
       } catch (_error) {
         window.location.assign(url);
       }
@@ -1073,5 +1080,44 @@
     window.requestAnimationFrame(() => {
       selectedUploadPage.scrollIntoView({ block: "nearest", inline: "nearest" });
     });
+  }
+
+  const historySearch = document.querySelector("[data-history-search]");
+  if (historySearch) {
+    const queryInput = historySearch.querySelector("[name='query']");
+    const sortInput = historySearch.querySelector("[name='sort_order']");
+    let timer = null;
+    let controller = null;
+    const refreshHistory = async () => {
+      controller?.abort();
+      controller = new AbortController();
+      const url = new URL(historySearch.action, window.location.origin);
+      new FormData(historySearch).forEach((value, key) => {
+        if (value) url.searchParams.set(key, value);
+      });
+      try {
+        const response = await fetch(url, { signal: controller.signal });
+        if (!response.ok) throw new Error("history search failed");
+        const documentCopy = new DOMParser().parseFromString(
+          await response.text(), "text/html"
+        );
+        const nextResults = documentCopy.querySelector("[data-history-results]");
+        const currentResults = document.querySelector("[data-history-results]");
+        if (!nextResults || !currentResults) throw new Error("history results missing");
+        currentResults.replaceWith(nextResults);
+        window.history.replaceState({}, "", `${url.pathname}${url.search}`);
+      } catch (error) {
+        if (error.name !== "AbortError") historySearch.submit();
+      }
+    };
+    historySearch.addEventListener("submit", (event) => {
+      event.preventDefault();
+      refreshHistory();
+    });
+    queryInput?.addEventListener("input", () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(refreshHistory, 350);
+    });
+    sortInput?.addEventListener("change", refreshHistory);
   }
 })();

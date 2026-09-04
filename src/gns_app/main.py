@@ -72,6 +72,7 @@ outlook_outgoing = OutlookOutgoingService(db, settings, outlook)
 _outlook_import_activity_lock = Lock()
 _outlook_import_active = False
 OUTLOOK_SENT_CHECK_INTERVAL_SECONDS = 30
+INCOMING_PAGE_SIZE = 50
 
 
 def _claim_outlook_import() -> bool:
@@ -432,6 +433,8 @@ EVENT_LABELS = {
     "outlook_test_message_sent": "Отправлено тестовое письмо Outlook",
     "outlook_test_send_failed": "Ошибка тестовой отправки Outlook",
     "outlook_sent_confirmed": "Отправка подтверждена папкой Outlook",
+    "outlook_resend_draft_created": "Создан повторный черновик Outlook",
+    "outlook_resend_confirmed": "Повторная отправка подтверждена Outlook",
     "gns_offices_replaced": "Обновлён справочник налоговых органов",
     "gns_office_emails_updated": "Обновлены официальные email подразделений",
     "gns_office_location_expanded": "Район дополнен областью или городом",
@@ -565,13 +568,29 @@ def period_review_status(case: dict) -> dict[str, object]:
     }
 
 
-def _incoming_workspace_values(incoming_sort: str) -> dict[str, object]:
+def _incoming_workspace_values(
+    incoming_sort: str,
+    incoming_page: int = 1,
+) -> dict[str, object]:
     safe_sort = (
         incoming_sort if incoming_sort in {"newest", "oldest"} else "newest"
     )
+    total = workflow.count_incoming_work()
+    page_count = max(1, (total + INCOMING_PAGE_SIZE - 1) // INCOMING_PAGE_SIZE)
+    selected_page = min(max(int(incoming_page), 1), page_count)
     return {
-        "uploads": workflow.list_incoming_work(sort_order=safe_sort),
+        "uploads": workflow.list_incoming_work(
+            limit=INCOMING_PAGE_SIZE,
+            sort_order=safe_sort,
+            offset=(selected_page - 1) * INCOMING_PAGE_SIZE,
+        ),
         "incoming_sort": safe_sort,
+        "incoming_page": {
+            "page": selected_page,
+            "page_count": page_count,
+            "page_size": INCOMING_PAGE_SIZE,
+            "total": total,
+        },
         "inbox_dir": str(workflow.get_inbox_dir()),
         "outlook_auto_enabled": outlook_importer.get_auto_enabled(),
         "outlook_auto_status": outlook_importer.get_automation_status(),
@@ -584,6 +603,7 @@ def index(
     request: Request,
     tab: str = "incoming",
     incoming_sort: str = "newest",
+    incoming_page: int = 1,
     response_view: str = "prepare",
     focus_letter: str = "",
     outgoing_start: str = "",
@@ -608,7 +628,7 @@ def index(
         "error": error,
     }
     if tab == "incoming":
-        values.update(_incoming_workspace_values(incoming_sort))
+        values.update(_incoming_workspace_values(incoming_sort, incoming_page))
     elif tab == "review":
         review = workflow.manual_review_overview()
         values.update(
@@ -682,11 +702,15 @@ def index(
 def incoming_workspace_fragment(
     request: Request,
     incoming_sort: str = "newest",
+    incoming_page: int = 1,
 ):
     return templates.TemplateResponse(
         request,
         "_work_incoming.html",
-        context(request, **_incoming_workspace_values(incoming_sort)),
+        context(
+            request,
+            **_incoming_workspace_values(incoming_sort, incoming_page),
+        ),
     )
 
 
@@ -715,14 +739,51 @@ def letter_history(
     request: Request,
     query: str = "",
     page: int = 1,
+    sort_order: str = "date_desc",
+    message: str = "",
+    error: str = "",
 ):
     return templates.TemplateResponse(
         request,
         "history.html",
         context(
             request,
-            history=workflow.list_letter_history(query, page=page),
+            history=workflow.list_letter_history(
+                query,
+                page=page,
+                sort_order=sort_order,
+            ),
+            message=message,
+            error=error,
         ),
+    )
+
+
+@app.post("/outlook-messages/{message_id}/resend-draft")
+def create_outlook_resend_draft(
+    message_id: str,
+    query: str = Form(""),
+    sort_order: str = Form("date_desc"),
+    page: int = Form(1),
+):
+    parameters = (
+        f"query={quote(query)}&sort_order={quote(sort_order)}&page={max(page, 1)}"
+    )
+    try:
+        result = outlook_outgoing.create_resend_draft(workflow, message_id)
+    except OutlookIntegrationError as exc:
+        return RedirectResponse(
+            f"/history?{parameters}&error={quote(str(exc))}",
+            status_code=303,
+        )
+    notice = (
+        "Повторный черновик Outlook открыт."
+        if result.get("existing_outlook_draft")
+        else "Повторный черновик Outlook создан и открыт."
+    )
+    return RedirectResponse(
+        f"/history?{parameters}&message={quote(notice)}",
+        status_code=303,
     )
 
 

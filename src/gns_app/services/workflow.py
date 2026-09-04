@@ -6723,14 +6723,16 @@ class WorkflowService:
         limit: int | None = None,
         *,
         sort_order: str = "newest",
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         direction = "ASC" if sort_order == "oldest" else "DESC"
         limit_clause = ""
         parameters: tuple[Any, ...] = ()
         if limit is not None:
             safe_limit = max(1, min(int(limit), 100))
-            limit_clause = "LIMIT ?"
-            parameters = (safe_limit,)
+            safe_offset = max(0, int(offset))
+            limit_clause = "LIMIT ? OFFSET ?"
+            parameters = (safe_limit, safe_offset)
         return self.db.fetch_all(
             f"""
             SELECT uploads.*,
@@ -6765,6 +6767,10 @@ class WorkflowService:
             """,
             parameters,
         )
+
+    def count_incoming_work(self) -> int:
+        row = self.db.fetch_one("SELECT COUNT(*) AS count FROM uploads")
+        return int(row.get("count") or 0) if row else 0
 
     def get_upload_pages(self, upload_id: str) -> list[dict[str, Any]]:
         return self.db.fetch_all(
@@ -7985,10 +7991,18 @@ class WorkflowService:
         *,
         page: int = 1,
         page_size: int = 40,
+        sort_order: str = "date_desc",
     ) -> dict[str, Any]:
         search = " ".join(str(query or "").split())[:160]
         page_size = max(10, min(int(page_size), 100))
         requested_page = max(int(page), 1)
+        if sort_order not in {
+            "date_desc",
+            "date_asc",
+            "district_asc",
+            "district_desc",
+        }:
+            sort_order = "date_desc"
         history_cte = """
             WITH letter_history AS (
                 SELECT
@@ -8081,6 +8095,17 @@ class WorkflowService:
                        AND signed_response_scans.status != 'superseded'
                      ORDER BY signed_response_scans.created_at DESC
                      LIMIT 1) AS signed_scan_id,
+                    (SELECT outlook_outgoing_messages.id
+                     FROM response_group_cases
+                     JOIN response_letters
+                       ON response_letters.response_group_id =
+                          response_group_cases.response_group_id
+                     JOIN outlook_outgoing_messages
+                       ON outlook_outgoing_messages.response_letter_id =
+                          response_letters.id
+                     WHERE response_group_cases.case_id = cases.id
+                     ORDER BY outlook_outgoing_messages.created_at DESC
+                     LIMIT 1) AS outlook_message_id,
                     (SELECT outlook_outgoing_messages.status
                      FROM response_group_cases
                      JOIN response_letters
@@ -8113,7 +8138,29 @@ class WorkflowService:
                           response_letters.id
                      WHERE response_group_cases.case_id = cases.id
                      ORDER BY outlook_outgoing_messages.created_at DESC
-                     LIMIT 1) AS sent_at
+                     LIMIT 1) AS sent_at,
+                    (SELECT outlook_outgoing_messages.resend_status
+                     FROM response_group_cases
+                     JOIN response_letters
+                       ON response_letters.response_group_id =
+                          response_group_cases.response_group_id
+                     JOIN outlook_outgoing_messages
+                       ON outlook_outgoing_messages.response_letter_id =
+                          response_letters.id
+                     WHERE response_group_cases.case_id = cases.id
+                     ORDER BY outlook_outgoing_messages.created_at DESC
+                     LIMIT 1) AS resend_status,
+                    (SELECT outlook_outgoing_messages.resent_at
+                     FROM response_group_cases
+                     JOIN response_letters
+                       ON response_letters.response_group_id =
+                          response_group_cases.response_group_id
+                     JOIN outlook_outgoing_messages
+                       ON outlook_outgoing_messages.response_letter_id =
+                          response_letters.id
+                     WHERE response_group_cases.case_id = cases.id
+                     ORDER BY outlook_outgoing_messages.created_at DESC
+                     LIMIT 1) AS resent_at
                 FROM cases
                 JOIN uploads ON uploads.id = cases.upload_id
             )
@@ -8122,18 +8169,36 @@ class WorkflowService:
         search_parameters: tuple[Any, ...] = ()
         if search:
             where = """
-                WHERE original_filename LIKE ?
-                   OR district_place LIKE ?
-                   OR recipient_display_name LIKE ?
-                   OR taxpayer_names LIKE ?
-                   OR taxpayer_inns LIKE ?
-                   OR sender_smtp LIKE ?
-                   OR original_sender_smtp LIKE ?
-                   OR outgoing_numbers LIKE ?
-                   OR status LIKE ?
+                WHERE gns_fuzzy_match(
+                    COALESCE(original_filename, '') || ' ' ||
+                    COALESCE(district_place, '') || ' ' ||
+                    COALESCE(recipient_display_name, '') || ' ' ||
+                    COALESCE(taxpayer_names, '') || ' ' ||
+                    COALESCE(taxpayer_inns, '') || ' ' ||
+                    COALESCE(sender_smtp, '') || ' ' ||
+                    COALESCE(original_sender_smtp, '') || ' ' ||
+                    COALESCE(outgoing_numbers, '') || ' ' ||
+                    COALESCE(status, ''),
+                    ?
+                ) = 1
             """
-            pattern = f"%{search}%"
-            search_parameters = (pattern,) * 9
+            search_parameters = (search,)
+        order_by = {
+            "date_desc": (
+                "COALESCE(received_at, uploaded_at) DESC, uploaded_at DESC"
+            ),
+            "date_asc": (
+                "COALESCE(received_at, uploaded_at) ASC, uploaded_at ASC"
+            ),
+            "district_asc": (
+                "gns_search_normalize(COALESCE(district_place, '')) ASC, "
+                "COALESCE(received_at, uploaded_at) DESC"
+            ),
+            "district_desc": (
+                "gns_search_normalize(COALESCE(district_place, '')) DESC, "
+                "COALESCE(received_at, uploaded_at) DESC"
+            ),
+        }[sort_order]
         total_row = self.db.fetch_one(
             history_cte
             + f"SELECT COUNT(*) AS count FROM letter_history {where}",
@@ -8148,8 +8213,7 @@ class WorkflowService:
             + f"""
                 SELECT * FROM letter_history
                 {where}
-                ORDER BY COALESCE(received_at, uploaded_at) DESC,
-                         uploaded_at DESC,
+                ORDER BY {order_by},
                          original_filename,
                          COALESCE(source_first_page, 999999999),
                          id
@@ -8160,6 +8224,7 @@ class WorkflowService:
         return {
             "items": items,
             "query": search,
+            "sort_order": sort_order,
             "page": selected_page,
             "page_count": page_count,
             "page_size": page_size,

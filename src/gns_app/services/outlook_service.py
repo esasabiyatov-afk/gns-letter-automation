@@ -2686,6 +2686,132 @@ class OutlookOutgoingService:
         updated["already_sent"] = False
         return updated
 
+    def create_resend_draft(
+        self,
+        workflow: OutlookWorkflow,
+        message_id: str,
+    ) -> dict[str, Any]:
+        """Create or reopen one tracked repeat draft from the sent PDF."""
+
+        with self._draft_lock:
+            row = self.db.fetch_one(
+                """
+                SELECT outlook_outgoing_messages.*,
+                       signed_response_scans.pdf_path AS scan_pdf_path
+                FROM outlook_outgoing_messages
+                JOIN signed_response_scans
+                  ON signed_response_scans.id =
+                     outlook_outgoing_messages.signed_scan_id
+                WHERE outlook_outgoing_messages.id = ?
+                """,
+                (message_id,),
+            )
+            if not row or row.get("status") != "sent":
+                raise OutlookIntegrationError(
+                    "Повторное письмо доступно только после подтверждённой отправки."
+                )
+            stored_message_id = str(row["id"])
+            try:
+                pdf_path = ensure_within(
+                    Path(str(row["scan_pdf_path"])),
+                    self.settings.runtime_dir / "signed_scans",
+                )
+            except (KeyError, StorageError) as exc:
+                raise OutlookIntegrationError(
+                    "Подписанный PDF для повторной отправки недоступен."
+                ) from exc
+            if (
+                not pdf_path.is_file()
+                or self._sha256_file(pdf_path) != row["attachment_sha256"]
+            ):
+                raise OutlookIntegrationError(
+                    "Сохранённый подписанный PDF отсутствует или изменён."
+                )
+
+            reopening = bool(
+                row.get("resend_status") == "draft_created"
+                and row.get("resend_draft_key")
+            )
+            sequence = int(row.get("resend_sequence") or 0)
+            draft_key = str(row.get("resend_draft_key") or "")
+            if not reopening:
+                sequence += 1
+                draft_key = f"gns-resend-{stored_message_id}-{sequence}"
+                self.db.execute(
+                    """
+                    UPDATE outlook_outgoing_messages
+                    SET resend_sequence = ?, resend_status = 'creating',
+                        resend_draft_key = ?, resend_outlook_entry_id = NULL,
+                        resent_at = NULL, resend_error_message = NULL,
+                        updated_at = ?
+                    WHERE id = ? AND status = 'sent'
+                    """,
+                    (sequence, draft_key, utc_now(), stored_message_id),
+                )
+
+            staging_root = ensure_within(
+                self.settings.runtime_dir / "outlook_outgoing_staging",
+                self.settings.runtime_dir,
+            )
+            run_dir = ensure_within(
+                staging_root / f"{stored_message_id}-resend-{sequence}",
+                staging_root,
+            )
+            attachment_path = run_dir / str(row["attachment_name"])
+            try:
+                run_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(pdf_path, attachment_path)
+                result = self.outlook.create_draft(
+                    draft_key=draft_key,
+                    recipient_email=str(row["recipient_email"]),
+                    subject=str(row["subject"]),
+                    body="",
+                    attachment_path=attachment_path,
+                    attachment_name=str(row["attachment_name"]),
+                    sending_account=self.get_mailbox(),
+                    create_if_missing=not reopening,
+                )
+            except (OutlookIntegrationError, OSError) as exc:
+                if not reopening:
+                    self.db.execute(
+                        """
+                        UPDATE outlook_outgoing_messages
+                        SET resend_status = 'technical_error',
+                            resend_error_message = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (str(exc)[:500], utc_now(), stored_message_id),
+                    )
+                raise OutlookIntegrationError(str(exc)) from exc
+            finally:
+                if run_dir.exists():
+                    shutil.rmtree(run_dir, ignore_errors=True)
+
+            now = utc_now()
+            self.db.execute(
+                """
+                UPDATE outlook_outgoing_messages
+                SET resend_status = 'draft_created',
+                    resend_outlook_entry_id = ?, resend_error_message = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (result.entry_id, now, stored_message_id),
+            )
+            self.db.audit(
+                "outlook_outgoing_message",
+                stored_message_id,
+                "outlook_resend_draft_created",
+                {"sequence": sequence, "existing_outlook_draft": result.existing},
+                actor=workflow.get_active_employee() or "Сотрудник",
+            )
+            updated = self.db.fetch_one(
+                "SELECT * FROM outlook_outgoing_messages WHERE id = ?",
+                (stored_message_id,),
+            ) or {}
+            updated["existing_outlook_draft"] = result.existing
+            return updated
+
     def reconcile_sent_messages(self) -> dict[str, int]:
         """Confirm manually sent drafts by exact copies in Outlook Sent Items."""
 
@@ -2695,6 +2821,7 @@ class OutlookOutgoingService:
                 SELECT *
                 FROM outlook_outgoing_messages
                 WHERE status = 'draft_created'
+                   OR (status = 'sent' AND resend_status = 'draft_created')
                 ORDER BY created_at, id
                 """
             )
@@ -2707,7 +2834,14 @@ class OutlookOutgoingService:
                 }
             candidates = tuple(
                 OutlookSentCandidate(
-                    draft_key=str(row.get("draft_key") or ""),
+                    draft_key=str(
+                        (
+                            row.get("resend_draft_key")
+                            if row.get("resend_status") == "draft_created"
+                            else row.get("draft_key")
+                        )
+                        or ""
+                    ),
                     recipient_email=str(row.get("recipient_email") or ""),
                     subject=str(row.get("subject") or ""),
                     attachment_name=str(row.get("attachment_name") or ""),
@@ -2721,7 +2855,13 @@ class OutlookOutgoingService:
             for row in rows:
                 try:
                     created_days.append(
-                        datetime.fromisoformat(str(row["created_at"])).date()
+                        datetime.fromisoformat(
+                            str(
+                                row["updated_at"]
+                                if row.get("resend_status") == "draft_created"
+                                else row["created_at"]
+                            )
+                        ).date()
                     )
                 except (TypeError, ValueError):
                     continue
@@ -2751,7 +2891,15 @@ class OutlookOutgoingService:
                     shutil.rmtree(staging.canonical_dir, ignore_errors=True)
 
             rows_by_key = {
-                str(row.get("draft_key") or ""): row for row in rows
+                str(
+                    (
+                        row.get("resend_draft_key")
+                        if row.get("resend_status") == "draft_created"
+                        else row.get("draft_key")
+                    )
+                    or ""
+                ): row
+                for row in rows
             }
             confirmed = 0
             confirmed_keys: set[str] = set()
@@ -2774,18 +2922,50 @@ class OutlookOutgoingService:
                     "signed_scan_id": row["signed_scan_id"],
                     "sent_at": match.sent_at,
                 }
+                is_resend = bool(
+                    row.get("resend_status") == "draft_created"
+                    and row.get("resend_draft_key") == match.draft_key
+                )
                 with self.db.connect() as connection:
-                    updated = connection.execute(
-                        """
-                        UPDATE outlook_outgoing_messages
-                        SET status = 'sent', outlook_entry_id = ?, sent_at = ?,
-                            error_message = NULL, updated_at = ?
-                        WHERE id = ? AND status = 'draft_created'
-                        """,
-                        (match.entry_id, match.sent_at, now, row["id"]),
-                    )
+                    if is_resend:
+                        updated = connection.execute(
+                            """
+                            UPDATE outlook_outgoing_messages
+                            SET resend_status = 'sent',
+                                resend_outlook_entry_id = ?, resent_at = ?,
+                                resend_error_message = NULL, updated_at = ?
+                            WHERE id = ? AND resend_status = 'draft_created'
+                              AND resend_draft_key = ?
+                            """,
+                            (
+                                match.entry_id,
+                                match.sent_at,
+                                now,
+                                row["id"],
+                                match.draft_key,
+                            ),
+                        )
+                    else:
+                        updated = connection.execute(
+                            """
+                            UPDATE outlook_outgoing_messages
+                            SET status = 'sent', outlook_entry_id = ?, sent_at = ?,
+                                error_message = NULL, updated_at = ?
+                            WHERE id = ? AND status = 'draft_created'
+                            """,
+                            (match.entry_id, match.sent_at, now, row["id"]),
+                        )
                     if updated.rowcount != 1:
                         continue
+                    event_type = (
+                        "outlook_resend_confirmed"
+                        if is_resend
+                        else "outlook_sent_confirmed"
+                    )
+                    if is_resend:
+                        audit_payload["sequence"] = int(
+                            row.get("resend_sequence") or 0
+                        )
                     connection.execute(
                         """
                         INSERT INTO audit_events(
@@ -2796,7 +2976,7 @@ class OutlookOutgoingService:
                         (
                             "outlook_outgoing_message",
                             str(row["id"]),
-                            "outlook_sent_confirmed",
+                            event_type,
                             "Система",
                             json.dumps(audit_payload, ensure_ascii=False),
                             now,

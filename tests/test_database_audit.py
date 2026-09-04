@@ -185,10 +185,16 @@ def test_initialize_backfills_legacy_outlook_draft_key(tmp_path):
     db.initialize()
 
     row = db.fetch_one(
-        "SELECT draft_key FROM outlook_outgoing_messages "
+        "SELECT draft_key, resend_sequence, resend_status, resend_draft_key "
+        "FROM outlook_outgoing_messages "
         "WHERE id = 'legacy-outgoing'"
     )
-    assert row == {"draft_key": "gns-scan-scan"}
+    assert row == {
+        "draft_key": "gns-scan-scan",
+        "resend_sequence": 0,
+        "resend_status": None,
+        "resend_draft_key": None,
+    }
 
 
 def test_initialize_marks_legacy_upload_source_as_unknown(tmp_path):
