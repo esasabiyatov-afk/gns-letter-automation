@@ -3,6 +3,7 @@
     <div>
       <h2>Входящие письма</h2>
       <p>
+        Всего PDF: {{ uploads|length }} ·
         {% if outlook_auto_enabled %}
           Автопроверка включена{% if outlook_auto_status.checked_at %} · {{ outlook_auto_status.checked_at[:16].replace('T', ' ') }}{% endif %}
         {% else %}
@@ -11,10 +12,24 @@
       </p>
     </div>
     <div class="work-toolbar-actions">
-      <form method="post" action="/work/outlook/import">
+      <form class="incoming-sort-form" method="get" action="/"
+            data-auto-submit-form>
+        <input type="hidden" name="tab" value="incoming">
+        <label>
+          <span>По дате</span>
+          <select name="incoming_sort" data-auto-submit
+                  aria-label="Сортировка входящих PDF по дате">
+            <option value="newest" {% if incoming_sort == 'newest' %}selected{% endif %}>Сначала новые</option>
+            <option value="oldest" {% if incoming_sort == 'oldest' %}selected{% endif %}>Сначала старые</option>
+          </select>
+        </label>
+        <noscript><button class="button button-secondary button-compact" type="submit">Применить</button></noscript>
+      </form>
+      <form method="post" action="/work/outlook/import"
+            data-outlook-import-form>
         <button class="button button-primary" type="submit"
                 {% if not active_employee %}disabled{% endif %}
-                data-action="receive-mail">
+                data-action="receive-mail" data-outlook-import-button>
           Получить письма
         </button>
       </form>
@@ -52,31 +67,39 @@
     </div>
   </div>
 
-  {% if outlook_auto_status.state == 'error' or outlook_import_stats.errors %}
-    <div class="inline-state inline-state-error">
-      {{ outlook_auto_status.message }}
+  <div class="inline-state{% if outlook_auto_status.state == 'error' or outlook_import_stats.errors %} inline-state-error{% endif %}"
+       data-outlook-import-status
+       data-outlook-import-active="{{ 'true' if outlook_auto_status.state == 'running' else 'false' }}"
+       aria-live="polite"
+       {% if not outlook_auto_status.checked_at %}hidden{% endif %}>
+    {{ outlook_auto_status.message }}
+    {% if outlook_auto_status.state == 'error' or outlook_import_stats.errors %}
       <a href="/settings#outlook">Настроить Outlook</a>
-    </div>
-  {% elif outlook_auto_status.checked_at %}
-    <div class="inline-state">{{ outlook_auto_status.message }}</div>
-  {% endif %}
+    {% endif %}
+  </div>
 
   <div class="compact-list incoming-list">
     <div class="compact-list-head" aria-hidden="true">
       <span>Получено</span><span>Документ</span><span>Листы</span><span>Статус</span><span></span>
     </div>
     {% for upload in uploads %}
-      <article class="compact-list-row incoming-row">
+      <article class="compact-list-row incoming-row" data-testid="incoming-row">
         <div class="incoming-source">
           <time>{{ (upload.received_at or upload.created_at)[:16].replace('T', ' ') }}</time>
           <small title="{{ upload.sender_smtp or '' }}{% if upload.original_sender_smtp %} · исходный: {{ upload.original_sender_smtp }}{% endif %}">
-            {% if upload.original_sender_smtp %}
+            {% if upload.intake_source == 'outlook' and upload.original_sender_smtp %}
               Транспортный: {{ upload.sender_smtp }}<br>
               Исходный: {{ upload.original_sender_smtp }}
+            {% elif upload.intake_source == 'outlook' %}
+              {{ upload.sender_smtp }}
+            {% elif upload.intake_source == 'inbox_folder' %}
+              Из папки «Входящие»
+            {% elif upload.intake_source == 'manual_upload' %}
+              Добавлено вручную
             {% else %}
-              {{ upload.sender_smtp or 'Ручная загрузка' }}
+              Загружено ранее
             {% endif %}
-            {% if upload.source_count > 1 %} · копий: {{ upload.source_count }}{% endif %}
+            {% if upload.intake_source == 'outlook' and upload.source_count > 1 %} · копий: {{ upload.source_count }}{% endif %}
           </small>
         </div>
         <div class="compact-primary">

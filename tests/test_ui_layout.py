@@ -105,6 +105,46 @@ def test_work_incoming_is_compact_and_mail_first(
     assert '<details id="employee-entry"' in employee_response.text
 
 
+def test_work_incoming_shows_all_pdfs_and_sorts_by_date(workflow, monkeypatch):
+    from starlette.testclient import TestClient
+
+    rows = []
+    for index in range(21):
+        rows.append(
+            (
+                f"incoming-{index:02d}",
+                f"document-{index:02d}.pdf",
+                f"document-{index:02d}.pdf",
+                f"incoming-hash-{index:02d}",
+                f"2026-09-{index + 1:02d}T08:00:00+00:00",
+            )
+        )
+    workflow.db.executemany(
+        """
+        INSERT INTO uploads(
+            id, original_filename, stored_path, sha256,
+            page_count, status, created_at
+        ) VALUES (?, ?, ?, ?, 1, 'completed', ?)
+        """,
+        rows,
+    )
+    monkeypatch.setattr(main, "workflow", workflow)
+    client = TestClient(main.app)
+
+    newest = client.get("/?tab=incoming")
+    assert newest.text.count('data-testid="incoming-row"') == 21
+    assert newest.text.index("document-20.pdf") < newest.text.index(
+        "document-00.pdf"
+    )
+    assert 'value="newest" selected' in newest.text
+
+    oldest = client.get("/?tab=incoming&incoming_sort=oldest")
+    assert oldest.text.index("document-00.pdf") < oldest.text.index(
+        "document-20.pdf"
+    )
+    assert 'value="oldest" selected' in oldest.text
+
+
 def test_upload_page_combines_pdf_and_compact_page_list(
     workflow,
     monkeypatch,
@@ -545,9 +585,10 @@ def test_created_response_actions_are_reachable_without_card_expansion():
 
     assert 'class="created-letter-line"' in template
     assert "Исх. №" in template
+    assert "Открыть письмо" in template
     assert "Сканировать" in template
     assert "Отправить по почте" in template
-    assert "Открыть Word для печати" in template
+    assert "Открыть письмо повторно" in template
     assert "Скачать копию Word" in template
     assert "Подробнее" not in template
     assert "/scan-session/start" in template

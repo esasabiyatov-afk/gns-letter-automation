@@ -227,11 +227,135 @@
     });
   }
 
-  document.querySelectorAll("[data-auto-submit]").forEach((select) => {
-    select.addEventListener("change", () => {
-      select.closest("form[data-auto-submit-form]")?.requestSubmit();
+  const bindAutoSubmit = (root = document) => {
+    root.querySelectorAll("[data-auto-submit]").forEach((select) => {
+      if (select.dataset.autoSubmitBound === "true") return;
+      select.dataset.autoSubmitBound = "true";
+      select.addEventListener("change", () => {
+        select.closest("form[data-auto-submit-form]")?.requestSubmit();
+      });
     });
-  });
+  };
+  bindAutoSubmit();
+
+  let incomingImportPoll = null;
+  const incomingWorkspaceSelector = "[data-testid='incoming-workspace']";
+
+  const setIncomingImportStatus = (workspace, status, active) => {
+    const state = workspace?.querySelector("[data-outlook-import-status]");
+    if (!state || !status) return;
+    state.hidden = false;
+    state.textContent = status.message || "Проверка почты выполняется.";
+    state.dataset.outlookImportActive = active ? "true" : "false";
+    state.classList.toggle(
+      "inline-state-error",
+      ["error", "connection_error", "timeout"].includes(status.state),
+    );
+  };
+
+  const refreshIncomingWorkspace = async (sort) => {
+    const current = document.querySelector(incomingWorkspaceSelector);
+    if (!current) return null;
+    const url = new URL("/work/incoming", window.location.origin);
+    url.searchParams.set("incoming_sort", sort || "newest");
+    const response = await fetch(url, { headers: { Accept: "text/html" } });
+    if (!response.ok) throw new Error("incoming_refresh_failed");
+    const documentBody = new DOMParser().parseFromString(
+      await response.text(),
+      "text/html",
+    );
+    const replacement = documentBody.querySelector(incomingWorkspaceSelector);
+    if (!replacement) throw new Error("incoming_fragment_missing");
+    current.replaceWith(replacement);
+    bindAutoSubmit(replacement);
+    bindIncomingWorkspace(replacement);
+    return replacement;
+  };
+
+  const pollIncomingImport = async () => {
+    try {
+      const response = await fetch("/api/outlook/import-status", {
+        headers: { Accept: "application/json" },
+      });
+      if (!response.ok) throw new Error("outlook_status_failed");
+      const payload = await response.json();
+      const workspace = document.querySelector(incomingWorkspaceSelector);
+      setIncomingImportStatus(workspace, payload.status, payload.active);
+      if (payload.active) {
+        incomingImportPoll = window.setTimeout(pollIncomingImport, 1000);
+        return;
+      }
+      incomingImportPoll = null;
+      const sort = workspace?.querySelector("[name='incoming_sort']")?.value;
+      await refreshIncomingWorkspace(sort);
+    } catch (_error) {
+      incomingImportPoll = null;
+      const workspace = document.querySelector(incomingWorkspaceSelector);
+      const button = workspace?.querySelector("[data-outlook-import-button]");
+      if (button) {
+        button.disabled = false;
+        button.textContent = button.dataset.originalLabel || "Получить письма";
+      }
+    }
+  };
+
+  const bindIncomingWorkspace = (workspace) => {
+    if (!workspace || workspace.dataset.incomingWorkspaceBound === "true") return;
+    workspace.dataset.incomingWorkspaceBound = "true";
+
+    const sortForm = workspace.querySelector(".incoming-sort-form");
+    sortForm?.addEventListener("submit", async (event) => {
+      if (!window.fetch) return;
+      event.preventDefault();
+      const sort = sortForm.querySelector("[name='incoming_sort']")?.value || "newest";
+      const url = new URL(window.location.href);
+      url.searchParams.set("tab", "incoming");
+      url.searchParams.set("incoming_sort", sort);
+      window.history.replaceState(null, "", url);
+      try {
+        await refreshIncomingWorkspace(sort);
+      } catch (_error) {
+        window.location.assign(url);
+      }
+    });
+
+    const importForm = workspace.querySelector("[data-outlook-import-form]");
+    const importButton = workspace.querySelector("[data-outlook-import-button]");
+    importForm?.addEventListener("submit", async (event) => {
+      if (!window.fetch || !importButton || importButton.disabled) return;
+      event.preventDefault();
+      importButton.dataset.originalLabel ||= importButton.textContent;
+      importButton.disabled = true;
+      importButton.textContent = "Проверяем…";
+      try {
+        const response = await fetch(importForm.action, {
+          method: "POST",
+          headers: { Accept: "application/json" },
+        });
+        if (!response.ok) throw new Error("outlook_import_start_failed");
+        const payload = await response.json();
+        setIncomingImportStatus(workspace, payload.status, payload.active);
+        if (!incomingImportPoll) incomingImportPoll = window.setTimeout(pollIncomingImport, 250);
+      } catch (_error) {
+        importButton.disabled = false;
+        importButton.textContent = importButton.dataset.originalLabel || "Получить письма";
+        setIncomingImportStatus(
+          workspace,
+          { state: "error", message: "Не удалось запустить проверку почты." },
+          false,
+        );
+      }
+    });
+
+    if (
+      workspace.querySelector("[data-outlook-import-status]")
+        ?.dataset.outlookImportActive === "true"
+      && !incomingImportPoll
+    ) {
+      incomingImportPoll = window.setTimeout(pollIncomingImport, 250);
+    }
+  };
+  bindIncomingWorkspace(document.querySelector(incomingWorkspaceSelector));
 
   document.querySelectorAll("[data-open-dialog]").forEach((button) => {
     button.addEventListener("click", () => {

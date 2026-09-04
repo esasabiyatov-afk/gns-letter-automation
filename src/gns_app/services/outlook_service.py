@@ -30,7 +30,6 @@ from gns_app.services.storage import (
     save_pdf_stream,
 )
 from gns_app.services.windows_focus import (
-    focus_window_handle,
     start_outlook_certificate_dialog_watcher,
 )
 
@@ -38,6 +37,8 @@ from gns_app.services.windows_focus import (
 OL_FOLDER_INBOX = 6
 OL_FOLDER_DRAFTS = 16
 OL_MAIL_ITEM = 0
+OL_WINDOW_STATE_MINIMIZED = 1
+OL_WINDOW_STATE_NORMAL = 2
 OL_BY_VALUE = 1
 OL_TEXT = 1
 OL_EMBEDDED_ITEM = 5
@@ -503,7 +504,13 @@ class OutlookGateway(Protocol):
 class OutlookWorkflow(Protocol):
     def get_active_employee(self) -> str: ...
 
-    def create_upload(self, original_filename: str, stream: Any) -> str: ...
+    def create_upload(
+        self,
+        original_filename: str,
+        stream: Any,
+        *,
+        intake_source: str = "outlook",
+    ) -> str: ...
 
     def get_response_letter(self, letter_id: str) -> dict[str, Any] | None: ...
 
@@ -816,12 +823,14 @@ class PyWin32OutlookGateway:
             inspector = _safe_attribute(mail, "GetInspector", None)
             if inspector is not None:
                 try:
+                    if (
+                        int(_safe_attribute(inspector, "WindowState", -1))
+                        == OL_WINDOW_STATE_MINIMIZED
+                    ):
+                        inspector.WindowState = OL_WINDOW_STATE_NORMAL
                     inspector.Activate()
                 except Exception:
                     pass
-                focus_window_handle(
-                    int(_safe_attribute(inspector, "HWND", 0) or 0)
-                )
             return OutlookDraftResult(
                 entry_id=_safe_text(_safe_attribute(mail, "EntryID")),
                 recipient_email=_safe_text(_safe_attribute(mail, "To")),
@@ -1180,6 +1189,17 @@ class PyWin32OutlookGateway:
             inbox = self._select_inbox(namespace, mailbox)
             self._ensure_outlook_window(application, inbox)
             items = inbox.Items
+            sorted_by_received_time = False
+            try:
+                # Outlook sorts the COM collection itself.  Once the first
+                # older item is reached, the rest of a large Inbox can be
+                # skipped instead of crossing the COM boundary item by item.
+                items.Sort("[ReceivedTime]", True)
+                sorted_by_received_time = True
+            except Exception:
+                # Some stores do not support Sort.  The per-item date check
+                # below remains the correctness fallback.
+                pass
             inspected = 0
             eligible = 0
             known = 0
@@ -1194,7 +1214,11 @@ class PyWin32OutlookGateway:
                         continue
                     inspected += 1
                     received_time = _safe_attribute(mail, "ReceivedTime", None)
-                    if received_time is None or received_time.date() < received_since:
+                    if received_time is None:
+                        continue
+                    if received_time.date() < received_since:
+                        if sorted_by_received_time:
+                            break
                         continue
                     sender_smtp = self._sender_smtp(mail)
                     accepted, original_sender_smtp = (
@@ -1471,31 +1495,36 @@ class SubprocessOutlookGateway:
         )
         timeout = timeout_seconds or self.timeout_seconds
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        input_text = (
+            json.dumps(input_payload, ensure_ascii=False)
+            if input_payload is not None
+            else None
+        )
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 command,
-                input=(
-                    json.dumps(input_payload, ensure_ascii=False)
-                    if input_payload is not None
-                    else None
-                ),
-                capture_output=True,
+                stdin=subprocess.PIPE if input_text is not None else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=timeout,
-                check=False,
                 creationflags=creation_flags,
                 cwd=Path.cwd(),
                 env={**os.environ, "PYTHONIOENCODING": "utf-8"},
             )
+            stdout, _stderr = process.communicate(
+                input=input_text,
+                timeout=timeout,
+            )
         except subprocess.TimeoutExpired as exc:
+            self._terminate_bridge_process_tree(process)
             raise OutlookProbeTimeoutError(
                 f"Outlook не ответил за {timeout} секунд. "
                 "Возможно, открыто скрытое окно выбора профиля или подтверждения."
             ) from exc
         try:
-            payload = json.loads(completed.stdout.strip())
+            payload = json.loads(stdout.strip())
         except (json.JSONDecodeError, AttributeError) as exc:
             raise OutlookConnectionError(
                 "Модуль Outlook завершился без корректного результата."
@@ -1517,6 +1546,39 @@ class SubprocessOutlookGateway:
             }.get(error_kind, OutlookConnectionError)
             raise error_class(error_message)
         return payload
+
+    @staticmethod
+    def _terminate_bridge_process_tree(process: subprocess.Popen[str]) -> None:
+        """Stop the exact timed-out worker and its venv child on Windows."""
+
+        if sys.platform == "win32" and process.poll() is None:
+            try:
+                subprocess.run(
+                    [
+                        "taskkill.exe",
+                        "/PID",
+                        str(process.pid),
+                        "/T",
+                        "/F",
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                    check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
 class OutlookService:
@@ -2590,8 +2652,23 @@ class OutlookInboxImporter:
             str(row["source_key"])
             for row in self.db.fetch_all(
                 """
-                SELECT source_key FROM outlook_messages
-                WHERE status IN ('completed', 'no_pdf')
+                SELECT messages.source_key
+                FROM outlook_messages AS messages
+                WHERE messages.status = 'no_pdf'
+                   OR (
+                       messages.status = 'completed'
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM outlook_attachments AS attachments
+                           LEFT JOIN uploads
+                             ON uploads.id = attachments.upload_id
+                           WHERE attachments.message_key = messages.source_key
+                             AND (
+                                 attachments.upload_id IS NULL
+                                 OR uploads.id IS NULL
+                             )
+                       )
+                   )
                 """
             )
         )
@@ -2699,6 +2776,7 @@ class OutlookInboxImporter:
                                 upload_id = workflow.create_upload(
                                     safe_name,
                                     stream,
+                                    intake_source="outlook",
                                 )
                             imported_uploads.append(upload_id)
                             attachment_status = "imported"

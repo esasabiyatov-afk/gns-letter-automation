@@ -6,6 +6,7 @@ import sys
 from contextlib import asynccontextmanager, suppress
 from datetime import date
 from pathlib import Path
+from threading import Lock
 from urllib.parse import quote
 
 import uvicorn
@@ -48,6 +49,7 @@ from gns_app.services.registry_service import RegistryLookupError
 from gns_app.services.scanner_service import ScannerCancelled, ScannerError
 from gns_app.services.taxpayer_service import TaxpayerKind, classify_taxpayer
 from gns_app.services.windows_focus import start_foreground_watcher
+from gns_app.services.word_desktop import WordDesktopError, open_word_document
 from gns_app.services.workflow import (
     WorkflowService,
     WorkflowValidationError,
@@ -67,6 +69,48 @@ outlook = OutlookService(
 )
 outlook_importer = OutlookInboxImporter(db, settings, outlook)
 outlook_outgoing = OutlookOutgoingService(db, settings, outlook)
+_outlook_import_activity_lock = Lock()
+_outlook_import_active = False
+
+
+def _claim_outlook_import() -> bool:
+    global _outlook_import_active
+    with _outlook_import_activity_lock:
+        if _outlook_import_active:
+            return False
+        _outlook_import_active = True
+        return True
+
+
+def _release_outlook_import() -> None:
+    global _outlook_import_active
+    with _outlook_import_activity_lock:
+        _outlook_import_active = False
+
+
+def _outlook_import_is_active() -> bool:
+    with _outlook_import_activity_lock:
+        return _outlook_import_active
+
+
+def _queue_outlook_import(background_tasks: BackgroundTasks) -> bool:
+    """Queue one import and return immediately to the browser."""
+
+    if not _claim_outlook_import():
+        return False
+    try:
+        outlook_importer.record_automation_status(
+            state="running",
+            message="Проверка почты запущена в фоне.",
+        )
+        background_tasks.add_task(
+            _run_automated_outlook_import,
+            claimed=True,
+        )
+    except Exception:
+        _release_outlook_import()
+        raise
+    return True
 
 
 async def _resume_interrupted_uploads(upload_ids: list[str]) -> None:
@@ -78,55 +122,64 @@ async def _resume_interrupted_uploads(upload_ids: list[str]) -> None:
         )
 
 
-async def _run_automated_outlook_import() -> None:
-    outlook_importer.record_automation_status(
-        state="running",
-        message="Проверяется папка входящих Outlook.",
-    )
+async def _run_automated_outlook_import(*, claimed: bool = False) -> bool:
+    if not claimed and not _claim_outlook_import():
+        return False
     try:
-        summary = await asyncio.to_thread(outlook_importer.import_new, workflow)
-    except OutlookIntegrationError as exc:
         outlook_importer.record_automation_status(
-            state="error",
-            message=str(exc),
-            errors=1,
+            state="running",
+            message="Проверяется папка входящих Outlook.",
         )
-        return
-    except Exception:
-        outlook_importer.record_automation_status(
-            state="error",
-            message=(
-                "Автоматическая проверка завершилась технической ошибкой. "
-                "Приложение повторит попытку по расписанию."
-            ),
-            errors=1,
-        )
-        return
-
-    processing_errors = 0
-    for upload_id in summary["imported"]:
         try:
-            await asyncio.to_thread(workflow.process_upload, upload_id)
+            summary = await asyncio.to_thread(
+                outlook_importer.import_new,
+                workflow,
+            )
+        except OutlookIntegrationError as exc:
+            outlook_importer.record_automation_status(
+                state="error",
+                message=str(exc),
+                errors=1,
+            )
+            return True
         except Exception:
-            processing_errors += 1
-    error_count = (
-        int(summary["scan_errors"])
-        + int(bool(summary.get("sync_error")))
-        + len(summary["errors"])
-        + processing_errors
-    )
-    state = "warning" if error_count else "success"
-    message = (
-        f"Проверка завершена. Новых писем: {summary['new_messages']}; "
-        f"сохранено PDF: {summary['saved_attachments']}; ошибок: {error_count}."
-    )
-    outlook_importer.record_automation_status(
-        state=state,
-        message=message,
-        new_messages=summary["new_messages"],
-        saved_attachments=summary["saved_attachments"],
-        errors=error_count,
-    )
+            outlook_importer.record_automation_status(
+                state="error",
+                message=(
+                    "Автоматическая проверка завершилась технической ошибкой. "
+                    "Приложение повторит попытку по расписанию."
+                ),
+                errors=1,
+            )
+            return True
+
+        processing_errors = 0
+        for upload_id in summary["imported"]:
+            try:
+                await asyncio.to_thread(workflow.process_upload, upload_id)
+            except Exception:
+                processing_errors += 1
+        error_count = (
+            int(summary["scan_errors"])
+            + int(bool(summary.get("sync_error")))
+            + len(summary["errors"])
+            + processing_errors
+        )
+        state = "warning" if error_count else "success"
+        message = (
+            f"Проверка завершена. Новых писем: {summary['new_messages']}; "
+            f"сохранено PDF: {summary['saved_attachments']}; ошибок: {error_count}."
+        )
+        outlook_importer.record_automation_status(
+            state=state,
+            message=message,
+            new_messages=summary["new_messages"],
+            saved_attachments=summary["saved_attachments"],
+            errors=error_count,
+        )
+        return True
+    finally:
+        _release_outlook_import()
 
 
 async def _outlook_automation_loop() -> None:
@@ -490,10 +543,25 @@ def period_review_status(case: dict) -> dict[str, object]:
     }
 
 
+def _incoming_workspace_values(incoming_sort: str) -> dict[str, object]:
+    safe_sort = (
+        incoming_sort if incoming_sort in {"newest", "oldest"} else "newest"
+    )
+    return {
+        "uploads": workflow.list_incoming_work(sort_order=safe_sort),
+        "incoming_sort": safe_sort,
+        "inbox_dir": str(workflow.get_inbox_dir()),
+        "outlook_auto_enabled": outlook_importer.get_auto_enabled(),
+        "outlook_auto_status": outlook_importer.get_automation_status(),
+        "outlook_import_stats": outlook_importer.stats(),
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 def index(
     request: Request,
     tab: str = "incoming",
+    incoming_sort: str = "newest",
     response_view: str = "prepare",
     focus_letter: str = "",
     outgoing_start: str = "",
@@ -506,6 +574,8 @@ def index(
         tab = "incoming"
     if response_view not in {"prepare", "created", "manual"}:
         response_view = "prepare"
+    if incoming_sort not in {"newest", "oldest"}:
+        incoming_sort = "newest"
 
     values: dict[str, object] = {
         "work_tab": tab,
@@ -516,13 +586,7 @@ def index(
         "error": error,
     }
     if tab == "incoming":
-        values.update(
-            uploads=workflow.list_incoming_work(limit=20),
-            inbox_dir=str(workflow.get_inbox_dir()),
-            outlook_auto_enabled=outlook_importer.get_auto_enabled(),
-            outlook_auto_status=outlook_importer.get_automation_status(),
-            outlook_import_stats=outlook_importer.stats(),
-        )
+        values.update(_incoming_workspace_values(incoming_sort))
     elif tab == "review":
         review = workflow.manual_review_overview()
         values.update(
@@ -589,6 +653,18 @@ def index(
         request,
         "index.html",
         context(request, **values),
+    )
+
+
+@app.get("/work/incoming", response_class=HTMLResponse)
+def incoming_workspace_fragment(
+    request: Request,
+    incoming_sort: str = "newest",
+):
+    return templates.TemplateResponse(
+        request,
+        "_work_incoming.html",
+        context(request, **_incoming_workspace_values(incoming_sort)),
     )
 
 
@@ -736,6 +812,7 @@ def recipient_suggestions(query: str = ""):
 
 @app.get("/settings", response_class=HTMLResponse)
 def settings_page(request: Request, message: str = "", error: str = ""):
+    scanner_settings = workflow.get_scanner_settings()
     return templates.TemplateResponse(
         request,
         "settings.html",
@@ -744,6 +821,8 @@ def settings_page(request: Request, message: str = "", error: str = ""):
             inbox_dir=str(workflow.get_inbox_dir()),
             registry_priority=workflow.get_registry_priority(),
             processing_workers=workflow.get_processing_workers(),
+            scanner_dpi=scanner_settings["dpi"],
+            scanner_color_mode=scanner_settings["color_mode"],
             outlook_status=outlook.last_result(),
             outlook_allowed_senders=", ".join(
                 sorted(outlook_importer.get_forwarding_senders())
@@ -826,6 +905,7 @@ def request_outlook_send_receive():
 
 @app.post("/settings/outlook/config")
 def update_outlook_import_settings(
+    background_tasks: BackgroundTasks,
     outlook_allowed_senders: str = Form(""),
     outlook_import_since: str = Form(...),
     outlook_mailbox: str = Form(""),
@@ -850,8 +930,14 @@ def update_outlook_import_settings(
             f"/settings?error={quote(str(exc))}#outlook",
             status_code=303,
         )
+    started = _queue_outlook_import(background_tasks)
+    message = (
+        "Настройки Outlook сохранены. Получение PDF запущено."
+        if started
+        else "Настройки Outlook сохранены. Проверка почты уже выполняется."
+    )
     return RedirectResponse(
-        "/settings?message=" + quote("Настройки Outlook сохранены.") + "#outlook",
+        "/settings?message=" + quote(message) + "#outlook",
         status_code=303,
     )
 
@@ -904,64 +990,51 @@ def send_response_letter_outlook_test_message(
 
 @app.post("/settings/outlook/import")
 def import_outlook_attachments(background_tasks: BackgroundTasks):
-    try:
-        summary = outlook_importer.import_new(workflow)
-    except OutlookIntegrationError as exc:
-        return RedirectResponse(
-            f"/settings?error={quote(str(exc))}#outlook",
-            status_code=303,
-        )
-    for upload_id in summary["imported"]:
-        background_tasks.add_task(workflow.process_upload, upload_id)
-    error_count = (
-        int(summary["scan_errors"])
-        + int(bool(summary.get("sync_error")))
-        + len(summary["errors"])
-    )
+    started = _queue_outlook_import(background_tasks)
     message = (
-        f"Outlook проверен. Новых писем: {summary['new_messages']}; "
-        f"сохранено PDF: {summary['saved_attachments']}; "
-        f"повторов: {summary['known'] + summary['duplicate_attachments']}; "
-        f"ошибок: {error_count}."
-    )
-    parameter = (
-        "error"
-        if error_count
-        else "message"
+        "Проверка Outlook запущена в фоне."
+        if started
+        else "Проверка Outlook уже выполняется в фоне."
     )
     return RedirectResponse(
-        f"/settings?{parameter}={quote(message)}#outlook",
+        f"/settings?message={quote(message)}#outlook",
         status_code=303,
     )
 
 
 @app.post("/work/outlook/import")
-def import_outlook_from_work(background_tasks: BackgroundTasks):
-    try:
-        summary = outlook_importer.import_new(workflow)
-    except OutlookIntegrationError as exc:
-        return RedirectResponse(
-            f"/?tab=incoming&error={quote(str(exc))}",
-            status_code=303,
+def import_outlook_from_work(
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    started = _queue_outlook_import(background_tasks)
+    status = outlook_importer.get_automation_status()
+    if "application/json" in request.headers.get("accept", ""):
+        return JSONResponse(
+            {
+                "accepted": started,
+                "active": True,
+                "status": status,
+            },
+            status_code=202 if started else 200,
         )
-    for upload_id in summary["imported"]:
-        background_tasks.add_task(workflow.process_upload, upload_id)
-    error_count = (
-        int(summary["scan_errors"])
-        + int(bool(summary.get("sync_error")))
-        + len(summary["errors"])
-    )
     message = (
-        f"Почта проверена. Новых писем: {summary['new_messages']}; "
-        f"PDF: {summary['saved_attachments']}; "
-        f"повторов: {summary['known'] + summary['duplicate_attachments']}; "
-        f"ошибок: {error_count}."
+        "Проверка почты запущена в фоне."
+        if started
+        else "Проверка почты уже выполняется в фоне."
     )
-    parameter = "error" if error_count else "message"
     return RedirectResponse(
-        f"/?tab=incoming&{parameter}={quote(message)}",
+        f"/?tab=incoming&message={quote(message)}",
         status_code=303,
     )
+
+
+@app.get("/api/outlook/import-status")
+def outlook_import_status():
+    return {
+        "active": _outlook_import_is_active(),
+        "status": outlook_importer.get_automation_status(),
+    }
 
 
 @app.post("/settings")
@@ -972,6 +1045,8 @@ def update_settings(
     inbox_dir: str = Form(...),
     registry_priority: str = Form("osoo"),
     processing_workers: int = Form(2),
+    scanner_dpi: int = Form(150),
+    scanner_color_mode: str = Form("grayscale"),
 ):
     try:
         workflow.update_ui_preferences(
@@ -984,6 +1059,8 @@ def update_settings(
             inbox_dir=inbox_dir,
             registry_priority=registry_priority,
             processing_workers=processing_workers,
+            scanner_dpi=scanner_dpi,
+            scanner_color_mode=scanner_color_mode,
         )
     except WorkflowValidationError as exc:
         return RedirectResponse(
@@ -1573,23 +1650,29 @@ def open_grouped_response_for_print(group_id: str):
         )
         if not path.exists():
             raise OSError("missing response")
-        startfile = getattr(os, "startfile", None)
-        if startfile is None:
-            raise OSError("Word open is unavailable")
         start_foreground_watcher(
             title_parts=(path.stem,),
             class_parts=("opusapp",),
             timeout_seconds=20,
+            keep_foreground_seconds=2.0,
         )
-        startfile(str(path))
-    except (StorageError, OSError):
+        open_word_document(path)
+        workflow.mark_response_group_opened_for_print(
+            group_id,
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+    except (StorageError, OSError, WordDesktopError):
         return RedirectResponse(
-            "/today?error="
+            "/?tab=responses&response_view=created&error="
             + quote("Не удалось открыть ответ в Word. Скачайте файл вручную."),
             status_code=303,
         )
     return RedirectResponse(
-        "/today?message=" + quote("Ответ открыт в Word для проверки и печати."),
+        (
+            "/?tab=responses&response_view=created&message="
+            + quote("Ответ открыт в Word для проверки и печати.")
+            + f"#group-{quote(group_id)}"
+        ),
         status_code=303,
     )
 

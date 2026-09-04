@@ -56,6 +56,41 @@
             <input name="inbox_dir" value="{{ inbox_dir }}" required>
             <small>Из этой папки команда «Проверить папку» забирает новые PDF.</small>
         </label>
+        <div class="settings-field-grid settings-field-grid-compact"
+             data-testid="scanner-settings">
+          <label class="field setting-field">
+            <span>Разрешение сканера</span>
+            <select name="scanner_dpi">
+              <option value="150" {% if scanner_dpi == 150 %}selected{% endif %}>
+                150 DPI — быстро
+              </option>
+              <option value="200" {% if scanner_dpi == 200 %}selected{% endif %}>
+                200 DPI — баланс
+              </option>
+              <option value="300" {% if scanner_dpi == 300 %}selected{% endif %}>
+                300 DPI — чётко
+              </option>
+            </select>
+          </label>
+          <label class="field setting-field">
+            <span>Режим изображения</span>
+            <select name="scanner_color_mode">
+              <option value="grayscale"
+                      {% if scanner_color_mode == 'grayscale' %}selected{% endif %}>
+                Градации серого — быстро
+              </option>
+              <option value="black_white"
+                      {% if scanner_color_mode == 'black_white' %}selected{% endif %}>
+                Чёрно-белый — минимальный размер
+              </option>
+              <option value="color"
+                      {% if scanner_color_mode == 'color' %}selected{% endif %}>
+                Цветной
+              </option>
+            </select>
+          </label>
+        </div>
+        <small>Эти параметры применяются к каждому новому листу WIA.</small>
         <div class="settings-capability settings-capability-compact">
           <span class="status status-completed">WIA</span>
           <div>
@@ -184,12 +219,7 @@
         </form>
         <form method="post" action="/settings/outlook/send-receive">
           <button class="button button-secondary" type="submit">
-            Получить почту
-          </button>
-        </form>
-        <form method="post" action="/settings/outlook/import">
-          <button class="button button-primary" type="submit">
-            Загрузить новые PDF
+            Синхронизировать Outlook
           </button>
         </form>
       </div>
@@ -254,7 +284,7 @@
       </section>
       <div class="settings-submit-bar">
         <button class="button button-primary" type="submit">
-          Сохранить Outlook
+          Сохранить и получить письма
         </button>
       </div>
     </form>

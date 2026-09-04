@@ -312,6 +312,7 @@ def start_foreground_watcher(
     title_parts: Iterable[str] = (),
     class_parts: Iterable[str] = (),
     timeout_seconds: float = 15.0,
+    keep_foreground_seconds: float = 0.0,
 ) -> threading.Thread | None:
     if sys.platform != "win32":
         return None
@@ -326,6 +327,20 @@ def start_foreground_watcher(
                 title_parts=titles,
                 class_parts=classes,
             ):
+                # После открытия документа браузер ещё завершает переход и
+                # Windows может вернуть фокус ему. Коротко повторяем
+                # активацию только после явной команды пользователя.
+                keep_until = min(
+                    deadline,
+                    time.monotonic() + max(0.0, keep_foreground_seconds),
+                )
+                while time.monotonic() < keep_until:
+                    time.sleep(0.2)
+                    find_and_focus_window(
+                        process_id=process_id,
+                        title_parts=titles,
+                        class_parts=classes,
+                    )
                 return
             time.sleep(0.15)
 

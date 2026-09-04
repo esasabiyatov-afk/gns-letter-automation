@@ -53,6 +53,10 @@ from gns_app.services.registry_service import (
     RegistryLookupResult,
 )
 from gns_app.services.scanner_service import (
+    DEFAULT_SCANNER_COLOR_MODE,
+    DEFAULT_SCANNER_DPI,
+    SCANNER_COLOR_INTENTS,
+    SCANNER_DPI_CHOICES,
     ScannerCancelled,
     ScannerError,
     ScannerService,
@@ -79,6 +83,9 @@ class WorkflowValidationError(ValueError):
 class WorkflowService:
     ACTIVE_EMPLOYEE_SETTING = "active_employee_key"
     GNS_OFFICES_SOURCE_SETTING = "gns_offices_source_hash"
+    INTAKE_SOURCES = frozenset(
+        {"outlook", "manual_upload", "inbox_folder", "legacy"}
+    )
     GNS_EMAILS_SOURCE_SETTING = "gns_emails_source_hash"
     GNS_EMAILS_SOURCE_URL = (
         "https://sti.gov.kg/section/0/electronic_appeals_of_citizens"
@@ -87,6 +94,8 @@ class WorkflowService:
     INBOX_DIR_SETTING = "inbox_dir"
     REGISTRY_PRIORITY_SETTING = "registry_priority"
     PROCESSING_WORKERS_SETTING = "processing_workers"
+    SCANNER_DPI_SETTING = "scanner_dpi"
+    SCANNER_COLOR_MODE_SETTING = "scanner_color_mode"
     # Город Ош — отдельная административная единица. Упоминание Ошской
     # области в той же фразе противоречит городскому маршруту и не может
     # автоматически выбрать его по частичному совпадению.
@@ -274,6 +283,26 @@ class WorkflowService:
             value = self.settings.processing_workers
         return max(1, min(2, value))
 
+    def get_scanner_settings(self) -> dict[str, int | str]:
+        rows = self.db.fetch_all(
+            "SELECT key, value FROM settings WHERE key IN (?, ?)",
+            (self.SCANNER_DPI_SETTING, self.SCANNER_COLOR_MODE_SETTING),
+        )
+        values = {str(row["key"]): str(row["value"]) for row in rows}
+        try:
+            dpi = int(values.get(self.SCANNER_DPI_SETTING, DEFAULT_SCANNER_DPI))
+        except (TypeError, ValueError):
+            dpi = DEFAULT_SCANNER_DPI
+        if dpi not in SCANNER_DPI_CHOICES:
+            dpi = DEFAULT_SCANNER_DPI
+        color_mode = values.get(
+            self.SCANNER_COLOR_MODE_SETTING,
+            DEFAULT_SCANNER_COLOR_MODE,
+        ).strip().casefold()
+        if color_mode not in SCANNER_COLOR_INTENTS:
+            color_mode = DEFAULT_SCANNER_COLOR_MODE
+        return {"dpi": dpi, "color_mode": color_mode}
+
     def update_operational_settings(
         self,
         *,
@@ -281,6 +310,8 @@ class WorkflowService:
         inbox_dir: str,
         registry_priority: str = CompositeRegistryClient.PRIMARY_OSOO,
         processing_workers: int = 2,
+        scanner_dpi: int = DEFAULT_SCANNER_DPI,
+        scanner_color_mode: str = DEFAULT_SCANNER_COLOR_MODE,
         actor: str = "Сотрудник",
     ) -> None:
         try:
@@ -300,6 +331,19 @@ class WorkflowService:
         ):
             registry_priority = CompositeRegistryClient.PRIMARY_OSOO
         workers = max(1, min(2, int(processing_workers)))
+        try:
+            scanner_dpi = int(scanner_dpi)
+        except (TypeError, ValueError) as exc:
+            raise WorkflowValidationError(
+                "Укажите корректное разрешение сканирования"
+            ) from exc
+        if scanner_dpi not in SCANNER_DPI_CHOICES:
+            raise WorkflowValidationError(
+                "Разрешение сканирования должно быть 150, 200 или 300 DPI"
+            )
+        scanner_color_mode = str(scanner_color_mode).strip().casefold()
+        if scanner_color_mode not in SCANNER_COLOR_INTENTS:
+            raise WorkflowValidationError("Выберите режим изображения сканера")
         now = utc_now()
         self.db.executemany(
             """
@@ -313,6 +357,8 @@ class WorkflowService:
                 (self.INBOX_DIR_SETTING, str(folder), now),
                 (self.REGISTRY_PRIORITY_SETTING, registry_priority, now),
                 (self.PROCESSING_WORKERS_SETTING, str(workers), now),
+                (self.SCANNER_DPI_SETTING, str(scanner_dpi), now),
+                (self.SCANNER_COLOR_MODE_SETTING, scanner_color_mode, now),
             ],
         )
         self.db.audit(
@@ -324,6 +370,8 @@ class WorkflowService:
                 "inbox_dir": str(folder),
                 "registry_priority": registry_priority,
                 "processing_workers": workers,
+                "scanner_dpi": scanner_dpi,
+                "scanner_color_mode": scanner_color_mode,
             },
             actor=actor,
         )
@@ -1034,7 +1082,8 @@ class WorkflowService:
             self.db.execute(
                 """
                 UPDATE response_groups
-                SET district_place = ?, response_page_overflow = ?, updated_at = ?
+                SET district_place = ?, response_page_overflow = ?,
+                    opened_for_print_at = NULL, updated_at = ?
                 WHERE id = ?
                 """,
                 (after, int(likely_overflow), now, group["id"]),
@@ -1245,11 +1294,15 @@ class WorkflowService:
         self,
         original_filename: str,
         stream: BinaryIO,
+        *,
+        intake_source: str = "manual_upload",
     ) -> str:
         upload_id = uuid4().hex
         safe_name = sanitize_filename(original_filename)
         if Path(safe_name).suffix.casefold() != ".pdf":
             raise WorkflowValidationError("Разрешены только PDF-файлы")
+        if intake_source not in self.INTAKE_SOURCES:
+            raise WorkflowValidationError("Неизвестный источник PDF")
 
         upload_dir = self.settings.uploads_dir / upload_id
         stored_path = upload_dir / "source.pdf"
@@ -1270,14 +1323,15 @@ class WorkflowService:
             """
             INSERT INTO uploads(
                 id, original_filename, stored_path, sha256,
-                page_count, status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                intake_source, page_count, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 upload_id,
                 safe_name,
                 str(stored_path),
                 digest,
+                intake_source,
                 page_count,
                 UploadStatus.REGISTERED,
                 created_at,
@@ -1312,6 +1366,7 @@ class WorkflowService:
                 "filename": safe_name,
                 "page_count": page_count,
                 "sha256": digest,
+                "intake_source": intake_source,
             },
         )
         return upload_id
@@ -1357,7 +1412,11 @@ class WorkflowService:
                     continue
                 with safe_source.open("rb") as stream:
                     imported.append(
-                        self.create_upload(safe_source.name, stream)
+                        self.create_upload(
+                            safe_source.name,
+                            stream,
+                            intake_source="inbox_folder",
+                        )
                     )
             except Exception as exc:
                 errors.append(
@@ -5133,6 +5192,31 @@ class WorkflowService:
             (group_id,),
         )
 
+    def mark_response_group_opened_for_print(
+        self,
+        group_id: str,
+        *,
+        actor: str = "Сотрудник",
+    ) -> None:
+        if not self.get_response_group(group_id):
+            raise WorkflowValidationError("Общий ответ не найден")
+        now = utc_now()
+        with self.db.connect() as connection:
+            connection.execute(
+                "UPDATE response_groups SET opened_for_print_at = ? WHERE id = ?",
+                (now, group_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO audit_events(
+                    entity_type, entity_id, event_type,
+                    actor, payload_json, created_at
+                ) VALUES ('response_group', ?, 'response_opened_for_print',
+                          ?, '{}', ?)
+                """,
+                (group_id, actor, now),
+            )
+
     @staticmethod
     def _canonical_outgoing_number(
         value: str | int | None,
@@ -5450,7 +5534,8 @@ class WorkflowService:
                     connection.execute(
                         """
                         UPDATE response_groups
-                        SET response_page_overflow = ?, updated_at = ?
+                        SET response_page_overflow = ?,
+                            opened_for_print_at = NULL, updated_at = ?
                         WHERE id = ?
                         """,
                         (int(overflow), now, group_id),
@@ -5773,7 +5858,12 @@ class WorkflowService:
         destination = self._scan_session_page_destination(session, page_id)
         destination.parent.mkdir(parents=True, exist_ok=True)
         try:
-            self.scanner.acquire_a4(destination)
+            scanner_settings = self.get_scanner_settings()
+            self.scanner.acquire_a4(
+                destination,
+                dpi=int(scanner_settings["dpi"]),
+                color_mode=str(scanner_settings["color_mode"]),
+            )
             size_bytes = destination.stat().st_size
             if not size_bytes:
                 raise WorkflowValidationError("Сканер вернул пустой лист")
@@ -6630,22 +6720,37 @@ class WorkflowService:
 
     def list_incoming_work(
         self,
-        limit: int = 20,
+        limit: int | None = None,
+        *,
+        sort_order: str = "newest",
     ) -> list[dict[str, Any]]:
-        safe_limit = max(1, min(int(limit), 100))
+        direction = "ASC" if sort_order == "oldest" else "DESC"
+        limit_clause = ""
+        parameters: tuple[Any, ...] = ()
+        if limit is not None:
+            safe_limit = max(1, min(int(limit), 100))
+            limit_clause = "LIMIT ?"
+            parameters = (safe_limit,)
         return self.db.fetch_all(
-            """
+            f"""
             SELECT uploads.*,
-                   MIN(outlook_messages.received_at) AS received_at,
-                   GROUP_CONCAT(
-                       DISTINCT outlook_messages.sender_smtp
-                   ) AS sender_smtp,
-                   GROUP_CONCAT(
-                       DISTINCT outlook_messages.original_sender_smtp
-                   ) AS original_sender_smtp,
-                   COUNT(
-                       DISTINCT outlook_messages.source_key
-                   ) AS source_count
+                   CASE WHEN uploads.intake_source = 'outlook'
+                        THEN MIN(outlook_messages.received_at)
+                   END AS received_at,
+                   CASE WHEN uploads.intake_source = 'outlook'
+                        THEN GROUP_CONCAT(
+                            DISTINCT outlook_messages.sender_smtp
+                        )
+                   END AS sender_smtp,
+                   CASE WHEN uploads.intake_source = 'outlook'
+                        THEN GROUP_CONCAT(
+                            DISTINCT outlook_messages.original_sender_smtp
+                        )
+                   END AS original_sender_smtp,
+                   CASE WHEN uploads.intake_source = 'outlook'
+                        THEN COUNT(DISTINCT outlook_messages.source_key)
+                        ELSE 0
+                   END AS source_count
             FROM uploads
             LEFT JOIN outlook_attachments
               ON outlook_attachments.upload_id = uploads.id
@@ -6655,10 +6760,10 @@ class WorkflowService:
             GROUP BY uploads.id
             ORDER BY COALESCE(
                 MIN(outlook_messages.received_at), uploads.created_at
-            ) DESC, uploads.id
-            LIMIT ?
+            ) {direction}, uploads.created_at {direction}, uploads.id {direction}
+            {limit_clause}
             """,
-            (safe_limit,),
+            parameters,
         )
 
     def get_upload_pages(self, upload_id: str) -> list[dict[str, Any]]:
@@ -7895,6 +8000,7 @@ class WorkflowService:
                     cases.recipient_display_name,
                     uploads.original_filename,
                     uploads.page_count,
+                    uploads.intake_source,
                     uploads.created_at AS uploaded_at,
                     (SELECT COUNT(*) FROM taxpayers
                      WHERE taxpayers.case_id = cases.id)
@@ -7919,6 +8025,7 @@ class WorkflowService:
                      FROM pages
                      WHERE pages.case_id = cases.id)
                         AS source_first_page,
+                    CASE WHEN uploads.intake_source = 'outlook' THEN
                     (SELECT outlook_messages.sender_smtp
                      FROM outlook_attachments
                      JOIN outlook_messages
@@ -7926,7 +8033,8 @@ class WorkflowService:
                           outlook_attachments.message_key
                      WHERE outlook_attachments.upload_id = cases.upload_id
                      ORDER BY outlook_messages.received_at
-                     LIMIT 1) AS sender_smtp,
+                     LIMIT 1) END AS sender_smtp,
+                    CASE WHEN uploads.intake_source = 'outlook' THEN
                     (SELECT outlook_messages.original_sender_smtp
                      FROM outlook_attachments
                      JOIN outlook_messages
@@ -7934,7 +8042,8 @@ class WorkflowService:
                           outlook_attachments.message_key
                      WHERE outlook_attachments.upload_id = cases.upload_id
                      ORDER BY outlook_messages.received_at
-                     LIMIT 1) AS original_sender_smtp,
+                     LIMIT 1) END AS original_sender_smtp,
+                    CASE WHEN uploads.intake_source = 'outlook' THEN
                     (SELECT outlook_messages.received_at
                      FROM outlook_attachments
                      JOIN outlook_messages
@@ -7942,7 +8051,7 @@ class WorkflowService:
                           outlook_attachments.message_key
                      WHERE outlook_attachments.upload_id = cases.upload_id
                      ORDER BY outlook_messages.received_at
-                     LIMIT 1) AS received_at,
+                     LIMIT 1) END AS received_at,
                     (SELECT response_groups.id
                      FROM response_group_cases
                      JOIN response_groups

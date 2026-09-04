@@ -175,6 +175,39 @@ def test_period_threshold_and_inbox_path_are_persisted(workflow, tmp_path):
     assert inbox.is_dir()
 
 
+def test_scanner_settings_are_persisted_and_rendered(
+    workflow,
+    tmp_path,
+    monkeypatch,
+):
+    from starlette.testclient import TestClient
+
+    from gns_app import main
+
+    assert workflow.get_scanner_settings() == {
+        "dpi": 150,
+        "color_mode": "grayscale",
+    }
+    workflow.update_operational_settings(
+        period_threshold="2020-01-01",
+        inbox_dir=str(tmp_path / "incoming-pdf"),
+        scanner_dpi=300,
+        scanner_color_mode="color",
+    )
+    assert workflow.get_scanner_settings() == {
+        "dpi": 300,
+        "color_mode": "color",
+    }
+
+    monkeypatch.setattr(main, "workflow", workflow)
+    response = TestClient(main.app).get("/settings")
+
+    assert response.status_code == 200
+    assert 'data-testid="scanner-settings"' in response.text
+    assert '<option value="300" selected>' in response.text
+    assert 'value="color"' in response.text
+
+
 def test_registry_priority_defaults_to_osoo(workflow):
     assert workflow.get_registry_priority() == "osoo"
 

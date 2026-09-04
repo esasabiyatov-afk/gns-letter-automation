@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS uploads (
     original_filename TEXT NOT NULL,
     stored_path TEXT NOT NULL,
     sha256 TEXT NOT NULL,
+    intake_source TEXT NOT NULL DEFAULT 'legacy',
     page_count INTEGER NOT NULL,
     status TEXT NOT NULL,
     issue_message TEXT,
@@ -253,6 +254,7 @@ CREATE TABLE IF NOT EXISTS response_groups (
     taxpayers_per_letter INTEGER NOT NULL DEFAULT 1,
     response_path TEXT,
     response_page_overflow INTEGER,
+    opened_for_print_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -430,6 +432,7 @@ class Database:
                 """
             )
             self._ensure_taxpayer_columns(connection)
+            self._ensure_upload_columns(connection)
             self._ensure_page_columns(connection)
             self._ensure_case_columns(connection)
             self._ensure_response_group_columns(connection)
@@ -438,6 +441,22 @@ class Database:
             self._ensure_outlook_outgoing_columns(connection)
             self._clean_legacy_district_places(connection)
             self._normalize_legacy_taxpayer_names(connection)
+
+    @staticmethod
+    def _ensure_upload_columns(connection: sqlite3.Connection) -> None:
+        existing = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(uploads)"
+            ).fetchall()
+        }
+        if "intake_source" not in existing:
+            # Старые строки нельзя честно отнести к Outlook только по
+            # одинаковому файлу: ручная копия может иметь тот же SHA-256.
+            connection.execute(
+                "ALTER TABLE uploads ADD COLUMN "
+                "intake_source TEXT NOT NULL DEFAULT 'legacy'"
+            )
 
     @staticmethod
     def _ensure_page_columns(connection: sqlite3.Connection) -> None:
@@ -556,6 +575,10 @@ class Database:
             connection.execute(
                 "ALTER TABLE response_groups ADD COLUMN "
                 "taxpayers_per_letter INTEGER"
+            )
+        if "opened_for_print_at" not in existing:
+            connection.execute(
+                "ALTER TABLE response_groups ADD COLUMN opened_for_print_at TEXT"
             )
         groups = connection.execute(
             """

@@ -86,12 +86,15 @@ class FakeImportGateway(FakeGateway):
         *,
         sender_smtp: str = "esasabiyatov@gmail.com",
         original_sender_smtp: str = "",
+        received_at: str = "2026-08-21T09:00:00+06:00",
     ):
         super().__init__()
         self.source_pdf = source_pdf
         self.sender_smtp = sender_smtp
         self.original_sender_smtp = original_sender_smtp
+        self.received_at = received_at
         self.scan_requests: list[frozenset[str]] = []
+        self.received_since_requests: list[date] = []
         self.staging_dirs: list[Path] = []
 
     def scan_inbox(
@@ -110,8 +113,17 @@ class FakeImportGateway(FakeGateway):
         assert staging_dir.is_dir()
         assert (staging_dir / ".gns-ready").is_file()
         self.scan_requests.append(known_message_keys)
+        self.received_since_requests.append(received_since)
         self.staging_dirs.append(staging_dir)
         message_key = "a" * 64
+        if date.fromisoformat(self.received_at[:10]) < received_since:
+            return OutlookInboxScan(
+                inspected_mail_count=1,
+                eligible_message_count=0,
+                known_message_count=0,
+                scan_error_count=0,
+                messages=(),
+            )
         if message_key in known_message_keys:
             known_messages = ()
             if self.original_sender_smtp:
@@ -119,7 +131,7 @@ class FakeImportGateway(FakeGateway):
                     OutlookScannedMessage(
                         source_key=message_key,
                         sender_smtp=self.sender_smtp,
-                        received_at="2026-08-21T09:00:00+06:00",
+                        received_at=self.received_at,
                         attachment_count=0,
                         pdf_attachment_count=0,
                         attachments=(),
@@ -157,7 +169,7 @@ class FakeImportGateway(FakeGateway):
                 OutlookScannedMessage(
                     source_key=message_key,
                     sender_smtp=self.sender_smtp,
-                    received_at="2026-08-21T09:00:00+06:00",
+                    received_at=self.received_at,
                     attachment_count=2,
                     pdf_attachment_count=2,
                     attachments=tuple(attachments),
@@ -261,18 +273,13 @@ def test_subprocess_gateway_reads_structured_probe(monkeypatch):
         },
     }
 
-    def fake_run(*args, **kwargs):
-        assert json.loads(kwargs["input"])["mailbox"] == (
-            "esasabiyatov@gmail.com"
-        )
-        return subprocess.CompletedProcess(
-            args=args[0],
-            returncode=0,
-            stdout=json.dumps(payload, ensure_ascii=False),
-            stderr="",
-        )
+    class FakeProcess:
+        def communicate(self, *, input=None, timeout=None):
+            assert timeout == 30
+            assert json.loads(input)["mailbox"] == "esasabiyatov@gmail.com"
+            return json.dumps(payload, ensure_ascii=False), ""
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
 
     probe = SubprocessOutlookGateway().inspect(
         request_sync=True,
@@ -282,6 +289,31 @@ def test_subprocess_gateway_reads_structured_probe(monkeypatch):
     assert probe.sync_requested
     assert probe.accounts[0].account_type == "Exchange"
     assert probe.accounts[0].smtp_address == "employee@example.test"
+
+
+def test_subprocess_gateway_terminates_worker_after_timeout(monkeypatch):
+    class TimedOutProcess:
+        def communicate(self, *, input=None, timeout=None):
+            raise subprocess.TimeoutExpired("outlook-worker", timeout)
+
+    process = TimedOutProcess()
+    gateway = SubprocessOutlookGateway()
+    terminated = []
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(
+        gateway,
+        "_terminate_bridge_process_tree",
+        lambda current: terminated.append(current),
+    )
+
+    try:
+        gateway._call_bridge("diagnose", timeout_seconds=1)
+    except OutlookProbeTimeoutError as exc:
+        assert isinstance(exc.__cause__, subprocess.TimeoutExpired)
+    else:
+        raise AssertionError("Ожидался тайм-аут Outlook-worker")
+
+    assert terminated == [process]
 
 
 def test_subprocess_sync_keeps_late_certificate_watcher_in_main_process(
@@ -548,6 +580,14 @@ def test_com_gateway_creates_and_reopens_same_outlook_draft(
 
     items = Items()
 
+    class Inspector:
+        def __init__(self):
+            self.WindowState = 1
+            self.activate_count = 0
+
+        def Activate(self):
+            self.activate_count += 1
+
     class Mail:
         EntryID = "draft-entry-1"
 
@@ -558,6 +598,7 @@ def test_com_gateway_creates_and_reopens_same_outlook_draft(
             self.UserProperties = UserProperties()
             self.Attachments = Attachments()
             self.display_count = 0
+            self.GetInspector = Inspector()
 
         def Save(self):
             if self not in items.values:
@@ -604,6 +645,8 @@ def test_com_gateway_creates_and_reopens_same_outlook_draft(
     assert len(items.values) == 1
     assert len(items.values[0].Attachments.added) == 1
     assert items.values[0].display_count == 2
+    assert items.values[0].GetInspector.WindowState == 2
+    assert items.values[0].GetInspector.activate_count == 2
 
 
 def test_com_gateway_sends_only_existing_pdf_draft_to_exact_account(
@@ -863,25 +906,53 @@ def test_com_gateway_filters_sender_and_exports_only_pdf(
     class Mail:
         Class = 43
         SenderEmailType = "SMTP"
-        ReceivedTime = datetime(2026, 8, 21, 9, 0, 0)
         Parent = SimpleNamespace(StoreID="store")
         EntryID = "entry"
 
-        def __init__(self, sender, internet_id):
+        def __init__(self, sender, internet_id, received_time):
             self.SenderEmailAddress = sender
             self.PropertyAccessor = Accessor(internet_id)
             self.Attachments = Attachments()
+            self.ReceivedTime = received_time
 
-    allowed_mail = Mail("esasabiyatov@gmail.com", "allowed@example.test")
-    blocked_mail = Mail("blocked@example.test", "blocked@example.test")
+    allowed_mail = Mail(
+        "esasabiyatov@gmail.com",
+        "allowed@example.test",
+        datetime(2026, 8, 21, 9, 0, 0),
+    )
+    blocked_mail = Mail(
+        "blocked@example.test",
+        "blocked@example.test",
+        datetime(2026, 8, 19, 9, 0, 0),
+    )
+    older_mail = Mail(
+        "older@example.test",
+        "older@example.test",
+        datetime(2026, 8, 18, 9, 0, 0),
+    )
 
     class Items:
-        values = [allowed_mail, blocked_mail]
-        Count = 2
+        def __init__(self):
+            self.values = [older_mail, blocked_mail, allowed_mail]
+            self.sort_calls = []
+            self.item_calls = 0
 
-        @classmethod
-        def Item(cls, index):
-            return cls.values[index - 1]
+        @property
+        def Count(self):
+            return len(self.values)
+
+        def Sort(self, property_name, descending):
+            self.sort_calls.append((property_name, descending))
+            self.values.sort(
+                key=lambda item: item.ReceivedTime,
+                reverse=descending,
+            )
+
+        def Item(self, index):
+            self.item_calls += 1
+            return self.values[index - 1]
+
+    items = Items()
 
     class Namespace:
         def __init__(self):
@@ -889,7 +960,7 @@ def test_com_gateway_filters_sender_and_exports_only_pdf(
 
             configured_store = SimpleNamespace(
                 DisplayName="esasabiyatov@gmail.com",
-                GetDefaultFolder=lambda folder_id: SimpleNamespace(Items=Items()),
+                GetDefaultFolder=lambda folder_id: SimpleNamespace(Items=items),
             )
             self.Stores = SimpleNamespace(
                 Count=1,
@@ -937,6 +1008,9 @@ def test_com_gateway_filters_sender_and_exports_only_pdf(
     assert allowed_mail.Attachments.values[0].saved
     assert not allowed_mail.Attachments.values[1].saved
     assert not blocked_mail.Attachments.values[0].saved
+    assert not older_mail.Attachments.values[0].saved
+    assert items.sort_calls == [("[ReceivedTime]", True)]
+    assert items.item_calls == 2
 
 
 def test_com_gateway_accepts_direct_gns_domain_sender():
@@ -1289,6 +1363,53 @@ def test_settings_routes_use_outlook_result(monkeypatch):
     assert "message=" in sync_response.headers["location"]
 
 
+def test_saving_outlook_date_queues_import_with_new_value(monkeypatch):
+    from fastapi import BackgroundTasks
+
+    from gns_app import main
+
+    class FakeImporter:
+        saved_date = ""
+
+        @classmethod
+        def update_settings(cls, *, import_since, **kwargs):
+            cls.saved_date = import_since
+
+    class FakeOutgoing:
+        @staticmethod
+        def validate_subject_template(value):
+            assert value == "Ответ {outgoing_number}"
+
+        @staticmethod
+        def update_subject_template(value):
+            assert value == "Ответ {outgoing_number}"
+
+    monkeypatch.setattr(main, "outlook_importer", FakeImporter())
+    monkeypatch.setattr(main, "outlook_outgoing", FakeOutgoing())
+    monkeypatch.setattr(
+        main,
+        "_queue_outlook_import",
+        lambda background_tasks: FakeImporter.saved_date == "2026-08-20",
+    )
+    background_tasks = BackgroundTasks()
+
+    response = main.update_outlook_import_settings(
+        background_tasks,
+        outlook_allowed_senders="reception@bank.kg",
+        outlook_import_since="2026-08-20",
+        outlook_mailbox="employee@bank.kg",
+        outlook_auto_enabled=True,
+        outlook_auto_interval=5,
+        outlook_subject_template="Ответ {outgoing_number}",
+    )
+    assert response.status_code == 303
+    from urllib.parse import unquote
+
+    assert "Получение PDF запущено" in unquote(
+        response.headers["location"]
+    )
+
+
 def test_outlook_draft_route_reports_created_and_existing(monkeypatch):
     from gns_app import main
 
@@ -1353,6 +1474,9 @@ def test_outlook_import_route_queues_only_new_uploads(monkeypatch):
     from gns_app import main
 
     class FakeImporter:
+        def record_automation_status(self, **kwargs):
+            self.status = kwargs
+
         @staticmethod
         def import_new(workflow):
             return {
@@ -1367,12 +1491,59 @@ def test_outlook_import_route_queues_only_new_uploads(monkeypatch):
 
     monkeypatch.setattr(main, "outlook_importer", FakeImporter())
     background_tasks = BackgroundTasks()
+    main._release_outlook_import()
+    try:
+        response = main.import_outlook_attachments(background_tasks)
 
-    response = main.import_outlook_attachments(background_tasks)
+        assert response.status_code == 303
+        assert "message=" in response.headers["location"]
+        assert len(background_tasks.tasks) == 1
+    finally:
+        main._release_outlook_import()
 
-    assert response.status_code == 303
-    assert "message=" in response.headers["location"]
-    assert len(background_tasks.tasks) == 1
+
+def test_work_outlook_import_returns_immediately_as_json(monkeypatch):
+    from fastapi import BackgroundTasks
+    from starlette.requests import Request
+
+    from gns_app import main
+
+    class FakeImporter:
+        @staticmethod
+        def get_automation_status():
+            return {
+                "state": "running",
+                "checked_at": "2026-08-21T09:00:00+06:00",
+                "message": "Проверка почты запущена в фоне.",
+                "new_messages": 0,
+                "saved_attachments": 0,
+                "errors": 0,
+            }
+
+    monkeypatch.setattr(main, "outlook_importer", FakeImporter())
+    monkeypatch.setattr(main, "_queue_outlook_import", lambda tasks: True)
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/work/outlook/import",
+            "raw_path": b"/work/outlook/import",
+            "query_string": b"",
+            "headers": [(b"accept", b"application/json")],
+            "client": ("127.0.0.1", 50000),
+            "server": ("127.0.0.1", 8765),
+        }
+    )
+
+    response = main.import_outlook_from_work(request, BackgroundTasks())
+
+    assert response.status_code == 202
+    assert json.loads(response.body) == {
+        "accepted": True,
+        "active": True,
+        "status": FakeImporter.get_automation_status(),
+    }
 
 
 def test_outlook_import_saves_message_once_and_reuses_duplicate_content(
@@ -1425,6 +1596,92 @@ def test_outlook_import_saves_message_once_and_reuses_duplicate_content(
     assert len(preserved) == 2
     assert all(row["upload_id"] is None for row in preserved)
     assert all(Path(row["stored_path"]).exists() for row in preserved)
+
+    restored = workflow.import_inbox()
+    assert len(restored["imported"]) == 1
+    assert workflow.get_upload(restored["imported"][0])["intake_source"] == (
+        "inbox_folder"
+    )
+
+    restored_from_outlook = importer.import_new(workflow)
+    assert len(restored_from_outlook["imported"]) == 0
+    relinked = workflow.db.fetch_all(
+        "SELECT upload_id FROM outlook_attachments ORDER BY attachment_index"
+    )
+    assert {row["upload_id"] for row in relinked} == {
+        restored["imported"][0]
+    }
+    incoming = workflow.list_incoming_work()
+    assert incoming[0]["intake_source"] == "inbox_folder"
+    assert incoming[0]["sender_smtp"] is None
+
+
+def test_manual_pdf_with_same_content_as_outlook_stays_manual(
+    workflow,
+    tmp_path,
+):
+    workflow.initialize_employee_profiles()
+    source = write_test_pdf(tmp_path / "same-content.pdf")
+    importer = OutlookInboxImporter(
+        workflow.db,
+        workflow.settings,
+        OutlookService(FakeImportGateway(source)),
+    )
+    importer.update_settings(
+        allowed_senders="esasabiyatov@gmail.com",
+        import_since="2026-08-20",
+    )
+    importer.import_new(workflow)
+    workflow.reset_processing_data()
+
+    with source.open("rb") as stream:
+        manual_upload_id = workflow.create_upload("manual.pdf", stream)
+    importer.import_new(workflow)
+
+    manual = workflow.get_upload(manual_upload_id)
+    incoming = workflow.list_incoming_work()
+    row = next(item for item in incoming if item["id"] == manual_upload_id)
+
+    assert manual["intake_source"] == "manual_upload"
+    assert row["sender_smtp"] is None
+    assert row["original_sender_smtp"] is None
+
+
+def test_outlook_import_uses_changed_earlier_date_for_unseen_message(
+    workflow,
+    tmp_path,
+):
+    workflow.initialize_employee_profiles()
+    gateway = FakeImportGateway(
+        write_test_pdf(tmp_path / "older-source.pdf"),
+        received_at="2026-08-21T09:00:00+06:00",
+    )
+    importer = OutlookInboxImporter(
+        workflow.db,
+        workflow.settings,
+        OutlookService(gateway),
+    )
+    importer.update_settings(
+        allowed_senders="esasabiyatov@gmail.com",
+        import_since="2026-08-22",
+        mailbox="esasabiyatov@gmail.com",
+    )
+
+    first = importer.import_new(workflow)
+    assert not first["imported"]
+
+    importer.update_settings(
+        allowed_senders="esasabiyatov@gmail.com",
+        import_since="2026-08-20",
+        mailbox="esasabiyatov@gmail.com",
+    )
+    second = importer.import_new(workflow)
+
+    assert len(second["imported"]) == 1
+    assert gateway.received_since_requests == [
+        date(2026, 8, 22),
+        date(2026, 8, 20),
+    ]
 
 
 def test_outlook_import_stores_and_shows_original_sender_from_relay(
@@ -1853,7 +2110,7 @@ def test_settings_page_renders_outlook_diagnostic(workflow, monkeypatch):
 
     assert "Подключение Outlook" in body
     assert "Рабочий профиль" in body
-    assert "Получить почту" in body
+    assert "Синхронизировать Outlook" in body
     assert 'data-settings-tab="processing"' in body
     assert 'data-settings-tab="outlook"' in body
     assert 'data-settings-tab="service"' in body

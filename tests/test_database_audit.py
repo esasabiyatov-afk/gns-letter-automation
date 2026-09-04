@@ -143,6 +143,42 @@ def test_initialize_adds_original_sender_to_legacy_outlook_messages(tmp_path):
     }
 
 
+def test_initialize_marks_legacy_upload_source_as_unknown(tmp_path):
+    path = tmp_path / "legacy-upload.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE uploads (
+                id TEXT PRIMARY KEY,
+                original_filename TEXT NOT NULL,
+                stored_path TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                page_count INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                issue_message TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO uploads(
+                id, original_filename, stored_path, sha256,
+                page_count, status, created_at
+            ) VALUES ('legacy-upload', 'old.pdf', 'old.pdf', 'hash', 1,
+                      'ready', '2026-08-21T09:00:00+00:00')
+            """
+        )
+
+    db = Database(path)
+    db.initialize()
+
+    assert db.fetch_one(
+        "SELECT intake_source FROM uploads WHERE id = 'legacy-upload'"
+    )["intake_source"] == "legacy"
+
+
 def test_initialize_cleans_edge_quote_and_audits_change(tmp_path):
     db = Database(tmp_path / "cleanup.sqlite3")
     db.initialize()
@@ -253,4 +289,5 @@ def test_initialize_backfills_letters_for_legacy_split_response(tmp_path):
         "WHERE response_group_id = 'legacy-group' ORDER BY letter_order"
     )
     assert group["taxpayers_per_letter"] == 2
+    assert group["opened_for_print_at"] is None
     assert [letter["taxpayer_count"] for letter in letters] == [2, 2, 1]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
@@ -867,6 +868,8 @@ def test_outgoing_number_correction_is_unique_and_regenerates_word(workflow):
         "SELECT * FROM response_letters WHERE response_group_id = ?",
         (group_id,),
     )
+    workflow.mark_response_group_opened_for_print(group_id)
+    assert workflow.get_response_group(group_id)["opened_for_print_at"]
 
     workflow.set_outgoing_number(letter["id"], "9544")
     workflow.set_outgoing_number(letter["id"], "9600")
@@ -875,6 +878,7 @@ def test_outgoing_number_correction_is_unique_and_regenerates_word(workflow):
         "SELECT * FROM response_letters WHERE id = ?", (letter["id"],)
     )
     assert refreshed["outgoing_number"] == "9600"
+    assert workflow.get_response_group(group_id)["opened_for_print_at"] is None
     document_text = "\n".join(
         paragraph.text for paragraph in Document(output).paragraphs
     )
@@ -1035,10 +1039,10 @@ def test_today_page_opens_generated_response_in_word(workflow, monkeypatch):
     workflow.check_abs_today("batch-user", "one-time-secret")
     group = workflow.today_overview()["not_found_groups"][0]
     group_id, output = workflow.generate_daily_response(group["group_key"])
-    opened: list[str] = []
+    opened: list[Path] = []
     focus_requests: list[dict] = []
     monkeypatch.setattr(main, "workflow", workflow)
-    monkeypatch.setattr(main.os, "startfile", opened.append, raising=False)
+    monkeypatch.setattr(main, "open_word_document", opened.append)
     monkeypatch.setattr(
         main,
         "start_foreground_watcher",
@@ -1046,15 +1050,28 @@ def test_today_page_opens_generated_response_in_word(workflow, monkeypatch):
     )
     client = TestClient(main.app)
 
+    before = client.get("/?tab=responses&response_view=created")
+    assert re.search(r">\s*Открыть письмо\s*<", before.text)
+    assert not re.search(r">\s*Сканировать\s*<", before.text)
+
     response = client.post(
         f"/response-groups/{group_id}/open-for-print",
         follow_redirects=False,
     )
 
     assert response.status_code == 303
-    assert opened == [str(output)]
+    assert response.headers["location"].startswith(
+        "/?tab=responses&response_view=created"
+    )
+    assert opened == [output]
     assert focus_requests[0]["title_parts"] == (output.stem,)
     assert focus_requests[0]["class_parts"] == ("opusapp",)
+    assert focus_requests[0]["keep_foreground_seconds"] == 2.0
+    assert workflow.get_response_group(group_id)["opened_for_print_at"]
+
+    after = client.get("/?tab=responses&response_view=created")
+    assert re.search(r">\s*Сканировать\s*<", after.text)
+    assert "Можно сканировать" in after.text
 
 
 def _ready_response_letter(workflow):
@@ -1152,7 +1169,10 @@ def test_signed_scan_preserves_multi_page_pdf(workflow):
 def test_device_scan_is_registered_through_wia_gateway(workflow, monkeypatch):
     _, letter = _ready_response_letter(workflow)
 
-    def fake_acquire(destination, timeout_seconds=900):
+    scan_profiles = []
+
+    def fake_acquire(destination, timeout_seconds=900, **scanner_profile):
+        scan_profiles.append(scanner_profile)
         Image.new("RGB", (1240, 1754), "white").save(destination, "PNG")
         return destination
 
@@ -1162,13 +1182,14 @@ def test_device_scan_is_registered_through_wia_gateway(workflow, monkeypatch):
 
     assert scan["source"] == "wia"
     assert scan["status"] == "needs_confirmation"
+    assert scan_profiles == [{"dpi": 150, "color_mode": "grayscale"}]
 
 
 def test_multi_page_wia_session_builds_one_pdf(workflow, monkeypatch):
     _, letter = _ready_response_letter(workflow)
     acquired = 0
 
-    def fake_acquire(destination, timeout_seconds=900):
+    def fake_acquire(destination, timeout_seconds=900, **scanner_profile):
         nonlocal acquired
         acquired += 1
         color = "white" if acquired == 1 else "lightgray"
@@ -1208,7 +1229,7 @@ def test_wia_session_error_keeps_previous_pages_and_can_resume(
     _, letter = _ready_response_letter(workflow)
     calls = 0
 
-    def flaky_acquire(destination, timeout_seconds=900):
+    def flaky_acquire(destination, timeout_seconds=900, **scanner_profile):
         nonlocal calls
         calls += 1
         if calls == 2:
@@ -1238,7 +1259,7 @@ def test_wia_session_reorders_replaces_and_removes_pages(workflow, monkeypatch):
     _, letter = _ready_response_letter(workflow)
     acquired = 0
 
-    def fake_acquire(destination, timeout_seconds=900):
+    def fake_acquire(destination, timeout_seconds=900, **scanner_profile):
         nonlocal acquired
         acquired += 1
         Image.new("RGB", (620, 877), (acquired, acquired, acquired)).save(

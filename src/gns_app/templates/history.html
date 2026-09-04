@@ -31,11 +31,17 @@
       <article class="compact-list-row history-list-grid">
         <div class="history-received">
           <time>{{ (item.received_at or item.uploaded_at)[:16].replace('T', ' ') }}</time>
-          {% if item.original_sender_smtp %}
+          {% if item.intake_source == 'outlook' and item.original_sender_smtp %}
             <small>Транспортный: {{ item.sender_smtp }}</small>
             <small>Исходный: {{ item.original_sender_smtp }}</small>
+          {% elif item.intake_source == 'outlook' %}
+            <small>{{ item.sender_smtp }}</small>
+          {% elif item.intake_source == 'inbox_folder' %}
+            <small>Из папки «Входящие»</small>
+          {% elif item.intake_source == 'manual_upload' %}
+            <small>Добавлено вручную</small>
           {% else %}
-            <small>{{ item.sender_smtp or 'Ручная загрузка' }}</small>
+            <small>Загружено ранее</small>
           {% endif %}
         </div>
         <div class="compact-primary">
