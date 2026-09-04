@@ -256,8 +256,8 @@ class QrService:
             issue="QR не найден и на повышенном разрешении.",
         )
 
-    @staticmethod
     def _try_decode(
+        self,
         image: Image.Image,
         method: str,
         binarizer: zxingcpp.Binarizer,
@@ -276,12 +276,7 @@ class QrService:
             for item in results
             if item.text and item.valid and item.error is None
         }
-        if len(payloads) == 1:
-            return payloads.pop(), method
-        if len(payloads) > 1:
-            # Несколько разных QR нельзя выбирать по догадке.
-            return "", "multiple-values"
-        return None
+        return self._select_payload(payloads, method, "multiple-values")
 
     def _validate_decoder_candidates(
         self,
@@ -289,11 +284,7 @@ class QrService:
         zbar_candidate: tuple[str, str] | None,
     ) -> QrDecodeResult | None:
         if zxing_candidate and zbar_candidate:
-            if (
-                not zxing_candidate[0]
-                or not zbar_candidate[0]
-                or zxing_candidate[0] != zbar_candidate[0]
-            ):
+            if not zxing_candidate[0] or not zbar_candidate[0]:
                 return QrDecodeResult(
                     status=QrStatus.DECODE_ERROR,
                     method="zxing-zbar-conflict",
@@ -302,17 +293,35 @@ class QrService:
                         "Требуется ручная проверка."
                     ),
                 )
-            return self._validate(
-                zxing_candidate[0],
-                f"{zxing_candidate[1]}+{zbar_candidate[1]}",
+            zxing_result = self._validate(*zxing_candidate)
+            zbar_result = self._validate(*zbar_candidate)
+            if zxing_result.status == QrStatus.FOUND:
+                if zbar_result.status != QrStatus.FOUND:
+                    return zxing_result
+                if zxing_candidate[0] == zbar_candidate[0]:
+                    return self._validate(
+                        zxing_candidate[0],
+                        f"{zxing_candidate[1]}+{zbar_candidate[1]}",
+                    )
+            elif zbar_result.status == QrStatus.FOUND:
+                return zbar_result
+            elif zxing_candidate[0] == zbar_candidate[0]:
+                return zxing_result
+            return QrDecodeResult(
+                status=QrStatus.DECODE_ERROR,
+                method="zxing-zbar-conflict",
+                issue=(
+                    "QR-декодеры получили разные значения. "
+                    "Требуется ручная проверка."
+                ),
             )
         candidate = zxing_candidate or zbar_candidate
         if candidate:
             return self._validate(candidate[0], candidate[1])
         return None
 
-    @staticmethod
     def _try_decode_zbar(
+        self,
         image: Image.Image,
         method: str,
     ) -> tuple[str, str] | None:
@@ -324,11 +333,37 @@ class QrService:
                 continue
             if payload:
                 payloads.add(payload)
+        return self._select_payload(
+            payloads,
+            method,
+            "multiple-values-zbar",
+        )
+
+    def _select_payload(
+        self,
+        payloads: set[str],
+        method: str,
+        multiple_method: str,
+    ) -> tuple[str, str] | None:
+        allowed = {payload for payload in payloads if self._is_allowed(payload)}
+        if len(allowed) == 1:
+            return allowed.pop(), method
+        if len(allowed) > 1:
+            # Несколько разных разрешённых QR нельзя выбирать по догадке.
+            return "", multiple_method
         if len(payloads) == 1:
             return payloads.pop(), method
         if len(payloads) > 1:
-            return "", "multiple-values-zbar"
+            return "", multiple_method
         return None
+
+    def _is_allowed(self, payload: str) -> bool:
+        parsed = urlparse(payload)
+        return (
+            parsed.scheme == "https"
+            and (parsed.hostname or "").lower() in self.allowed_hosts
+            and parsed.path in self.allowed_paths
+        )
 
     def _validate(self, payload: str, method: str) -> QrDecodeResult:
         if not payload:
@@ -340,11 +375,7 @@ class QrService:
 
         parsed = urlparse(payload)
         host = (parsed.hostname or "").lower()
-        if (
-            parsed.scheme != "https"
-            or host not in self.allowed_hosts
-            or parsed.path not in self.allowed_paths
-        ):
+        if not self._is_allowed(payload):
             return QrDecodeResult(
                 status=QrStatus.INVALID_URL,
                 method=method,

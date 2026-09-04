@@ -1,6 +1,8 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import zxingcpp
 from PIL import Image
 
 from gns_app.domain import QrStatus
@@ -87,6 +89,77 @@ def test_conflicting_decoders_require_manual_review(
 
     assert result.status == QrStatus.DECODE_ERROR
     assert result.method == "zxing-zbar-conflict"
+
+
+def test_decoders_prefer_the_only_allowed_qr(monkeypatch: pytest.MonkeyPatch):
+    allowed = "https://qr.salyk.kg/getsti010decission?encodedText=letter"
+    unsupported = "https://docs.gov.kg/document/other"
+    service = QrService(
+        frozenset({"qr.salyk.kg"}),
+        frozenset({"/getsti010decission"}),
+    )
+    monkeypatch.setattr(
+        "gns_app.services.qr_service.zxingcpp.read_barcodes",
+        lambda *args, **kwargs: [
+            SimpleNamespace(text=allowed, valid=True, error=None),
+            SimpleNamespace(text=unsupported, valid=True, error=None),
+        ],
+    )
+    monkeypatch.setattr(
+        "gns_app.services.qr_service.zbar_decode",
+        lambda *args, **kwargs: [
+            SimpleNamespace(data=allowed.encode()),
+            SimpleNamespace(data=unsupported.encode()),
+        ],
+    )
+    image = Image.new("L", (32, 32), 255)
+
+    zxing = service._try_decode(
+        image, "zxing", zxingcpp.Binarizer.LocalAverage
+    )
+    zbar = service._try_decode_zbar(image, "zbar")
+
+    assert zxing == (allowed, "zxing")
+    assert zbar == (allowed, "zbar")
+
+
+def test_untrusted_decoder_value_does_not_override_official_qr(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    image_path = tmp_path / "two-qr.png"
+    Image.new("L", (32, 32), 255).save(image_path)
+    allowed = "https://qr.salyk.kg/getsti010decission?encodedText=letter"
+    service = QrService(
+        frozenset({"qr.salyk.kg"}),
+        frozenset({"/getsti010decission"}),
+    )
+    monkeypatch.setattr(service, "_try_decode", lambda *args: (allowed, "zxing"))
+    monkeypatch.setattr(
+        service,
+        "_try_decode_zbar",
+        lambda *args: ("https://docs.gov.kg/document/other", "zbar"),
+    )
+
+    result = service.decode(image_path)
+
+    assert result.status == QrStatus.FOUND
+    assert result.payload == allowed
+
+
+def test_multiple_allowed_qr_values_remain_ambiguous():
+    service = QrService(
+        frozenset({"qr.salyk.kg"}),
+        frozenset({"/getsti010decission"}),
+    )
+    candidates = {
+        "https://qr.salyk.kg/getsti010decission?encodedText=one",
+        "https://qr.salyk.kg/getsti010decission?encodedText=two",
+    }
+
+    assert service._select_payload(candidates, "zxing", "multiple") == (
+        "",
+        "multiple",
+    )
 
 
 def test_high_resolution_retry_uses_zbar_fallback(

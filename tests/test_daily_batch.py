@@ -1794,7 +1794,8 @@ def test_real_abs_account_counts_are_persisted_without_auto_confirmation(
     assert overview_taxpayer["abs_active_account_count"] == 2
     assert overview_taxpayer["abs_closed_account_count"] == 1
     monkeypatch.setattr(main, "workflow", workflow)
-    response = TestClient(main.app).get("/?tab=review")
+    client = TestClient(main.app)
+    response = client.get("/?tab=review")
     assert response.status_code == 200
     visible_text = " ".join(
         BeautifulSoup(response.text, "html.parser")
@@ -1805,6 +1806,24 @@ def test_real_abs_account_counts_are_persisted_without_auto_confirmation(
     assert "Расчётный счёт" in response.text
     assert 'name="account_result" value="found"' in response.text
     assert 'name="account_result" value="not_found"' in response.text
+
+    confirmed = client.post(
+        f"/cases/{case_id}/abs-account/taxpayer",
+        data={
+            "taxpayer_inn": "12345678901234",
+            "account_result": "found",
+            "return_to": "review",
+        },
+        follow_redirects=False,
+    )
+    assert confirmed.status_code == 303
+    assert not workflow.manual_review_overview()["account_groups"]
+    manual = workflow.manual_response_groups()
+    assert len(manual) == 1
+    assert manual[0]["taxpayers"][0]["inn"] == "12345678901234"
+    manual_page = client.get("/?tab=responses&response_view=manual")
+    assert manual_page.status_code == 200
+    assert "12345678901234" in manual_page.text
 
 
 def test_found_abs_questionnaire_with_account_stays_manual(workflow):
