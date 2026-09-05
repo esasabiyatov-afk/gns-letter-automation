@@ -90,7 +90,7 @@ class Settings:
         outlook_test_email = os.environ.get(
             "GNS_OUTLOOK_TEST_EMAIL", ""
         ).strip().casefold()
-        if outlook_test_email not in {"", "esasabiyatov@gmail.com"}:
+        if outlook_test_email not in {"", "esensabiyatov@gmail.com"}:
             raise ValueError(
                 "GNS_OUTLOOK_TEST_EMAIL разрешён только для согласованного "
                 "тестового адреса"

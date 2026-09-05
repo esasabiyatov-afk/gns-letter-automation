@@ -102,7 +102,7 @@
         <input type="hidden" name="group_id" value="{{ active_group.id }}">
         <button class="button button-primary" type="submit">Проверить старый скан</button>
       </form>
-    {% elif active_letter.outgoing_number and active_letter.gns_email %}
+    {% elif active_letter.outgoing_number and (outlook_test_mode or active_letter.gns_email) %}
       <form method="post"
             action="/response-letters/{{ active_letter.id }}/outlook-draft">
         <input type="hidden" name="group_id" value="{{ active_group.id }}">

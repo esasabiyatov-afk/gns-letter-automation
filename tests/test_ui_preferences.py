@@ -94,7 +94,7 @@ def test_outlook_test_mode_is_shown_without_certificate_warning(workflow, monkey
 
     test_settings = replace(
         workflow.settings,
-        outlook_test_email="esasabiyatov@gmail.com",
+        outlook_test_email="esensabiyatov@gmail.com",
         outlook_allow_test_send=True,
         outlook_allow_insecure_certificate=True,
     )
@@ -114,7 +114,7 @@ def test_outlook_test_mode_is_shown_without_certificate_warning(workflow, monkey
 
     assert response.status_code == 200
     assert "Outlook автоматически подтверждает" not in response.text
-    assert "esasabiyatov@gmail.com" in response.text
+    assert "esensabiyatov@gmail.com" in response.text
     assert "отправка разрешена только" in response.text
 
 
@@ -148,7 +148,7 @@ def test_confirmed_recipient_is_suggested_by_partial_name(workflow):
 
     assert suggestions[0]["full_name"] == "Мураканов Улан Муратович"
     assert suggestions[0]["district_place"] == (
-        "по Ленинскому району г. Бишкек"
+        "по Ленинскому району г.Бишкек"
     )
 
 
@@ -206,6 +206,53 @@ def test_scanner_settings_are_persisted_and_rendered(
     assert 'data-testid="scanner-settings"' in response.text
     assert '<option value="300" selected>' in response.text
     assert 'value="color"' in response.text
+
+
+def test_office_directory_is_editable_from_settings(workflow, monkeypatch):
+    from starlette.testclient import TestClient
+
+    from gns_app import main
+
+    workflow.initialize_gns_offices()
+    workflow.initialize_gns_office_emails()
+    monkeypatch.setattr(main, "workflow", workflow)
+    client = TestClient(main.app)
+
+    page = client.get("/settings#offices")
+    assert page.status_code == 200
+    assert 'data-settings-tab="offices"' in page.text
+    assert 'data-office-filter' in page.text
+    assert "Резервные почты" in page.text
+    assert 'name="aliases"' in page.text
+    assert "УГНС по Иссык-Атинскому району" in page.text
+
+    created = client.post(
+        "/settings/offices/save",
+        data={
+            "district_place": "по Новому району Нарынской области",
+            "email_address": "new@example.kg",
+            "backup_emails": "reserve@example.kg",
+            "aliases": "Новый район, Новая налоговая",
+        },
+        follow_redirects=False,
+    )
+    assert created.status_code == 303
+    assert created.headers["location"].endswith("#offices")
+    office = next(
+        item
+        for item in workflow.list_gns_offices()
+        if item["email_address"] == "new@example.kg"
+    )
+    assert office["aliases"] == ["Новый район", "Новая налоговая"]
+
+    deleted = client.post(
+        f"/settings/offices/{office['id']}/delete",
+        follow_redirects=False,
+    )
+    assert deleted.status_code == 303
+    assert all(
+        item["id"] != office["id"] for item in workflow.list_gns_offices()
+    )
 
 
 def test_registry_priority_defaults_to_osoo(workflow):

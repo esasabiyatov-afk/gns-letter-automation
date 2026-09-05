@@ -379,82 +379,48 @@
   const inlineNumberForms = [
     ...document.querySelectorAll("form[data-inline-number-form]"),
   ];
-  if (inlineNumberForms.length) {
-    const entries = inlineNumberForms.map((form) => ({
-      form,
-      input: form.querySelector("[data-inline-number-input]"),
-      submit: form.querySelector("[data-inline-number-submit]"),
-      letterId: form.dataset.letterId || "",
-      originalAction: form.getAttribute("action") || "",
-    })).filter((entry) => entry.input && entry.submit && entry.letterId);
-    const unnumbered = entries.filter(
-      (entry) => (entry.input.dataset.originalNumber || "") === "",
-    );
-
-    const addSequenceField = (form, name, value) => {
-      const field = document.createElement("input");
-      field.type = "hidden";
-      field.name = name;
-      field.value = value;
-      field.dataset.inlineSequenceField = "";
-      form.append(field);
-    };
-
-    const resetSequence = (source, typedValue) => {
-      entries.forEach((entry) => {
-        entry.form.querySelectorAll("[data-inline-sequence-field]")
-          .forEach((field) => field.remove());
-        entry.form.setAttribute("action", entry.originalAction);
-        entry.form.classList.remove("sequence-source");
-        entry.submit.disabled = false;
-        entry.submit.textContent = "✓";
-        entry.submit.title = "Сохранить номер";
-        if (entry.input.dataset.sequencePreview === "true") {
-          if (entry !== source) entry.input.value = "";
-          entry.input.classList.remove("sequence-preview");
-          delete entry.input.dataset.sequencePreview;
+  inlineNumberForms.forEach((form) => {
+    const input = form.querySelector("[data-inline-number-input]");
+    const state = form.querySelector("[data-inline-number-state]");
+    if (!input) return;
+    let saving = false;
+    const save = async () => {
+      const current = input.value.trim();
+      const original = input.dataset.originalNumber || "";
+      if (saving || current === original || !input.reportValidity()) return;
+      saving = true;
+      const formData = new FormData(form);
+      input.disabled = true;
+      if (state) state.textContent = "Сохранение…";
+      try {
+        const response = await fetch(form.action, {
+          method: "POST",
+          body: formData,
+        });
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+          throw new Error(result.error || "Не удалось сохранить номер");
         }
-      });
-      if (source) source.input.value = typedValue;
+        input.value = result.outgoing_number || "";
+        input.dataset.originalNumber = input.value;
+        if (state) state.textContent = result.message || "Сохранено";
+        window.setTimeout(
+          () => window.location.reload(),
+          result.scan_invalidated || result.word_reopen_required ? 1500 : 350,
+        );
+      } catch (error) {
+        if (state) state.textContent = error.message;
+      } finally {
+        input.disabled = false;
+        saving = false;
+      }
     };
-
-    const renderSequence = (source) => {
-      const typedValue = source.input.value.trim();
-      resetSequence(source, typedValue);
-      const startIndex = unnumbered.indexOf(source);
-      if (startIndex < 0 || !/^\d{1,9}$/.test(typedValue)) return;
-      const firstNumber = Number.parseInt(typedValue, 10);
-      const suffix = unnumbered.slice(startIndex);
-      if (
-        firstNumber < 1
-        || firstNumber + Math.max(0, suffix.length - 1) > 999999999
-      ) return;
-
-      suffix.forEach((entry, offset) => {
-        entry.input.value = String(firstNumber + offset);
-        entry.input.classList.add("sequence-preview");
-        entry.input.dataset.sequencePreview = "true";
-        if (entry !== source) {
-          entry.submit.disabled = true;
-          entry.submit.title = "Сохранится вместе с первым номером";
-        }
-      });
-      source.form.setAttribute("action", "/today/outgoing-numbers/assign");
-      source.form.classList.add("sequence-source");
-      addSequenceField(source.form, "first_number", String(firstNumber));
-      suffix.forEach((entry) => {
-        addSequenceField(source.form, "letter_ids", entry.letterId);
-      });
-      source.submit.textContent = "✓";
-      source.submit.title = suffix.length > 1
-        ? `Сохранить номера для ${suffix.length} писем`
-        : "Сохранить номер";
-    };
-
-    unnumbered.forEach((entry) => {
-      entry.input.addEventListener("input", () => renderSequence(entry));
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      save();
     });
-  }
+    input.addEventListener("change", save);
+  });
 
   const actionMenus = [...document.querySelectorAll(".action-menu")];
   actionMenus.forEach((menu) => {
@@ -539,6 +505,21 @@
     });
   }
 
+  const officeFilter = document.querySelector("[data-office-filter]");
+  const officeRows = [...document.querySelectorAll("[data-office-row]")];
+  const officeEmpty = document.querySelector("[data-office-empty]");
+  officeFilter?.addEventListener("input", () => {
+    const query = officeFilter.value.trim().toLocaleLowerCase("ru");
+    let visible = 0;
+    officeRows.forEach((row) => {
+      const matches = !query || (row.dataset.officeSearch || "")
+        .toLocaleLowerCase("ru").includes(query);
+      row.hidden = !matches;
+      if (matches) visible += 1;
+    });
+    if (officeEmpty) officeEmpty.hidden = visible > 0;
+  });
+
   let settingsDirty = false;
   document.querySelectorAll("[data-settings-form]").forEach((form) => {
     const markDirty = () => {
@@ -614,6 +595,46 @@
     render();
   });
 
+  const prependReviewHistoryItem = (source, payload) => {
+    const list = document.querySelector("[data-review-history-list]");
+    if (!list) return;
+    list.querySelector("[data-review-history-empty]")?.remove();
+
+    const item = document.createElement("article");
+    item.className = "review-history-item";
+    item.dataset.reviewHistoryItem = "";
+    item.dataset.historyKind = "odb";
+
+    const meta = document.createElement("div");
+    meta.className = "review-history-meta";
+    const kind = document.createElement("span");
+    kind.className = "review-history-kind";
+    kind.textContent = "ОДБ";
+    const time = document.createElement("time");
+    const now = new Date();
+    time.dateTime = now.toISOString();
+    time.textContent = now.toLocaleString("ru-RU", {
+      day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit",
+    });
+    meta.append(kind, time);
+
+    const title = document.createElement("strong");
+    title.textContent = source.querySelector(".task-main strong")?.textContent
+      ?.trim() || "Лицо";
+    const details = document.createElement("span");
+    details.textContent = source.querySelector(".task-main > span")?.textContent
+      ?.trim() || "";
+    const result = document.createElement("span");
+    const found = payload.result === "found";
+    result.className = `review-history-result is-${found ? "found" : "not-found"}`;
+    result.textContent = found ? "Найден" : "Не найден";
+    item.append(meta, title, details, result);
+    list.prepend(item);
+
+    const count = document.querySelector("[data-review-history-count]");
+    if (count) count.textContent = String(Number(count.textContent || 0) + 1);
+  };
+
   document.querySelectorAll("[data-odb-result]").forEach((button) => {
     button.addEventListener("click", async () => {
       const row = button.closest("[data-odb-row]");
@@ -635,6 +656,7 @@
         if (!response.ok || !payload.ok) {
           throw new Error(payload.error || "Не удалось сохранить проверку ОДБ");
         }
+        prependReviewHistoryItem(odbCase, payload);
         row.classList.add("is-removing");
         window.setTimeout(() => {
           row.remove();
@@ -642,6 +664,34 @@
           const panel = odbCase.closest(".panel");
           if (willBeEmpty) odbCase.remove();
           if (panel && !panel.querySelector("[data-odb-case]")) panel.remove();
+          const remainingTasks = document.querySelectorAll(
+            ".manual-review-queue [data-task-kind]",
+          ).length;
+          const queueCount = document.querySelector(
+            ".manual-review-queue .count-pill",
+          );
+          if (queueCount) {
+            queueCount.textContent = String(remainingTasks);
+            queueCount.classList.toggle("count-pill-problem", remainingTasks > 0);
+          }
+          const navCount = document.querySelector(
+            "[data-testid='work-tab-review'] strong",
+          );
+          if (navCount) {
+            navCount.textContent = String(remainingTasks);
+            navCount.classList.toggle("is-problem", remainingTasks > 0);
+          }
+          const queue = document.querySelector(".manual-review-queue");
+          if (queue && !remainingTasks && !queue.querySelector(".empty-state")) {
+            const empty = document.createElement("div");
+            empty.className = "empty-state large";
+            const title = document.createElement("strong");
+            title.textContent = "Проверка не требуется";
+            const subtitle = document.createElement("span");
+            subtitle.textContent = "Очередь пуста.";
+            empty.append(title, subtitle);
+            queue.append(empty);
+          }
         }, 180);
       } catch (error) {
         row.dataset.saving = "false";

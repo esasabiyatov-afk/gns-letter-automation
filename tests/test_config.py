@@ -43,13 +43,13 @@ def test_outlook_office_test_flags_are_disabled_by_default(monkeypatch):
 
 
 def test_outlook_office_test_flags_can_be_explicitly_enabled(monkeypatch):
-    monkeypatch.setenv("GNS_OUTLOOK_TEST_EMAIL", "ESASABIYATOV@GMAIL.COM")
+    monkeypatch.setenv("GNS_OUTLOOK_TEST_EMAIL", "ESENSABIYATOV@GMAIL.COM")
     monkeypatch.setenv("GNS_OUTLOOK_ALLOW_TEST_SEND", "true")
     monkeypatch.setenv("GNS_OUTLOOK_ALLOW_INSECURE_CERTIFICATE", "true")
 
     settings = Settings.load()
 
-    assert settings.outlook_test_email == "esasabiyatov@gmail.com"
+    assert settings.outlook_test_email == "esensabiyatov@gmail.com"
     assert settings.outlook_allow_test_send
     assert settings.outlook_allow_insecure_certificate
 

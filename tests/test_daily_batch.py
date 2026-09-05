@@ -170,6 +170,168 @@ def test_same_inn_from_qr_and_manual_case_appears_once_in_response(workflow):
     assert document_text.count(name) == 1
 
 
+def test_late_duplicate_is_attached_to_existing_unscanned_response(workflow):
+    inn = "12345678901234"
+    name = 'ОсОО "Один налогоплательщик"'
+    first_case_id = _insert_ready_case(workflow, inn, name)
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    group = workflow.today_overview()["not_found_groups"][0]
+    group_id, output = workflow.generate_daily_response(group["group_key"])
+    letter = workflow.db.fetch_one(
+        "SELECT * FROM response_letters WHERE response_group_id = ?",
+        (group_id,),
+    )
+    workflow.set_outgoing_number(letter["id"], "9544")
+    workflow.mark_response_group_opened_for_print(group_id)
+
+    second_case_id = _insert_ready_case(workflow, inn, name)
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    late_group = workflow.today_overview()["not_found_groups"][0]
+    merged_group_id, merged_output = workflow.generate_daily_response(
+        late_group["group_key"]
+    )
+
+    assert merged_group_id == group_id
+    assert merged_output == output
+    assert workflow.db.fetch_one(
+        "SELECT COUNT(*) AS count FROM response_groups"
+    )["count"] == 1
+    assert workflow.db.fetch_one(
+        "SELECT COUNT(*) AS count FROM response_group_cases "
+        "WHERE response_group_id = ?",
+        (group_id,),
+    )["count"] == 2
+    assert workflow.db.fetch_one(
+        "SELECT COUNT(*) AS count FROM response_group_taxpayers "
+        "WHERE response_group_id = ?",
+        (group_id,),
+    )["count"] == 1
+    refreshed_letter = workflow.db.fetch_one(
+        "SELECT * FROM response_letters WHERE id = ?", (letter["id"],)
+    )
+    assert refreshed_letter["outgoing_number"] == "9544"
+    refreshed_group = workflow.get_response_group(group_id)
+    assert refreshed_group["opened_for_print_at"] is not None
+    assert refreshed_group["word_reopen_required"] == 0
+    assert workflow.get_case(first_case_id)["status"] == "response_created"
+    assert workflow.get_case(second_case_id)["status"] == "response_created"
+    document_text = "\n".join(
+        paragraph.text for paragraph in Document(output).paragraphs
+    )
+    assert document_text.count(inn) == 1
+    assert document_text.count(name) == 1
+
+
+def test_late_new_person_updates_existing_unscanned_response(workflow):
+    _insert_ready_case(workflow, "12345678901234", 'ОсОО "Первый"')
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    group = workflow.today_overview()["not_found_groups"][0]
+    group_id, output = workflow.generate_daily_response(group["group_key"])
+    letter = workflow.db.fetch_one(
+        "SELECT * FROM response_letters WHERE response_group_id = ?",
+        (group_id,),
+    )
+    workflow.set_outgoing_number(letter["id"], "9544")
+    workflow.mark_response_group_opened_for_print(group_id)
+
+    _insert_ready_case(workflow, "23456789012345", 'ОсОО "Второй"')
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    late_group = workflow.today_overview()["not_found_groups"][0]
+    merged_group_id, _ = workflow.generate_daily_response(
+        late_group["group_key"]
+    )
+
+    assert merged_group_id == group_id
+    refreshed_group = workflow.get_response_group(group_id)
+    assert refreshed_group["taxpayer_count"] == 2
+    assert refreshed_group["opened_for_print_at"] is None
+    assert refreshed_group["word_reopen_required"] == 1
+    refreshed_letter = workflow.db.fetch_one(
+        "SELECT * FROM response_letters WHERE id = ?", (letter["id"],)
+    )
+    assert refreshed_letter["outgoing_number"] == "9544"
+    assert refreshed_letter["taxpayer_count"] == 2
+    document_text = "\n".join(
+        paragraph.text for paragraph in Document(output).paragraphs
+    )
+    assert 'ОсОО "Первый"' in document_text
+    assert 'ОсОО "Второй"' in document_text
+
+
+def test_late_merge_rechecks_scan_before_committing(workflow, monkeypatch):
+    _insert_ready_case(workflow, "12345678901234", 'ОсОО "Первый"')
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    group = workflow.today_overview()["not_found_groups"][0]
+    first_group_id, _ = workflow.generate_daily_response(group["group_key"])
+    first_letter = workflow.db.fetch_one(
+        "SELECT * FROM response_letters WHERE response_group_id = ?",
+        (first_group_id,),
+    )
+
+    late_case_id = _insert_ready_case(
+        workflow, "23456789012345", 'ОсОО "Второй"'
+    )
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    late_group = workflow.today_overview()["not_found_groups"][0]
+    original_render = workflow.word.render_pages
+    scan_registered = False
+
+    def render_while_scan_starts(*args, **kwargs):
+        nonlocal scan_registered
+        result = original_render(*args, **kwargs)
+        if not scan_registered:
+            workflow.register_signed_response_scan(
+                first_letter["id"], "signed.png", _png_scan()
+            )
+            scan_registered = True
+        return result
+
+    monkeypatch.setattr(workflow.word, "render_pages", render_while_scan_starts)
+    with pytest.raises(WorkflowValidationError, match="начали сканировать"):
+        workflow.generate_daily_response(late_group["group_key"])
+
+    assert workflow.get_case(late_case_id)["status"] == "ready_for_response"
+    assert workflow.db.fetch_one(
+        "SELECT COUNT(*) AS count FROM response_group_cases "
+        "WHERE response_group_id = ?",
+        (first_group_id,),
+    )["count"] == 1
+
+    monkeypatch.setattr(workflow.word, "render_pages", original_render)
+    second_group_id, _ = workflow.generate_daily_response(
+        late_group["group_key"]
+    )
+    assert second_group_id != first_group_id
+
+
+def test_late_case_starts_new_response_after_signed_scan(workflow):
+    inn = "12345678901234"
+    name = 'ОсОО "Один налогоплательщик"'
+    _insert_ready_case(workflow, inn, name)
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    group = workflow.today_overview()["not_found_groups"][0]
+    first_group_id, _ = workflow.generate_daily_response(group["group_key"])
+    letter = workflow.db.fetch_one(
+        "SELECT * FROM response_letters WHERE response_group_id = ?",
+        (first_group_id,),
+    )
+    workflow.register_signed_response_scan(
+        letter["id"], "signed.png", _png_scan()
+    )
+
+    _insert_ready_case(workflow, inn, name)
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    late_group = workflow.today_overview()["not_found_groups"][0]
+    second_group_id, _ = workflow.generate_daily_response(
+        late_group["group_key"]
+    )
+
+    assert second_group_id != first_group_id
+    assert workflow.db.fetch_one(
+        "SELECT COUNT(*) AS count FROM response_groups"
+    )["count"] == 2
+
+
 def test_personal_ip_prefix_difference_is_not_sent_to_manual_review(workflow):
     inn = "12909198201284"
     full_name = "Абдылдаева Анипахан Акматалиевна"
@@ -231,6 +393,48 @@ def test_same_inn_with_different_names_blocks_response(workflow):
     )
     assert workflow.get_case(reviews[0]["right_case_id"])["status"] == (
         CaseStatus.NEEDS_REVIEW
+    )
+
+
+def test_work_counter_reconciles_an_already_resolved_comparison(workflow):
+    inn = "12345678901234"
+    first_case_id = _insert_ready_case(
+        workflow,
+        inn,
+        'ОсОО "Итоговое название"',
+    )
+    second_case_id = _insert_ready_case(
+        workflow,
+        inn,
+        'ОсОО "Старое название"',
+        source_kind="manual",
+    )
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    review = workflow.list_case_match_reviews()[0]
+    assert workflow.work_counts()["review"] == 1
+
+    second_taxpayer = workflow.get_taxpayers(second_case_id)[0]
+    workflow.db.execute(
+        "UPDATE taxpayers SET name = ?, updated_at = ? WHERE id = ?",
+        (
+            'ОсОО "Итоговое название"',
+            utc_now(),
+            second_taxpayer["id"],
+        ),
+    )
+
+    counts = workflow.work_counts()
+
+    assert counts["review"] == 0
+    assert workflow.db.fetch_one(
+        "SELECT status FROM case_match_reviews WHERE id = ?",
+        (review["id"],),
+    ) == {"status": "superseded"}
+    assert workflow.get_case(first_case_id)["status"] == (
+        CaseStatus.READY_FOR_RESPONSE
+    )
+    assert workflow.get_case(second_case_id)["status"] == (
+        CaseStatus.READY_FOR_RESPONSE
     )
 
 
@@ -856,7 +1060,7 @@ def test_batch_outgoing_numbers_are_previewed_assigned_and_written_to_word(
     assert all(event["actor"] == "Тестовый сотрудник" for event in events)
 
 
-def test_batch_outgoing_numbers_can_start_from_an_inline_letter_suffix(
+def test_batch_outgoing_numbers_fill_every_blank_and_skip_assigned_middle(
     workflow,
 ):
     for index in range(1, 9):
@@ -876,35 +1080,118 @@ def test_batch_outgoing_numbers_can_start_from_an_inline_letter_suffix(
         "ORDER BY letter_order",
         (group_id,),
     )
-    workflow.set_outgoing_number(letters[2]["id"], "7000")
+    # Номер в середине уже выдан вручную. Пакетная выдача не должна
+    # сдвинуть его или попытаться использовать повторно.
+    workflow.set_outgoing_number(letters[2]["id"], "9545")
+
+    preview = workflow.preview_outgoing_numbers("9544")
+
+    assert preview["count"] == 3
+    assert preview["first_number"] == "9544"
+    assert preview["last_number"] == "9547"
+    assert preview["skipped_occupied_count"] == 1
+    assert [
+        item["id"] for item in preview["letters"]
+    ] == [letters[0]["id"], letters[1]["id"], letters[3]["id"]]
+    assert [
+        item["proposed_number"] for item in preview["letters"]
+    ] == ["9544", "9546", "9547"]
 
     summary = workflow.assign_outgoing_numbers(
         "9544",
-        [letters[1]["id"], letters[3]["id"]],
+        [item["id"] for item in preview["letters"]],
         actor="Тестовый сотрудник",
     )
 
-    assert summary["letter_count"] == 2
+    assert summary["letter_count"] == 3
+    assert summary["first_assigned_number"] == "9544"
+    assert summary["last_number"] == "9547"
+    assert summary["skipped_occupied_count"] == 1
     refreshed = workflow.db.fetch_all(
         "SELECT outgoing_number FROM response_letters "
         "WHERE response_group_id = ? ORDER BY letter_order",
         (group_id,),
     )
     assert [letter["outgoing_number"] for letter in refreshed] == [
-        None,
         "9544",
-        "7000",
+        "9546",
         "9545",
+        "9547",
     ]
     document_text = "\n".join(
         paragraph.text for paragraph in Document(output).paragraphs
     )
     assert "04-1/9544" in document_text
-    assert "04-1/7000" in document_text
+    assert "04-1/9546" in document_text
     assert "04-1/9545" in document_text
+    assert "04-1/9547" in document_text
 
 
-def test_batch_outgoing_numbers_reject_non_contiguous_inline_selection(
+def test_generated_responses_sort_by_numeric_outgoing_number_and_blanks_last(
+    workflow,
+):
+    recipients = (
+        (
+            "12345678901234",
+            'ОсОО "Номер сто"',
+            "Асанова Айгуль Токтогуловна",
+            "Асановой А. Т.",
+        ),
+        (
+            "23456789012345",
+            'ОсОО "Номер двадцать"',
+            "Бекова Бурул Талгатовна",
+            "Бековой Б. Т.",
+        ),
+        (
+            "34567890123456",
+            'ОсОО "Без номера"',
+            "Валиев Венера Сагынбековна",
+            "Валиевой В. С.",
+        ),
+    )
+    for inn, name, full_name, display_name in recipients:
+        _insert_ready_case(
+            workflow,
+            inn,
+            name,
+            recipient_full_name=full_name,
+            recipient_display_name=display_name,
+        )
+
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    groups = workflow.today_overview()["not_found_groups"]
+    group_ids_by_recipient = {}
+    for group in groups:
+        group_id, _ = workflow.generate_daily_response(group["group_key"])
+        group_ids_by_recipient[group["recipient_display_name"]] = group_id
+
+    hundred_letter = workflow.db.fetch_one(
+        "SELECT id FROM response_letters WHERE response_group_id = ?",
+        (group_ids_by_recipient["Асановой А. Т."],),
+    )
+    twenty_letter = workflow.db.fetch_one(
+        "SELECT id FROM response_letters WHERE response_group_id = ?",
+        (group_ids_by_recipient["Бековой Б. Т."],),
+    )
+    workflow.set_outgoing_number(hundred_letter["id"], "100")
+    workflow.set_outgoing_number(twenty_letter["id"], "20")
+
+    generated = workflow.today_overview(view="created")["generated_groups"]
+
+    assert [group["recipient_display_name"] for group in generated] == [
+        "Бековой Б. Т.",
+        "Асановой А. Т.",
+        "Валиевой В. С.",
+    ]
+    assert [group["letters"][0]["outgoing_number"] for group in generated] == [
+        "20",
+        "100",
+        None,
+    ]
+
+
+def test_batch_outgoing_numbers_reject_stale_or_partial_letter_list(
     workflow,
 ):
     for index in range(1, 7):
@@ -962,7 +1249,9 @@ def test_outgoing_number_correction_is_unique_and_regenerates_word(workflow):
         "SELECT * FROM response_letters WHERE id = ?", (letter["id"],)
     )
     assert refreshed["outgoing_number"] == "9600"
-    assert workflow.get_response_group(group_id)["opened_for_print_at"] is None
+    updated_group = workflow.get_response_group(group_id)
+    assert updated_group["opened_for_print_at"] is None
+    assert updated_group["word_reopen_required"] == 1
     document_text = "\n".join(
         paragraph.text for paragraph in Document(output).paragraphs
     )
@@ -974,6 +1263,68 @@ def test_outgoing_number_correction_is_unique_and_regenerates_word(workflow):
         (letter["id"],),
     )
     assert changed is not None
+
+
+def test_changing_outgoing_number_supersedes_the_signed_scan(workflow):
+    group_id, letter = _ready_response_letter(workflow)
+    workflow.set_outgoing_number(letter["id"], "9544")
+    scan = workflow.register_signed_response_scan(
+        letter["id"], "signed.png", _png_scan()
+    )
+
+    summary = workflow.set_outgoing_number(letter["id"], "9600")
+
+    assert summary["superseded_scan_count"] == 1
+    assert workflow.get_signed_response_scan(scan["id"])["status"] == (
+        "superseded"
+    )
+    assert workflow.get_confirmed_signed_response_scan(letter["id"]) is None
+    updated_group = workflow.get_response_group(group_id)
+    assert updated_group["opened_for_print_at"] is None
+    assert updated_group["word_reopen_required"] == 1
+    assert workflow.db.fetch_one(
+        "SELECT event_type FROM audit_events WHERE entity_id = ? "
+        "AND event_type = 'signed_scan_superseded_by_outgoing_number'",
+        (scan["id"],),
+    ) is not None
+
+
+def test_changing_outgoing_number_is_blocked_after_outlook_draft(workflow):
+    _, letter = _ready_response_letter(workflow)
+    workflow.set_outgoing_number(letter["id"], "9544")
+    scan = workflow.register_signed_response_scan(
+        letter["id"], "signed.png", _png_scan()
+    )
+    now = utc_now()
+    workflow.db.execute(
+        """
+        INSERT INTO outlook_outgoing_messages(
+            id, response_letter_id, signed_scan_id, status,
+            recipient_email, subject, attachment_name,
+            attachment_sha256, draft_key, created_at, updated_at
+        ) VALUES (?, ?, ?, 'draft_created', ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            uuid4().hex,
+            letter["id"],
+            scan["id"],
+            "002lenin@sti.gov.kg",
+            "Ответ на запрос ГНС",
+            "Ответ_ГНС.pdf",
+            "0" * 64,
+            f"test-{scan['id']}",
+            now,
+            now,
+        ),
+    )
+
+    with pytest.raises(WorkflowValidationError, match="черновик Outlook"):
+        workflow.set_outgoing_number(letter["id"], "9600")
+
+    assert workflow.get_response_letter(letter["id"])["outgoing_number"] == "9544"
+    assert workflow.get_signed_response_scan(scan["id"])["status"] == (
+        "confirmed"
+    )
 
 
 def test_outgoing_number_cannot_be_reused_for_another_letter(workflow):
@@ -1000,7 +1351,7 @@ def test_outgoing_number_cannot_be_reused_for_another_letter(workflow):
         workflow.set_outgoing_number(letters[1]["id"], "9544")
 
 
-def test_created_responses_assign_numbers_from_the_inline_letter_field(
+def test_created_responses_support_bulk_and_individual_outgoing_number_assignment(
     workflow, monkeypatch
 ):
     from starlette.testclient import TestClient
@@ -1018,22 +1369,39 @@ def test_created_responses_assign_numbers_from_the_inline_letter_field(
     page = client.get("/?tab=responses&response_view=created")
 
     assert page.status_code == 200
-    assert 'class="number-sequence-bar"' not in page.text
+    sequence_start = page.text.index('class="outgoing-sequence-form"')
+    sequence_end = page.text.index("</form>", sequence_start)
+    sequence_form = page.text[sequence_start:sequence_end]
+    assert 'action="/today/outgoing-numbers/assign"' in sequence_form
+    assert f'name="letter_ids" value="{letter["id"]}"' in sequence_form
+    assert 'name="first_number"' in sequence_form
+    assert "Заполнить пустые с №" in sequence_form
+    assert "<button" not in sequence_form
+    assert 'type="submit"' not in sequence_form
     assert 'data-number-sequence-start' not in page.text
     assert (
         f'data-inline-number-form data-letter-id="{letter["id"]}"'
         in page.text
     )
     assert 'data-inline-number-input' in page.text
-    assert "Первый свободный исх. №" not in page.text
 
     assigned = client.post(
-        "/today/outgoing-numbers/assign",
-        data={"first_number": "9544", "letter_ids": [letter["id"]]},
-        follow_redirects=False,
+        f"/response-letters/{letter['id']}/outgoing-number",
+        data={
+            "outgoing_number": "9544",
+            "group_id": group["group_key"],
+            "autosave": "true",
+        },
     )
 
-    assert assigned.status_code == 303
+    assert assigned.status_code == 200
+    assert assigned.json() == {
+        "ok": True,
+        "outgoing_number": "9544",
+        "scan_invalidated": False,
+        "word_reopen_required": True,
+        "message": "Номер сохранён. Word обновлён: откройте его заново.",
+    }
     refreshed = workflow.db.fetch_one(
         "SELECT outgoing_number FROM response_letters WHERE id = ?",
         (letter["id"],),
@@ -1064,7 +1432,9 @@ def test_created_responses_number_old_unfinished_backlog(
     )
 
     assert page.status_code == 200
-    assert 'class="number-sequence-bar"' not in page.text
+    assert 'class="outgoing-sequence-form"' in page.text
+    assert 'action="/today/outgoing-numbers/assign"' in page.text
+    assert f'name="letter_ids" value="{letter["id"]}"' in page.text
     assert (
         f'data-inline-number-form data-letter-id="{letter["id"]}"'
         in page.text
@@ -1124,14 +1494,8 @@ def test_today_page_opens_generated_response_in_word(workflow, monkeypatch):
     group = workflow.today_overview()["not_found_groups"][0]
     group_id, output = workflow.generate_daily_response(group["group_key"])
     opened: list[Path] = []
-    focus_requests: list[dict] = []
     monkeypatch.setattr(main, "workflow", workflow)
     monkeypatch.setattr(main, "open_word_document", opened.append)
-    monkeypatch.setattr(
-        main,
-        "start_foreground_watcher",
-        lambda **kwargs: focus_requests.append(kwargs),
-    )
     client = TestClient(main.app)
 
     before = client.get("/?tab=responses&response_view=created")
@@ -1148,14 +1512,31 @@ def test_today_page_opens_generated_response_in_word(workflow, monkeypatch):
         "/?tab=responses&response_view=created"
     )
     assert opened == [output]
-    assert focus_requests[0]["title_parts"] == (output.stem,)
-    assert focus_requests[0]["class_parts"] == ("opusapp",)
-    assert focus_requests[0]["keep_foreground_seconds"] == 2.0
     assert workflow.get_response_group(group_id)["opened_for_print_at"]
 
     after = client.get("/?tab=responses&response_view=created")
     assert re.search(r">\s*Сканировать\s*<", after.text)
     assert "Можно сканировать" in after.text
+
+    letter = workflow.db.fetch_one(
+        "SELECT id FROM response_letters WHERE response_group_id = ?",
+        (group_id,),
+    )
+    workflow.set_outgoing_number(letter["id"], "9544")
+
+    updated = client.get("/?tab=responses&response_view=created")
+    assert "Word создан заново — откройте для печати" in updated.text
+    assert re.search(r">\s*Открыть обновлённый Word\s*<", updated.text)
+    assert not re.search(r">\s*Сканировать\s*<", updated.text)
+
+    reopened = client.post(
+        f"/response-groups/{group_id}/open-for-print",
+        follow_redirects=False,
+    )
+
+    assert reopened.status_code == 303
+    assert opened == [output, output]
+    assert workflow.get_response_group(group_id)["word_reopen_required"] == 0
 
 
 def _ready_response_letter(workflow):
@@ -1260,6 +1641,7 @@ def test_restart_manual_review_supersedes_only_unsent_response_group(workflow):
     assert workflow.get_case(case_id)["status"] == "needs_review"
     assert workflow.get_response_group(group_id)["status"] == "superseded"
     assert workflow.get_signed_response_scan(scan["id"])["status"] == "superseded"
+    assert not workflow.today_overview()["generated_groups"]
 
 
 def test_signed_scan_preserves_multi_page_pdf(workflow):
@@ -1485,7 +1867,7 @@ def test_signed_scan_upload_route_marks_scan_ready(workflow, monkeypatch):
 
 
 def test_confirmed_multi_page_scan_creates_one_idempotent_outlook_draft(
-    workflow,
+    workflow, monkeypatch
 ):
     workflow.initialize_gns_offices()
     workflow.initialize_gns_office_emails()
@@ -1525,8 +1907,24 @@ def test_confirmed_multi_page_scan_creates_one_idempotent_outlook_draft(
         workflow.settings,
         OutlookService(gateway),
     )
+    workflow.db.execute(
+        """
+        INSERT INTO settings(key, value, updated_at)
+        VALUES (?, ?, ?)
+        """,
+        (
+            OutlookOutgoingService.SUBJECT_TEMPLATE_SETTING,
+            "Ответ № {outgoing_number}",
+            utc_now(),
+        ),
+    )
+    assert outgoing.get_subject_template() == (
+        OutlookOutgoingService.DEFAULT_SUBJECT_TEMPLATE
+    )
+    with pytest.raises(OutlookIntegrationError, match="только внутри Word/PDF"):
+        outgoing.update_subject_template("Ответ № {outgoing_number}")
     outgoing.update_subject_template(
-        "Ответ № {outgoing_number} — {office_name}"
+        "Ответ — {office_name}"
     )
 
     created = outgoing.create_draft(workflow, letter["id"])
@@ -1537,10 +1935,10 @@ def test_confirmed_multi_page_scan_creates_one_idempotent_outlook_draft(
 
     assert created["status"] == "draft_created"
     assert created["recipient_email"] == "002lenin@sti.gov.kg"
-    assert created["subject"] == (
-        "Ответ № 9544 — УГНС по Ленинскому району"
-    )
-    assert created["attachment_name"] == "Ответ_исх_9544.pdf"
+    assert created["subject"] == "Ответ — УГНС по Ленинскому району"
+    assert "9544" not in created["subject"]
+    assert created["attachment_name"] == "Ответ_ГНС.pdf"
+    assert gateway.requests[0]["body"] == outgoing.DEFAULT_BODY
     assert not created["existing_outlook_draft"]
     assert reopened["existing_outlook_draft"]
     assert len(gateway.requests) == 3
@@ -1555,6 +1953,17 @@ def test_confirmed_multi_page_scan_creates_one_idempotent_outlook_draft(
     assert workflow.db.fetch_one(
         "SELECT COUNT(*) AS count FROM outlook_outgoing_messages"
     )["count"] == 1
+
+    from starlette.testclient import TestClient
+
+    from gns_app import main
+
+    monkeypatch.setattr(main, "workflow", workflow)
+    page = TestClient(main.app).get("/?tab=responses&response_view=created")
+
+    assert page.status_code == 200
+    assert "Письмо подготовлено" in page.text
+    assert "002lenin@sti.gov.kg" in page.text
 
 
 def test_outlook_sent_reconciliation_updates_status_once(workflow, monkeypatch):
@@ -1669,6 +2078,7 @@ def test_outlook_sent_reconciliation_updates_status_once(workflow, monkeypatch):
     assert page.status_code == 200
     assert "Отправлено" in page.text
     assert "2026-09-04 10:30" in page.text
+    assert "002lenin@sti.gov.kg" in page.text
     assert "Подтверждено Outlook" in page.text
     assert "Подготовить письмо в Outlook" not in page.text
     history = client.get("/history")
@@ -1750,24 +2160,30 @@ def test_repeat_draft_reuses_exact_confirmed_scan_and_is_confirmed(workflow):
     assert gateway.requests[1]["create_if_missing"] is True
     assert gateway.requests[2]["create_if_missing"] is False
     assert gateway.requests[3]["create_if_missing"] is True
+    assert all(
+        request["body"] == outgoing.DEFAULT_BODY
+        for request in gateway.requests
+    )
+    assert all(
+        request["attachment_name"] == "Ответ_ГНС.pdf"
+        for request in gateway.requests
+    )
+    assert all("9550" not in request["subject"] for request in gateway.requests)
     assert gateway.attachments == [expected_pdf] * 4
 
 
-def test_outlook_draft_requires_confirmed_scan(workflow):
+def test_outlook_draft_requires_signed_scan(workflow):
     workflow.initialize_gns_offices()
     workflow.initialize_gns_office_emails()
     _, letter = _ready_response_letter(workflow)
     workflow.set_outgoing_number(letter["id"], "9545")
-    workflow.register_signed_response_scan(
-        letter["id"], "scan.png", _png_scan()
-    )
     outgoing = OutlookOutgoingService(
         workflow.db,
         workflow.settings,
         OutlookService(object()),
     )
 
-    with pytest.raises(OutlookIntegrationError, match="подтвердите"):
+    with pytest.raises(OutlookIntegrationError, match="загрузите"):
         outgoing.create_draft(workflow, letter["id"])
 
 
@@ -1825,6 +2241,109 @@ def test_abs_account_task_moves_to_manual_response_without_duplicate(workflow):
     assert not after["account_groups"]
     assert len(manual) == 1
     assert manual[0]["taxpayers"][0]["source_case_id"] == case_id
+
+
+def test_manual_review_history_lists_only_completed_abs_and_odb(
+    workflow, monkeypatch
+):
+    from starlette.testclient import TestClient
+
+    from gns_app import main
+
+    abs_case_id = _insert_ready_case(
+        workflow, "22222222222222", 'ОсОО "Проверка АБС"'
+    )
+    workflow.db.execute(
+        "UPDATE taxpayers SET abs_result = 'found' WHERE case_id = ?",
+        (abs_case_id,),
+    )
+    workflow.db.execute(
+        "UPDATE cases SET status = 'needs_review', abs_status = 'found' "
+        "WHERE id = ?",
+        (abs_case_id,),
+    )
+    workflow.confirm_abs_account_taxpayer(
+        abs_case_id, "22222222222222", "found", actor="Проверяющий"
+    )
+    abs_without_account_id = _insert_ready_case(
+        workflow, "22222222222223", 'ОсОО "Счёта нет"'
+    )
+    workflow.db.execute(
+        "UPDATE taxpayers SET abs_result = 'found' WHERE case_id = ?",
+        (abs_without_account_id,),
+    )
+    workflow.db.execute(
+        "UPDATE cases SET status = 'needs_review', abs_status = 'found' "
+        "WHERE id = ?",
+        (abs_without_account_id,),
+    )
+    workflow.confirm_abs_account_taxpayer(
+        abs_without_account_id,
+        "22222222222223",
+        "not_found",
+        actor="Проверяющий",
+    )
+
+    odb_case_id = _insert_ready_case(
+        workflow, "33333333333333", 'ОсОО "Проверка ОДБ"'
+    )
+    workflow.db.execute(
+        "UPDATE taxpayers SET abs_result = 'not_found' WHERE case_id = ?",
+        (odb_case_id,),
+    )
+    workflow.db.execute(
+        "UPDATE cases SET status = 'manual_period_rule', period_route = 'odb' "
+        "WHERE id = ?",
+        (odb_case_id,),
+    )
+    workflow.confirm_odb_taxpayer(
+        odb_case_id, "33333333333333", "not_found", actor="Проверяющий"
+    )
+    odb_found_case_id = _insert_ready_case(
+        workflow, "33333333333334", 'ОсОО "Найдена в ОДБ"'
+    )
+    workflow.db.execute(
+        "UPDATE taxpayers SET abs_result = 'not_found' WHERE case_id = ?",
+        (odb_found_case_id,),
+    )
+    workflow.db.execute(
+        "UPDATE cases SET status = 'manual_period_rule', period_route = 'odb' "
+        "WHERE id = ?",
+        (odb_found_case_id,),
+    )
+    workflow.confirm_odb_taxpayer(
+        odb_found_case_id,
+        "33333333333334",
+        "found",
+        actor="Проверяющий",
+    )
+
+    history = workflow.manual_review_overview()["review_history"]
+
+    assert {item["kind"] for item in history} == {"abs", "odb"}
+    assert {item["name"] for item in history} == {
+        'ОсОО "Проверка АБС"',
+        'ОсОО "Проверка ОДБ"',
+        'ОсОО "Найдена в ОДБ"',
+    }
+    assert {item["result"] for item in history} == {
+        "Счёт есть",
+        "Не найден",
+        "Найден",
+    }
+    assert 'ОсОО "Счёта нет"' not in {item["name"] for item in history}
+
+    monkeypatch.setattr(main, "workflow", workflow)
+    page = TestClient(main.app).get("/?tab=review")
+
+    assert page.status_code == 200
+    assert 'data-testid="manual-review-queue"' in page.text
+    assert 'data-testid="manual-review-history"' in page.text
+    assert 'data-history-kind="person"' not in page.text
+    assert 'data-history-kind="abs"' in page.text
+    assert 'data-history-kind="odb"' in page.text
+    assert "Счёт есть" in page.text
+    assert "Не найден" in page.text
 
 
 def test_real_abs_account_counts_are_persisted_without_auto_confirmation(

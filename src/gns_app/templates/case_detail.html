@@ -33,6 +33,24 @@
           {{ source_upload.original_filename if source_upload else 'Исходный документ' }}
         </strong>
       </div>
+      {% if response_group %}
+        <nav class="review-queue-nav" aria-label="Переключение обращений ответа"
+             data-testid="response-group-navigation">
+          {% if previous_group_case_id %}
+            <a href="/cases/{{ previous_group_case_id }}?return_to=responses&amp;group_key={{ response_group.group_key }}"
+               aria-label="Предыдущее обращение">←</a>
+          {% else %}
+            <span aria-hidden="true">←</span>
+          {% endif %}
+          <strong>{{ response_group_position }} из {{ response_group.case_count }}</strong>
+          {% if next_group_case_id %}
+            <a href="/cases/{{ next_group_case_id }}?return_to=responses&amp;group_key={{ response_group.group_key }}"
+               aria-label="Следующее обращение">→</a>
+          {% else %}
+            <span aria-hidden="true">→</span>
+          {% endif %}
+        </nav>
+      {% endif %}
       {% if source_page %}
         <span>Страница {{ source_page.page_number }}</span>
       {% endif %}
@@ -223,18 +241,11 @@
         </small>
       {% endif %}
     {% endif %}
-    <details class="action-menu">
-      <summary aria-label="Дополнительные действия">⋯</summary>
-      <div class="action-menu-panel action-menu-panel-right">
-        <form method="post" action="/cases/{{ case.id }}/restart-manual-review">
-          <button type="submit">Проверить заново вручную</button>
-        </form>
-        <span class="action-menu-note">
-          Сбросит результаты АБС и ОДБ, сохранит исходный PDF и журнал.
-          Отправленное письмо вернуть нельзя.
-        </span>
-      </div>
-    </details>
+    <form method="post" action="/cases/{{ case.id }}/restart-manual-review">
+      <button class="button button-secondary" type="submit">
+        Проверить заново вручную
+      </button>
+    </form>
   </div>
 </section>
 

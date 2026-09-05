@@ -1,5 +1,7 @@
-<section class="work-section" data-testid="manual-review-workspace"
+<section class="manual-review-layout" data-testid="manual-review-workspace"
          data-tour-anchor="review">
+<section class="work-section manual-review-queue"
+         data-testid="manual-review-queue">
   <div class="work-section-toolbar">
     <div>
       <h2>Ручная проверка</h2>
@@ -150,4 +152,40 @@
       <span>Очередь пуста.</span>
     </div>
   {% endif %}
+</section>
+
+<aside class="work-section manual-review-history"
+       data-testid="manual-review-history">
+  <header class="review-history-heading">
+    <div>
+      <h2>АБС и ОДБ</h2>
+      <p>Счета, найденные в АБС, и все проверки ОДБ по периоду.</p>
+    </div>
+    <span data-review-history-count>{{ review.review_history|length }}</span>
+  </header>
+
+  <div class="review-history-list" data-review-history-list>
+    {% for item in review.review_history %}
+      <article class="review-history-item" data-review-history-item
+               data-history-kind="{{ item.kind }}">
+        <div class="review-history-meta">
+          <span class="review-history-kind">{{ item.kind_label }}</span>
+          <time datetime="{{ item.created_at }}">
+            {{ item.created_at[:16].replace('T', ' ') }}
+          </time>
+        </div>
+        <strong>{{ item.name }}</strong>
+        {% if item.inn %}<span>ИНН {{ item.inn }}</span>{% endif %}
+        {% if item.district_place %}<small>{{ item.district_place }}</small>{% endif %}
+        <span class="review-history-result is-{{ item.result_tone }}">
+          {{ item.result }}
+        </span>
+      </article>
+    {% else %}
+      <div class="review-history-empty" data-review-history-empty>
+        Результаты АБС и ОДБ появятся здесь.
+      </div>
+    {% endfor %}
+  </div>
+</aside>
 </section>

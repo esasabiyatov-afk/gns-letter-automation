@@ -57,10 +57,22 @@
     <div class="response-list" data-testid="response-prepare-list">
       {% for group in overview.not_found_groups %}
         <article class="response-row {% if group.issues %}response-row-problem{% endif %}">
-          <div class="response-person">
-            <strong>{{ group.recipient_display_name }}</strong>
-            <span>УГНС {{ group.district_place }}</span>
-          </div>
+          <details class="response-person response-taxpayer-disclosure"
+                   data-testid="prepare-response-taxpayer-disclosure">
+            <summary>
+              <strong>{{ group.recipient_display_name }}</strong>
+              <span>УГНС {{ group.district_place }}</span>
+              <small>Лиц: {{ group.taxpayer_count }}</small>
+            </summary>
+            <ol class="response-taxpayer-list" aria-label="Лица будущего ответа">
+              {% for taxpayer in group.taxpayers %}
+                <li>
+                  <span>{{ taxpayer.name }}</span>
+                  <small>ИНН {{ taxpayer.inn }}</small>
+                </li>
+              {% endfor %}
+            </ol>
+          </details>
           <div class="response-metrics">
             <span>Лиц: <strong>{{ group.taxpayer_count }}</strong></span>
             <span>Обращений: <strong>{{ group.case_count }}</strong></span>
@@ -86,15 +98,10 @@
             <details class="action-menu">
               <summary aria-label="Дополнительные действия">⋯</summary>
               <div class="action-menu-panel">
-                <a href="/cases/{{ group.taxpayers[0].source_case_id }}?return_to=responses"
-                   data-testid="open-case-with-document">
-                  Открыть письмо и данные
+                <a href="/cases/{{ group.case_ids[0] }}?return_to=responses&amp;group_key={{ group.group_key }}"
+                   data-testid="open-response-group">
+                  Открыть все письма и данные
                 </a>
-                {% if group.case_count > 1 %}
-                  <span class="action-menu-note">
-                    Остальные {{ group.case_count - 1 }} {{ case_word(group.case_count - 1) }} доступны в истории писем.
-                  </span>
-                {% endif %}
               </div>
             </details>
           </div>
@@ -108,17 +115,58 @@
     </div>
 
   {% elif response_view == 'created' %}
+    {% set created_split = namespace(pending=[], sent=[]) %}
+    {% for created_group in overview.generated_groups %}
+      {% set delivery = namespace(all_sent=created_group.letters|length > 0) %}
+      {% for created_letter in created_group.letters %}
+        {% if not created_letter.outlook_message
+              or created_letter.outlook_message.status != 'sent' %}
+          {% set delivery.all_sent = false %}
+        {% endif %}
+      {% endfor %}
+      {% if delivery.all_sent %}
+        {% set created_split.sent = created_split.sent + [created_group] %}
+      {% else %}
+        {% set created_split.pending = created_split.pending + [created_group] %}
+      {% endif %}
+    {% endfor %}
+    {% set pending_created_groups = created_split.pending %}
+    {% set sent_created_groups = created_split.sent %}
     <div class="work-section-toolbar response-toolbar"
          data-tour-anchor="created">
       <div>
         <h2>Созданные ответы</h2>
         <p>Сначала откройте письмо в Word, проверьте и распечатайте его. Затем отсканируйте подписанный ответ.</p>
       </div>
+      <div class="work-toolbar-actions created-toolbar-actions">
+        {% if overview.unnumbered_letters %}
+          <form class="outgoing-sequence-form" method="post"
+                action="/today/outgoing-numbers/assign">
+            {% for letter in overview.unnumbered_letters %}
+              <input type="hidden" name="letter_ids" value="{{ letter.id }}">
+            {% endfor %}
+            <label for="outgoing-sequence-start">Заполнить пустые с №</label>
+            <input id="outgoing-sequence-start" name="first_number" inputmode="numeric"
+                   placeholder="125" maxlength="9" pattern="[0-9]+" required>
+          </form>
+        {% endif %}
+        {% if outlook_test_send_enabled %}
+          <form class="send-ready-form" method="post"
+                action="/today/outlook-test-send-all"
+                onsubmit="return confirm('Отправить все готовые ответы только на {{ outlook_test_email }}?');">
+            <button class="button button-primary" type="submit"
+                    {% if not outlook_ready_test_send_count %}disabled{% endif %}>
+              Отправить все готовые · {{ outlook_ready_test_send_count }}
+            </button>
+            <small>Только с темой, получателем и непустым PDF-ответом.</small>
+          </form>
+        {% endif %}
+      </div>
     </div>
 
-    <div class="response-list" data-testid="created-response-list">
-      {% for group in overview.generated_groups %}
-        <article class="response-row created-response-row" id="group-{{ group.id }}">
+    {% macro render_created_group(group, is_sent=false) %}
+        <article class="response-row created-response-row{% if is_sent %} created-response-sent{% endif %}"
+                 id="group-{{ group.id }}">
           {% if group.taxpayers %}
             <details class="response-person response-taxpayer-disclosure"
                      data-testid="created-response-taxpayer-disclosure">
@@ -153,6 +201,7 @@
                       action="/response-letters/{{ letter.id }}/outgoing-number"
                       data-inline-number-form data-letter-id="{{ letter.id }}">
                   <input type="hidden" name="group_id" value="{{ group.id }}">
+                  <input type="hidden" name="autosave" value="true">
                   <label>
                     <span>Исх. №</span>
                     <input name="outgoing_number" inputmode="numeric"
@@ -160,13 +209,19 @@
                            placeholder="—" maxlength="9" pattern="[0-9]+"
                            data-inline-number-input
                            data-original-number="{{ letter.outgoing_number or '' }}"
+                           {% if letter.outlook_message %}readonly title="Черновик или отправка Outlook уже зафиксированы"{% endif %}
                            aria-label="Исходящий номер для {{ group.recipient_display_name }}{% if group.letters|length > 1 %}, письмо {{ letter.letter_order }}{% endif %}">
                   </label>
-                  <button class="icon-button" type="submit"
-                          title="Сохранить номер" data-inline-number-submit>✓</button>
+                  <small class="inline-number-state" data-inline-number-state
+                         aria-live="polite"></small>
                 </form>
 
                 <div class="letter-progress">
+                  {% set recipient_email = (
+                    letter.outlook_message.recipient_email
+                    if letter.outlook_message
+                    else (outlook_test_email if outlook_test_mode else letter.gns_email)
+                  ) %}
                   {% if letter.outlook_message and letter.outlook_message.status == 'sent' %}
                     <span class="status status-completed">Отправлено</span>
                     {% if letter.outlook_message.sent_at %}
@@ -180,10 +235,16 @@
                     <span class="status status-needs_review">Проверить скан</span>
                   {% elif letter.scan_session %}
                     <span class="status status-processing">Скан: {{ letter.scan_session.page_count }} {{ page_word(letter.scan_session.page_count) }}</span>
+                  {% elif group.word_reopen_required %}
+                    <span class="status status-needs_review">Word создан заново — откройте для печати</span>
                   {% elif group.opened_for_print_at %}
                     <span class="status status-ready">Можно сканировать</span>
                   {% else %}
                     <span class="status status-response_created">Word создан</span>
+                  {% endif %}
+                  {% if recipient_email %}
+                    <small class="letter-recipient-email"
+                           title="Получатель письма">{{ recipient_email }}{% if outlook_test_mode and not letter.outlook_message %} · тестовый режим{% endif %}</small>
                   {% endif %}
                 </div>
 
@@ -201,19 +262,36 @@
                       Проверить скан
                     </a>
                   {% elif letter.signed_scan and letter.signed_scan.status == 'confirmed' %}
-                    {% if letter.outgoing_number and letter.gns_email %}
-                      <form method="post"
-                            action="/response-letters/{{ letter.id }}/outlook-draft">
-                        <input type="hidden" name="group_id" value="{{ group.id }}">
-                        <button class="button button-primary button-compact" type="submit">
-                          {% if letter.outlook_message and letter.outlook_message.status == 'draft_created' %}Открыть письмо{% else %}Подготовить письмо в Outlook{% endif %}
-                        </button>
-                      </form>
+                    {% if letter.outgoing_number and (outlook_test_mode or letter.gns_email) %}
+                      {% if outlook_test_send_enabled %}
+                        <form method="post"
+                              action="/response-letters/{{ letter.id }}/outlook-test-send"
+                              onsubmit="return confirm('Отправить готовый PDF только на {{ outlook_test_email }}?');">
+                          <input type="hidden" name="group_id" value="{{ group.id }}">
+                          <button class="button button-primary button-compact" type="submit">
+                            Отправить
+                          </button>
+                        </form>
+                      {% else %}
+                        <form method="post"
+                              action="/response-letters/{{ letter.id }}/outlook-draft">
+                          <input type="hidden" name="group_id" value="{{ group.id }}">
+                          <button class="button button-primary button-compact" type="submit">
+                            {% if letter.outlook_message and letter.outlook_message.status == 'draft_created' %}Открыть письмо{% else %}Подготовить письмо в Outlook{% endif %}
+                          </button>
+                        </form>
+                      {% endif %}
                     {% elif not letter.outgoing_number %}
-                      <button class="button button-secondary button-compact" type="button" disabled>Укажите номер</button>
+                      <button class="button button-secondary button-compact" type="button" disabled>Укажите номер в Word</button>
                     {% else %}
                       <button class="button button-secondary button-compact" type="button" disabled>Нет email УГНС</button>
                     {% endif %}
+                  {% elif group.word_reopen_required %}
+                    <form method="post" action="/response-groups/{{ group.id }}/open-for-print">
+                      <button class="button button-primary button-compact" type="submit">
+                        Открыть обновлённый Word
+                      </button>
+                    </form>
                   {% elif group.opened_for_print_at %}
                     <form method="post"
                           action="/response-letters/{{ letter.id }}/scan-session/start">
@@ -245,19 +323,74 @@
                         Загрузить готовый скан
                       </a>
                     {% endif %}
+                    {% if outlook_test_send_enabled
+                          and letter.outgoing_number
+                          and letter.signed_scan
+                          and letter.signed_scan.status == 'confirmed'
+                          and (not letter.outlook_message or letter.outlook_message.status != 'sent') %}
+                      <form method="post"
+                            action="/response-letters/{{ letter.id }}/outlook-draft">
+                        <input type="hidden" name="group_id" value="{{ group.id }}">
+                        <button type="submit">
+                          {% if letter.outlook_message and letter.outlook_message.status == 'draft_created' %}Открыть черновик Outlook{% else %}Подготовить черновик Outlook{% endif %}
+                        </button>
+                      </form>
+                    {% endif %}
                   </div>
                 </details>
               </div>
             {% endfor %}
           </div>
         </article>
-      {% else %}
+    {% endmacro %}
+
+    {% if overview.generated_groups %}
+      <section class="created-state-section created-pending-section"
+               data-testid="created-pending-section">
+        <header class="created-state-heading">
+          <div>
+            <h3>Ждут отправки</h3>
+            <span>Здесь письма, по которым ещё осталось действие.</span>
+          </div>
+          <strong>{{ pending_created_groups|length }}</strong>
+        </header>
+        <div class="response-list" data-testid="created-response-list">
+          {% for group in pending_created_groups %}
+            {{ render_created_group(group) }}
+          {% else %}
+            <div class="empty-state created-state-empty">
+              <strong>Все созданные письма отправлены</strong>
+              <span>Новых действий пока нет.</span>
+            </div>
+          {% endfor %}
+        </div>
+      </section>
+
+      <details class="created-state-section created-sent-section"
+               data-testid="created-sent-section">
+        <summary class="created-state-heading">
+          <div>
+            <h3>Отправленные</h3>
+            <span>Отправка подтверждена Outlook.</span>
+          </div>
+          <strong>{{ sent_created_groups|length }}</strong>
+        </summary>
+        <div class="response-list">
+          {% for group in sent_created_groups %}
+            {{ render_created_group(group, true) }}
+          {% else %}
+            <div class="empty-state created-state-empty">
+              <strong>Отправленных писем пока нет</strong>
+            </div>
+          {% endfor %}
+        </div>
+      </details>
+    {% else %}
         <div class="empty-state large">
           <strong>Word-ответы ещё не создавались</strong>
           <span>Создайте их во вкладке «К созданию».</span>
         </div>
-      {% endfor %}
-    </div>
+    {% endif %}
 
     {% if active_letter and active_group %}
       {% include "_response_letter_drawer.html" %}

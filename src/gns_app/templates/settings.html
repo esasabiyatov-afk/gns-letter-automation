@@ -21,6 +21,8 @@
   <button type="button" role="tab" aria-selected="false"
           data-settings-tab="outlook">Outlook</button>
   <button type="button" role="tab" aria-selected="false"
+          data-settings-tab="offices">Районы и почта</button>
+  <button type="button" role="tab" aria-selected="false"
           data-settings-tab="service">Обслуживание</button>
 </nav>
 
@@ -193,6 +195,87 @@
   </section>
 
   <section class="settings-section" role="tabpanel"
+           data-settings-panel="offices" hidden>
+    <section class="settings-card">
+      <header>
+        <h2>Добавить район или город</h2>
+      </header>
+      <form method="post" action="/settings/offices/save"
+            class="office-settings-form" data-settings-form>
+        <label class="field">
+          <span>Район / город</span>
+          <input name="district_place" required placeholder="по г.Ош Ошской области">
+        </label>
+        <label class="field">
+          <span>Основная почта</span>
+          <input type="email" name="email_address" placeholder="office@sti.gov.kg">
+        </label>
+        <label class="field">
+          <span>Резервные почты</span>
+          <input name="backup_emails" placeholder="reserve@sti.gov.kg">
+        </label>
+        <label class="field office-alias-field">
+          <span>Алиасы</span>
+          <input name="aliases" placeholder="Старое название, сокращение">
+        </label>
+        <button class="button button-primary" type="submit">Добавить</button>
+      </form>
+    </section>
+
+    <section class="settings-card">
+      <header class="office-directory-header">
+        <h2>Справочник</h2>
+        <input type="search" placeholder="Найти район"
+               aria-label="Найти район" data-office-filter>
+      </header>
+      <div class="office-settings-list" data-office-list>
+        {% for office in gns_offices %}
+          <div class="office-settings-row" data-office-row
+               data-office-search="{{ office.district_place|lower }} {{ office.email_address or '' }} {{ office.backup_emails|join(' ') }} {{ office.aliases|join(' ')|lower }}">
+            <form method="post" action="/settings/offices/save"
+                  class="office-settings-form" data-settings-form>
+              <input type="hidden" name="office_id" value="{{ office.id }}">
+              <label class="field">
+                <span>Район / город</span>
+                <input name="district_place" value="{{ office.district_place }}"
+                       required>
+              </label>
+              <label class="field">
+                <span>Основная почта</span>
+                <input type="email" name="email_address"
+                       value="{{ office.email_address or '' }}">
+              </label>
+              <label class="field">
+                <span>Резервные почты</span>
+                <input name="backup_emails"
+                       value="{{ office.backup_emails|join(', ') }}">
+              </label>
+              <label class="field office-alias-field">
+                <span>Алиасы</span>
+                <input name="aliases"
+                       value="{{ office.aliases|join(', ') }}">
+              </label>
+              <button class="button button-secondary" type="submit">
+                Сохранить
+              </button>
+            </form>
+            <form method="post" action="/settings/offices/{{ office.id }}/delete"
+                  class="office-delete-form">
+              <button class="button button-danger" type="submit"
+                      onclick="return confirm('Удалить район из справочника?');">
+                Удалить
+              </button>
+            </form>
+          </div>
+        {% endfor %}
+      </div>
+      <p class="office-settings-empty" data-office-empty hidden>
+        Ничего не найдено.
+      </p>
+    </section>
+  </section>
+
+  <section class="settings-section" role="tabpanel"
            data-settings-panel="outlook" hidden>
     <section class="settings-card settings-status-card">
       <header>
@@ -208,7 +291,13 @@
       {% if outlook_test_mode %}
         <div class="outlook-status outlook-status-ready">
           <strong>Тестовый адрес: {{ outlook_test_email }}</strong>
-          <small>Получение и отправка на другие внешние адреса заблокированы.</small>
+          <small>
+            {% if outlook_inbox_test_mode %}
+              Получение и отправка на другие внешние адреса заблокированы.
+            {% else %}
+              Все исходящие получатели заменены этим адресом; приём писем не ограничен.
+            {% endif %}
+          </small>
         </div>
       {% endif %}
       <div class="settings-action-row">
@@ -229,8 +318,32 @@
           class="settings-form" data-settings-form>
       <section class="settings-card">
         <header>
+          <h2>Отправители</h2>
+        </header>
+        <div class="settings-field-grid">
+          <label class="field setting-field">
+            <span>Дополнительные отправители</span>
+            <input name="outlook_direct_sender_rules"
+                   value="{{ outlook_direct_sender_rules }}"
+                   {% if outlook_inbox_test_mode %}readonly{% endif %}
+                   placeholder="office@gmail.com, @example.kg">
+            <small>Точный адрес или @домен, через запятую.</small>
+          </label>
+          <label class="field setting-field">
+            <span>Пересылка через</span>
+            <input name="outlook_allowed_senders"
+                   value="{{ outlook_allowed_senders }}"
+                   {% if outlook_inbox_test_mode %}readonly{% endif %}
+                   placeholder="reception@bank.kg">
+            <small>Доверенные адреса приёмной.</small>
+          </label>
+        </div>
+        <small>Всегда разрешены: @sti.gov.kg, @salyk.kg.</small>
+      </section>
+      <section class="settings-card">
+        <header>
           <h2>Получение и отправка</h2>
-          <p>Правила фильтрации, расписание и тема исходящего письма.</p>
+          <p>Расписание и тема исходящего письма.</p>
         </header>
         <div class="settings-field-grid">
           <label class="field setting-field">
@@ -238,18 +351,6 @@
             <input name="outlook_mailbox" value="{{ outlook_mailbox }}"
                    placeholder="mailbox@example.com">
             <small>Пустое поле означает стандартную папку «Входящие».</small>
-          </label>
-          <label class="field setting-field">
-            <span>Почта приёмной</span>
-            <input name="outlook_allowed_senders"
-                   value="{{ outlook_allowed_senders }}"
-                   {% if outlook_test_mode %}readonly{% endif %}
-                   placeholder="reception@bank.kg">
-            <small>
-              Почта УГНС @sti.gov.kg и @salyk.kg уже принимается. Отсюда
-              берутся только пересылки, где в строке «From/От» указан адрес УГНС.
-              Несколько адресов — через запятую.
-            </small>
           </label>
           <label class="field setting-field">
             <span>Проверять начиная с</span>
@@ -269,7 +370,7 @@
                    value="{{ outlook_subject_template }}"
                    maxlength="200" required>
             <small>
-              Доступны: {outgoing_number}, {office_name}, {recipient_name}, {date}.
+              Доступны: {office_name}, {recipient_name}, {date}. Исх. номер остаётся только в Word/PDF.
             </small>
           </label>
         </div>

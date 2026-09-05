@@ -205,6 +205,10 @@ MONTHS_RU = (
 
 
 class WordTemplateService:
+    DEPUTY_WORD_RE = re.compile(
+        r"\bзаместител(?:ь|я|ю|ем|е|и|ей|ям|ями|ях)\b",
+        re.IGNORECASE,
+    )
     TOKENS = {
         "today": "[Дата.Сегодня]",
         "district": "[Район.Место]",
@@ -250,7 +254,7 @@ class WordTemplateService:
         replacements = {
             self.TOKENS["today"]: self._format_date(date.today()),
             self.TOKENS["district"]: clean_location(case["district_place"]),
-            self.TOKENS["position"]: self.names.position_display(
+            self.TOKENS["position"]: self._position_for_word(
                 case["recipient_position"]
             ),
             self.TOKENS["recipient"]: case["recipient_display_name"].strip(),
@@ -289,6 +293,17 @@ class WordTemplateService:
         self._assert_no_tokens(working_path)
         os.replace(working_path, output_path)
         return output_path, likely_overflow
+
+    def _position_for_word(self, position: str) -> str:
+        displayed = self.names.position_display(position)
+
+        def abbreviation(match: re.Match[str]) -> str:
+            value = match.group(0)
+            if value.isupper():
+                return "ЗАМ."
+            return "Зам." if value[:1].isupper() else "зам."
+
+        return self.DEPUTY_WORD_RE.sub(abbreviation, displayed)
 
     def render_pages(
         self,

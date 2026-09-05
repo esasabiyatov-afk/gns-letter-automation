@@ -91,6 +91,7 @@ class WorkflowService:
         {"outlook", "manual_upload", "inbox_folder", "legacy"}
     )
     GNS_EMAILS_SOURCE_SETTING = "gns_emails_source_hash"
+    EMAIL_RE = re.compile(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}")
     GNS_EMAILS_SOURCE_URL = (
         "https://sti.gov.kg/section/0/electronic_appeals_of_citizens"
     )
@@ -683,10 +684,53 @@ class WorkflowService:
             and signature["value"] == source_hash
         ):
             return 0
+        preserved = self.db.fetch_all(
+            "SELECT * FROM gns_offices WHERE user_modified = 1"
+        )
         count = self.replace_gns_offices(
             self.read_gns_offices_csv(self.DEFAULT_GNS_OFFICES_PATH),
             actor="Система",
         )
+        if preserved:
+            with self.db.connect() as connection:
+                connection.executemany(
+                    """
+                    INSERT INTO gns_offices(
+                        office_key, office_name, district_place,
+                        postal_address, email_address, backup_emails_json,
+                        aliases_json, active, user_modified, is_custom,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                    ON CONFLICT(office_key) DO UPDATE SET
+                        office_name = excluded.office_name,
+                        district_place = excluded.district_place,
+                        postal_address = excluded.postal_address,
+                        email_address = excluded.email_address,
+                        backup_emails_json = excluded.backup_emails_json,
+                        aliases_json = excluded.aliases_json,
+                        active = excluded.active,
+                        user_modified = 1,
+                        is_custom = excluded.is_custom,
+                        updated_at = excluded.updated_at
+                    """,
+                    [
+                        (
+                            office["office_key"],
+                            office["office_name"],
+                            office["district_place"],
+                            office.get("postal_address"),
+                            office.get("email_address"),
+                            office.get("backup_emails_json") or "[]",
+                            office.get("aliases_json") or "[]",
+                            int(office.get("active", 1)),
+                            int(office.get("is_custom", 0)),
+                            office["created_at"],
+                            office["updated_at"],
+                        )
+                        for office in preserved
+                    ],
+                )
+            self._invalidate_gns_office_cache()
         self.db.execute(
             """
             INSERT INTO settings(key, value, updated_at)
@@ -702,27 +746,20 @@ class WorkflowService:
         path = self.DEFAULT_GNS_EMAILS_PATH
         if not path.is_file():
             return {"updated": 0, "unmatched": []}
-        source_hash = "office-alias-v2:" + hashlib.sha256(
+        source_hash = "office-alias-v3:" + hashlib.sha256(
             path.read_bytes()
         ).hexdigest()
         signature = self.db.fetch_one(
             "SELECT value FROM settings WHERE key = ?",
             (self.GNS_EMAILS_SOURCE_SETTING,),
         )
-        stored_count = self.db.fetch_one(
-            "SELECT COUNT(*) AS count FROM gns_offices "
-            "WHERE email_address IS NOT NULL AND email_address != ''"
-        )
-        if (
-            signature
-            and signature["value"] == source_hash
-            and stored_count
-            and int(stored_count["count"]) >= 55
-        ):
+        if signature and signature["value"] == source_hash:
             return {"updated": 0, "unmatched": []}
         offices = self.list_gns_offices()
         by_name: dict[str, list[dict[str, Any]]] = {}
         for office in offices:
+            if office.get("user_modified"):
+                continue
             keys = [office.get("office_name") or "", *(office.get("aliases") or [])]
             for key in keys:
                 normalized_key = self._normalize_office_text(key)
@@ -794,8 +831,267 @@ class WorkflowService:
                 )
             except json.JSONDecodeError:
                 row["aliases"] = []
+            try:
+                backup_emails = json.loads(
+                    row.get("backup_emails_json") or "[]"
+                )
+                row["backup_emails"] = [
+                    str(email).strip().casefold()
+                    for email in backup_emails
+                    if self.EMAIL_RE.fullmatch(
+                        str(email).strip().casefold()
+                    )
+                ]
+            except (json.JSONDecodeError, TypeError):
+                row["backup_emails"] = []
+            row["delivery_email"] = (
+                str(row.get("email_address") or "").strip().casefold()
+                or next(iter(row["backup_emails"]), "")
+            )
         self._gns_offices_cache = rows
         return self._gns_offices_cache
+
+    @classmethod
+    def _normalize_office_emails(
+        cls,
+        value: str | list[str] | tuple[str, ...],
+    ) -> list[str]:
+        raw_values = (
+            re.split(r"[,;\n]+", value)
+            if isinstance(value, str)
+            else list(value)
+        )
+        result: list[str] = []
+        for raw in raw_values:
+            email = str(raw or "").strip().casefold()
+            if not email:
+                continue
+            if not cls.EMAIL_RE.fullmatch(email):
+                raise WorkflowValidationError(f"Некорректная почта: {email}")
+            if email not in result:
+                result.append(email)
+        return result
+
+    @staticmethod
+    def office_delivery_email(office: dict[str, Any] | None) -> str:
+        if not office:
+            return ""
+        primary = str(office.get("email_address") or "").strip().casefold()
+        if primary:
+            return primary
+        backups = office.get("backup_emails") or []
+        return str(backups[0]).strip().casefold() if backups else ""
+
+    def save_gns_office(
+        self,
+        district_place: str,
+        email_address: str = "",
+        backup_emails: str | list[str] = "",
+        aliases: str | list[str] = "",
+        *,
+        office_id: int | None = None,
+        actor: str = "Сотрудник",
+    ) -> int:
+        district = clean_location(district_place)
+        if not district:
+            raise WorkflowValidationError("Укажите район или город")
+        if len(district) > 240:
+            raise WorkflowValidationError("Название района слишком длинное")
+        primary_values = self._normalize_office_emails(email_address)
+        if len(primary_values) > 1:
+            raise WorkflowValidationError("Укажите одну основную почту")
+        primary = primary_values[0] if primary_values else ""
+        reserves = [
+            email
+            for email in self._normalize_office_emails(backup_emails)
+            if email != primary
+        ]
+        if len(reserves) > 5:
+            raise WorkflowValidationError("Можно указать до пяти резервных почт")
+        raw_aliases = (
+            re.split(r"[,;\n]+", aliases)
+            if isinstance(aliases, str)
+            else list(aliases)
+        )
+        saved_aliases: list[str] = []
+        for raw_alias in raw_aliases:
+            alias = " ".join(str(raw_alias or "").split())
+            if not alias:
+                continue
+            if len(alias) > 240:
+                raise WorkflowValidationError("Алиас слишком длинный")
+            if all(
+                self._normalize_office_text(existing_alias)
+                != self._normalize_office_text(alias)
+                for existing_alias in saved_aliases
+            ):
+                saved_aliases.append(alias)
+        if len(saved_aliases) > 20:
+            raise WorkflowValidationError("Можно указать до двадцати алиасов")
+
+        current = None
+        if office_id is not None:
+            current = self.db.fetch_one(
+                "SELECT * FROM gns_offices WHERE id = ? AND active = 1",
+                (office_id,),
+            )
+            if not current:
+                raise WorkflowValidationError("Район не найден")
+
+        normalized_district = self._normalize_office_text(district)
+        district_is_unchanged = bool(
+            current
+            and self._normalize_office_text(current["district_place"])
+            == normalized_district
+        )
+        supplied_emails = {primary, *reserves} - {""}
+        for office in self.list_gns_offices():
+            if current and office["id"] == current["id"]:
+                continue
+            if (
+                not district_is_unchanged
+                and self._normalize_office_text(office["district_place"])
+                == normalized_district
+            ):
+                raise WorkflowValidationError("Такой район уже есть")
+            office_emails = {
+                str(office.get("email_address") or "").strip().casefold(),
+                *(office.get("backup_emails") or []),
+            } - {""}
+            if supplied_emails & office_emails:
+                raise WorkflowValidationError(
+                    "Эта почта уже указана у другого района"
+                )
+            other_terms = [
+                office.get("office_name") or "",
+                office.get("district_place") or "",
+                *(office.get("aliases") or []),
+            ]
+            normalized_other_terms = {
+                self._normalize_office_text(term)
+                for term in other_terms
+                if self._normalize_office_text(term)
+            }
+            if (
+                not district_is_unchanged
+                and normalized_district in normalized_other_terms
+            ):
+                raise WorkflowValidationError(
+                    "Такое название уже используется другим районом"
+                )
+            if any(
+                self._normalize_office_text(alias) in normalized_other_terms
+                for alias in saved_aliases
+            ):
+                raise WorkflowValidationError(
+                    "Этот алиас уже используется другим районом"
+                )
+
+        now = utc_now()
+        if current:
+            old_district = clean_location(current["district_place"])
+            if (
+                self._normalize_office_text(old_district) != normalized_district
+                and all(
+                    self._normalize_office_text(alias)
+                    != self._normalize_office_text(old_district)
+                    for alias in saved_aliases
+                )
+            ):
+                saved_aliases.append(old_district)
+            self.db.execute(
+                """
+                UPDATE gns_offices
+                SET district_place = ?, email_address = ?,
+                    backup_emails_json = ?, aliases_json = ?, user_modified = 1,
+                    updated_at = ?
+                WHERE id = ? AND active = 1
+                """,
+                (
+                    district,
+                    primary or None,
+                    json.dumps(reserves, ensure_ascii=False),
+                    json.dumps(saved_aliases, ensure_ascii=False),
+                    now,
+                    current["id"],
+                ),
+            )
+            saved_id = int(current["id"])
+            event_type = "gns_office_updated"
+        else:
+            office_key = "manual:" + hashlib.sha256(
+                normalized_district.encode("utf-8")
+            ).hexdigest()[:24]
+            office_name = (
+                f"УГНС {district}"
+                if district.casefold().startswith("по ")
+                else f"УГНС по {district}"
+            )
+            with self.db.connect() as connection:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO gns_offices(
+                        office_key, office_name, district_place,
+                        postal_address, email_address, backup_emails_json,
+                        aliases_json, active, user_modified, is_custom,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, '', ?, ?, ?, 1, 1, 1, ?, ?)
+                    """,
+                    (
+                        office_key,
+                        office_name,
+                        district,
+                        primary or None,
+                        json.dumps(reserves, ensure_ascii=False),
+                        json.dumps(saved_aliases, ensure_ascii=False),
+                        now,
+                        now,
+                    ),
+                )
+                saved_id = int(cursor.lastrowid)
+            event_type = "gns_office_added"
+
+        self._invalidate_gns_office_cache()
+        self.db.audit(
+            "gns_office",
+            str(saved_id),
+            event_type,
+            {
+                "primary_email_configured": bool(primary),
+                "backup_email_count": len(reserves),
+                "alias_count": len(saved_aliases),
+            },
+            actor=actor,
+        )
+        return saved_id
+
+    def delete_gns_office(
+        self,
+        office_id: int,
+        *,
+        actor: str = "Сотрудник",
+    ) -> None:
+        office = self.db.fetch_one(
+            "SELECT id FROM gns_offices WHERE id = ? AND active = 1",
+            (office_id,),
+        )
+        if not office:
+            raise WorkflowValidationError("Район не найден")
+        self.db.execute(
+            """
+            UPDATE gns_offices
+            SET active = 0, user_modified = 1, updated_at = ?
+            WHERE id = ?
+            """,
+            (utc_now(), office_id),
+        )
+        self._invalidate_gns_office_cache()
+        self.db.audit(
+            "gns_office",
+            str(office_id),
+            "gns_office_deleted",
+            actor=actor,
+        )
 
     def _gns_office_match_index(
         self,
@@ -1076,7 +1372,8 @@ class WorkflowService:
                 """
                 UPDATE response_groups
                 SET district_place = ?, response_page_overflow = ?,
-                    opened_for_print_at = NULL, updated_at = ?
+                    opened_for_print_at = NULL, word_reopen_required = 1,
+                    updated_at = ?
                 WHERE id = ?
                 """,
                 (after, int(likely_overflow), now, group["id"]),
@@ -4398,6 +4695,12 @@ class WorkflowService:
             # Outlook надёжно фиксирует только открытие черновика, старые
             # незавершённые ответы нельзя скрывать фильтром текущего дня.
             generated = self._generated_response_groups(None)
+        pending_generated = [
+            group for group in generated if not group["is_fully_sent"]
+        ]
+        sent_generated = [
+            group for group in generated if group["is_fully_sent"]
+        ]
 
         odb_cases = (
             self._list_odb_cases() if view == "all" else []
@@ -4423,6 +4726,8 @@ class WorkflowService:
                 else []
             ),
             "generated_groups": generated,
+            "pending_generated_groups": pending_generated,
+            "sent_generated_groups": sent_generated,
             "unnumbered_letters": (
                 self.list_outgoing_letters(None, only_unnumbered=True)
                 if view in {"all", "created"}
@@ -4435,16 +4740,24 @@ class WorkflowService:
         business_date: date | None,
     ) -> list[dict[str, Any]]:
         parameters: tuple[Any, ...] = ()
-        where = ""
+        where = "WHERE response_groups.status = 'created'"
         if business_date is not None:
-            where = "WHERE business_date = ?"
+            where += " AND response_groups.business_date = ?"
             parameters = (business_date.isoformat(),)
         generated = self.db.fetch_all(
             f"""
-            SELECT *
+            SELECT response_groups.*,
+                   (
+                       SELECT MIN(CAST(response_letters.outgoing_number AS INTEGER))
+                       FROM response_letters
+                       WHERE response_letters.response_group_id = response_groups.id
+                         AND response_letters.outgoing_number IS NOT NULL
+                         AND response_letters.outgoing_number != ''
+                   ) AS first_outgoing_number
             FROM response_groups
             {where}
-            ORDER BY created_at, rowid
+            ORDER BY CASE WHEN first_outgoing_number IS NULL THEN 1 ELSE 0 END,
+                     first_outgoing_number, created_at, rowid
             """,
             parameters,
         )
@@ -4462,7 +4775,12 @@ class WorkflowService:
               ON response_groups.id = response_letters.response_group_id
             WHERE response_groups.id IN ({placeholders})
             ORDER BY response_groups.created_at,
-                     response_groups.rowid, response_letters.letter_order
+                     response_groups.rowid,
+                     CASE WHEN response_letters.outgoing_number IS NULL
+                               OR response_letters.outgoing_number = ''
+                          THEN 1 ELSE 0 END,
+                     CAST(response_letters.outgoing_number AS INTEGER),
+                     response_letters.letter_order
             """,
             group_ids,
         )
@@ -4563,14 +4881,21 @@ class WorkflowService:
             group = generated_by_id.get(letter["response_group_id"])
             if group is not None:
                 office = self.match_gns_office(group["district_place"])
-                letter["gns_email"] = (
-                    office.get("email_address") if office else ""
-                )
+                letter["gns_email"] = self.office_delivery_email(office)
                 group["letters"].append(letter)
         for group in generated:
             group["letter_count"] = len(group["letters"])
             group["numbered_letter_count"] = sum(
                 1 for letter in group["letters"] if letter["outgoing_number"]
+            )
+            group["sent_letter_count"] = sum(
+                1
+                for letter in group["letters"]
+                if letter.get("outlook_message")
+                and letter["outlook_message"].get("status") == "sent"
+            )
+            group["is_fully_sent"] = bool(group["letters"]) and (
+                group["sent_letter_count"] == group["letter_count"]
             )
         return generated
 
@@ -4647,6 +4972,10 @@ class WorkflowService:
         self,
         business_date: date | None = None,
     ) -> dict[str, int]:
+        # Сначала убираем сравнения, которые уже перестали быть актуальными.
+        # Иначе навигация считает старую pending-запись, а открытая очередь
+        # сразу после этого очищает её и выглядит пустой при счётчике 1.
+        self.reconcile_case_match_reviews()
         row = self.db.fetch_one(
             """
             SELECT
@@ -4702,7 +5031,8 @@ class WorkflowService:
                  WHERE status = 'ready_for_abs') AS ready_abs,
                 (SELECT COUNT(*) FROM cases
                  WHERE status = 'ready_for_response') AS ready_responses,
-                (SELECT COUNT(*) FROM response_groups)
+                (SELECT COUNT(*) FROM response_groups
+                 WHERE status = 'created')
                     AS created_responses,
                 (SELECT COUNT(DISTINCT cases.id)
                  FROM cases
@@ -4783,7 +5113,155 @@ class WorkflowService:
             "account_groups": account_groups,
             "odb_cases": self._list_odb_cases(),
             "case_tasks": generic_cases,
+            "review_history": self._manual_review_history(),
         }
+
+    def _manual_review_history(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Return ABS accounts found and all completed period-based ODB checks."""
+        safe_limit = max(1, min(int(limit), 200))
+        events = self.db.fetch_all(
+            """
+            SELECT id, entity_type, entity_id, event_type, actor,
+                   payload_json, created_at
+            FROM audit_events
+            WHERE event_type IN (
+                'abs_account_manually_checked',
+                'odb_checked'
+            )
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (safe_limit * 2,),
+        )
+        if not events:
+            return []
+
+        taxpayer_ids = tuple(
+            event["entity_id"]
+            for event in events
+            if event["event_type"] == "abs_account_manually_checked"
+        )
+        odb_case_ids = tuple(
+            event["entity_id"]
+            for event in events
+            if event["event_type"] == "odb_checked"
+        )
+
+        abs_context: dict[str, dict[str, Any]] = {}
+        if taxpayer_ids:
+            placeholders = ",".join("?" for _ in taxpayer_ids)
+            abs_context = {
+                row["taxpayer_id"]: row
+                for row in self.db.fetch_all(
+                    f"""
+                    SELECT taxpayers.id AS taxpayer_id, taxpayers.name,
+                           taxpayers.inn, cases.id AS case_id,
+                           cases.district_place, uploads.original_filename
+                    FROM taxpayers
+                    JOIN cases ON cases.id = taxpayers.case_id
+                    JOIN uploads ON uploads.id = cases.upload_id
+                    WHERE taxpayers.id IN ({placeholders})
+                    """,
+                    taxpayer_ids,
+                )
+            }
+
+        odb_context: dict[tuple[str, str], dict[str, Any]] = {}
+        if odb_case_ids:
+            placeholders = ",".join("?" for _ in odb_case_ids)
+            for row in self.db.fetch_all(
+                f"""
+                SELECT cases.id AS case_id, cases.district_place,
+                       uploads.original_filename, taxpayers.name,
+                       taxpayers.inn
+                FROM cases
+                JOIN uploads ON uploads.id = cases.upload_id
+                JOIN taxpayers ON taxpayers.case_id = cases.id
+                WHERE cases.id IN ({placeholders})
+                """,
+                odb_case_ids,
+            ):
+                odb_context[(row["case_id"], row["inn"])] = row
+
+        def payload(event: dict[str, Any]) -> dict[str, Any]:
+            try:
+                value = json.loads(event["payload_json"])
+            except (TypeError, json.JSONDecodeError):
+                return {}
+            return value if isinstance(value, dict) else {}
+
+        def history_item(
+            event: dict[str, Any],
+            *,
+            kind: str,
+            label: str,
+            name: str,
+            inn: str = "",
+            district_place: str = "",
+            result: str,
+            result_tone: str,
+            suffix: str = "",
+        ) -> dict[str, Any]:
+            return {
+                "id": f"{event['id']}{suffix}",
+                "kind": kind,
+                "kind_label": label,
+                "name": name,
+                "inn": inn,
+                "district_place": district_place,
+                "result": result,
+                "result_tone": result_tone,
+                "actor": event.get("actor") or "",
+                "created_at": event["created_at"],
+            }
+
+        history: list[dict[str, Any]] = []
+        for event in events:
+            data = payload(event)
+            if event["event_type"] == "abs_account_manually_checked":
+                context = abs_context.get(event["entity_id"])
+                if not context or data.get("result") != "found":
+                    continue
+                history.append(
+                    history_item(
+                        event,
+                        kind="abs",
+                        label="АБС",
+                        name=context["name"],
+                        inn=context["inn"],
+                        district_place=context.get("district_place") or "",
+                        result="Счёт есть",
+                        result_tone="found",
+                    )
+                )
+            elif event["event_type"] == "odb_checked":
+                results = data.get("results")
+                if not isinstance(results, list):
+                    continue
+                for index, decision in enumerate(results):
+                    if not isinstance(decision, dict):
+                        continue
+                    inn = str(decision.get("inn") or "")
+                    context = odb_context.get((event["entity_id"], inn))
+                    if not context:
+                        continue
+                    found = decision.get("result") == "found"
+                    history.append(
+                        history_item(
+                            event,
+                            kind="odb",
+                            label="ОДБ",
+                            name=context["name"],
+                            inn=inn,
+                            district_place=context.get("district_place") or "",
+                            result="Найден" if found else "Не найден",
+                            result_tone="found" if found else "not-found",
+                            suffix=f"-{index}",
+                        )
+                    )
+            if len(history) >= safe_limit:
+                break
+        return history[:safe_limit]
 
     def manual_response_groups(
         self,
@@ -4916,7 +5394,7 @@ class WorkflowService:
                     "abs_bucket": str(abs_bucket),
                     "district_place": district,
                     "gns_office_key": office["office_key"] if office else "",
-                    "gns_email": office.get("email_address") if office else "",
+                    "gns_email": self.office_delivery_email(office),
                     "recipient_position": row.get("recipient_position") or "",
                     "recipient_full_name": recipient,
                     "recipient_display_name": (
@@ -5145,14 +5623,13 @@ class WorkflowService:
                 )
         return {"created": created, "errors": errors}
 
-    def generate_daily_response(
+    def get_daily_response_group(
         self,
         group_key: str,
         business_date: date | None = None,
-        taxpayers_per_page: int | None = None,
-    ) -> tuple[str, Path]:
+    ) -> dict[str, Any] | None:
         day = business_date or datetime.now(self.BUSINESS_TIMEZONE).date()
-        group = next(
+        return next(
             (
                 item
                 for item in self._daily_response_groups(
@@ -5162,6 +5639,28 @@ class WorkflowService:
             ),
             None,
         )
+
+    def generate_daily_response(
+        self,
+        group_key: str,
+        business_date: date | None = None,
+        taxpayers_per_page: int | None = None,
+    ) -> tuple[str, Path]:
+        with self._case_lock:
+            return self._generate_daily_response_locked(
+                group_key,
+                business_date=business_date,
+                taxpayers_per_page=taxpayers_per_page,
+            )
+
+    def _generate_daily_response_locked(
+        self,
+        group_key: str,
+        business_date: date | None = None,
+        taxpayers_per_page: int | None = None,
+    ) -> tuple[str, Path]:
+        day = business_date or datetime.now(self.BUSINESS_TIMEZONE).date()
+        group = self.get_daily_response_group(group_key, day)
         if not group:
             raise WorkflowValidationError(
                 "Группа уже обработана или больше не готова к ответу"
@@ -5170,6 +5669,15 @@ class WorkflowService:
             raise WorkflowValidationError(
                 "Нельзя создать ответ: " + " ".join(group["issues"])
             )
+
+        existing = self._mergeable_created_response_group(group)
+        if existing:
+            if taxpayers_per_page is not None:
+                raise WorkflowValidationError(
+                    "Позднее обращение можно добавить только в обычный "
+                    "общий ответ без ручного разбиения."
+                )
+            return self._merge_ready_group_into_created(existing, group)
 
         group_id = uuid4().hex
         output = self.settings.responses_dir / self._response_word_filename(
@@ -5317,6 +5825,384 @@ class WorkflowService:
         )
         return group_id, output
 
+    def _mergeable_created_response_group(
+        self,
+        ready_group: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        candidates = self.db.fetch_all(
+            """
+            SELECT response_groups.*
+            FROM response_groups
+            WHERE response_groups.business_date = ?
+              AND response_groups.group_key = ?
+              AND response_groups.abs_bucket = ?
+              AND response_groups.status = 'created'
+              AND (
+                  SELECT COUNT(*) FROM response_letters
+                  WHERE response_letters.response_group_id = response_groups.id
+              ) = 1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM signed_response_scans
+                  JOIN response_letters
+                    ON response_letters.id =
+                       signed_response_scans.response_letter_id
+                  WHERE response_letters.response_group_id = response_groups.id
+                    AND signed_response_scans.status != 'superseded'
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM outlook_outgoing_messages
+                  JOIN response_letters
+                    ON response_letters.id =
+                       outlook_outgoing_messages.response_letter_id
+                  WHERE response_letters.response_group_id = response_groups.id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM signed_scan_sessions
+                  JOIN response_letters
+                    ON response_letters.id =
+                       signed_scan_sessions.response_letter_id
+                  JOIN signed_scan_session_pages
+                    ON signed_scan_session_pages.session_id =
+                       signed_scan_sessions.id
+                  WHERE response_letters.response_group_id = response_groups.id
+                    AND signed_scan_sessions.status IN (
+                        'collecting', 'technical_error'
+                    )
+                    AND signed_scan_session_pages.status = 'active'
+              )
+            ORDER BY response_groups.created_at, response_groups.id
+            """,
+            (
+                ready_group["business_date"],
+                ready_group["group_key"],
+                str(AbsStatus.NOT_FOUND),
+            ),
+        )
+        if not candidates:
+            return None
+        existing = candidates[0]
+        for field in (
+            "district_place",
+            "recipient_position",
+            "recipient_display_name",
+            "employee_name",
+        ):
+            if self._normalize_group_value(existing.get(field)) != (
+                self._normalize_group_value(ready_group.get(field))
+            ):
+                raise WorkflowValidationError(
+                    "У уже созданного ответа этому адресату отличаются "
+                    "реквизиты. Сначала проверьте их вручную."
+                )
+        return existing
+
+    def _merge_ready_group_into_created(
+        self,
+        existing_group: dict[str, Any],
+        ready_group: dict[str, Any],
+    ) -> tuple[str, Path]:
+        group_id = existing_group["id"]
+        stored_group, stored_taxpayers, letters = (
+            self._response_group_render_data(group_id)
+        )
+        if len(letters) != 1:
+            raise WorkflowValidationError(
+                "Позднее обращение нельзя безопасно добавить в разделённый Word."
+            )
+        output = ensure_within(
+            Path(stored_group["response_path"]),
+            self.settings.responses_dir,
+        )
+        if not output.exists():
+            raise WorkflowValidationError(
+                "Файл уже созданного ответа отсутствует."
+            )
+
+        combined = [dict(taxpayer) for taxpayer in stored_taxpayers]
+        by_inn = {
+            str(taxpayer["inn"]): self._normalize_group_value(taxpayer["name"])
+            for taxpayer in combined
+        }
+        by_name = {
+            self._normalize_group_value(taxpayer["name"]): str(taxpayer["inn"])
+            for taxpayer in combined
+        }
+        additions: list[dict[str, Any]] = []
+        for taxpayer in ready_group["taxpayers"]:
+            inn = str(taxpayer["inn"])
+            normalized_name = self._normalize_group_value(taxpayer["name"])
+            if inn in by_inn:
+                if by_inn[inn] != normalized_name:
+                    raise WorkflowValidationError(
+                        "У одинакового ИНН отличаются наименования. "
+                        "Требуется ручная проверка."
+                    )
+                continue
+            if normalized_name in by_name and by_name[normalized_name] != inn:
+                raise WorkflowValidationError(
+                    "У одинакового лица отличаются ИНН. "
+                    "Требуется ручная проверка."
+                )
+            addition = {
+                "source_case_id": taxpayer["source_case_id"],
+                "name": taxpayer["name"],
+                "inn": inn,
+            }
+            additions.append(addition)
+            combined.append(addition)
+            by_inn[inn] = normalized_name
+            by_name[normalized_name] = inn
+
+        temporary: Path | None = None
+        backup: Path | None = None
+        likely_overflow = bool(stored_group["response_page_overflow"])
+        if additions:
+            temporary = output.with_name(
+                f".{output.stem}-late-merge-{uuid4().hex}.docx"
+            )
+            try:
+                _, likely_overflow = self.word.render_pages(
+                    temporary,
+                    {
+                        "district_place": stored_group["district_place"],
+                        "recipient_position": stored_group["recipient_position"],
+                        "recipient_display_name": stored_group[
+                            "recipient_display_name"
+                        ],
+                        "employee_name": stored_group["employee_name"],
+                    },
+                    combined,
+                    len(combined),
+                    outgoing_numbers=[
+                        str(letters[0]["outgoing_number"] or "")
+                    ],
+                )
+                backup = output.with_name(
+                    f".{output.stem}-before-late-merge-{uuid4().hex}.docx"
+                )
+                shutil.copy2(output, backup)
+            except (OSError, WordTemplateError) as exc:
+                temporary.unlink(missing_ok=True)
+                raise WorkflowValidationError(
+                    "Не удалось обновить общий Word."
+                ) from exc
+
+        case_ids = list(dict.fromkeys(ready_group["case_ids"]))
+        placeholders = ",".join("?" for _ in case_ids)
+        now = utc_now()
+        replaced = False
+        try:
+            with self.db.connect() as connection:
+                # Блокируем конкурирующую запись и повторно проверяем границу
+                # сканирования/Outlook: между предварительным поиском группы и
+                # этой точкой сотрудник мог начать отправку.
+                connection.execute("BEGIN IMMEDIATE")
+                merge_cutoff = connection.execute(
+                    """
+                    SELECT 1
+                    FROM response_groups
+                    WHERE response_groups.id = ?
+                      AND response_groups.status = 'created'
+                      AND (
+                          EXISTS (
+                              SELECT 1
+                              FROM signed_response_scans
+                              JOIN response_letters
+                                ON response_letters.id =
+                                   signed_response_scans.response_letter_id
+                              WHERE response_letters.response_group_id =
+                                    response_groups.id
+                                AND signed_response_scans.status != 'superseded'
+                          )
+                          OR EXISTS (
+                              SELECT 1
+                              FROM outlook_outgoing_messages
+                              JOIN response_letters
+                                ON response_letters.id =
+                                   outlook_outgoing_messages.response_letter_id
+                              WHERE response_letters.response_group_id =
+                                    response_groups.id
+                          )
+                          OR EXISTS (
+                              SELECT 1
+                              FROM signed_scan_sessions
+                              JOIN response_letters
+                                ON response_letters.id =
+                                   signed_scan_sessions.response_letter_id
+                              JOIN signed_scan_session_pages
+                                ON signed_scan_session_pages.session_id =
+                                   signed_scan_sessions.id
+                              WHERE response_letters.response_group_id =
+                                    response_groups.id
+                                AND signed_scan_sessions.status IN (
+                                    'collecting', 'technical_error'
+                                )
+                                AND signed_scan_session_pages.status = 'active'
+                          )
+                      )
+                    """,
+                    (group_id,),
+                ).fetchone()
+                current_group = connection.execute(
+                    "SELECT status FROM response_groups WHERE id = ?",
+                    (group_id,),
+                ).fetchone()
+                if not current_group or current_group["status"] != "created":
+                    raise WorkflowValidationError(
+                        "Существующий ответ уже изменился. Обновите страницу."
+                    )
+                if merge_cutoff:
+                    raise WorkflowValidationError(
+                        "Ответ уже начали сканировать или отправлять. "
+                        "Новое обращение сохранено отдельно; повторите создание."
+                    )
+                current_cases = connection.execute(
+                    "SELECT id, status FROM cases "
+                    f"WHERE id IN ({placeholders})",
+                    case_ids,
+                ).fetchall()
+                if len(current_cases) != len(case_ids) or any(
+                    row["status"] != CaseStatus.READY_FOR_RESPONSE
+                    for row in current_cases
+                ):
+                    raise WorkflowValidationError(
+                        "Состав готовых обращений изменился. Обновите страницу."
+                    )
+
+                if additions and temporary is not None:
+                    temporary.replace(output)
+                    replaced = True
+
+                connection.executemany(
+                    "INSERT OR IGNORE INTO response_group_cases("
+                    "response_group_id, case_id) VALUES (?, ?)",
+                    [(group_id, case_id) for case_id in case_ids],
+                )
+                start_order = len(stored_taxpayers) + 1
+                connection.executemany(
+                    """
+                    INSERT INTO response_group_taxpayers(
+                        response_group_id, display_order, source_case_id,
+                        name, inn
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            group_id,
+                            start_order + index,
+                            taxpayer["source_case_id"],
+                            taxpayer["name"],
+                            taxpayer["inn"],
+                        )
+                        for index, taxpayer in enumerate(additions)
+                    ],
+                )
+                if additions:
+                    connection.execute(
+                        """
+                        UPDATE response_groups
+                        SET taxpayer_count = ?, taxpayers_per_letter = ?,
+                            response_page_overflow = ?,
+                            opened_for_print_at = NULL,
+                            word_reopen_required = 1, updated_at = ?
+                        WHERE id = ? AND status = 'created'
+                        """,
+                        (
+                            len(combined),
+                            len(combined),
+                            int(likely_overflow),
+                            now,
+                            group_id,
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE response_letters
+                        SET taxpayer_start_order = 1, taxpayer_count = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (len(combined), now, letters[0]["id"]),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE signed_scan_sessions
+                        SET status = 'cancelled', error_message = NULL,
+                            updated_at = ?
+                        WHERE response_letter_id = ?
+                          AND status IN ('collecting', 'technical_error')
+                          AND NOT EXISTS (
+                              SELECT 1 FROM signed_scan_session_pages
+                              WHERE signed_scan_session_pages.session_id =
+                                    signed_scan_sessions.id
+                                AND signed_scan_session_pages.status = 'active'
+                          )
+                        """,
+                        (now, letters[0]["id"]),
+                    )
+                connection.executemany(
+                    """
+                    UPDATE cases
+                    SET status = ?, response_status = ?,
+                        response_path = ?, updated_at = ?
+                    WHERE id = ? AND status = ?
+                    """,
+                    [
+                        (
+                            CaseStatus.RESPONSE_CREATED,
+                            "grouped",
+                            str(output),
+                            now,
+                            case_id,
+                            CaseStatus.READY_FOR_RESPONSE,
+                        )
+                        for case_id in case_ids
+                    ],
+                )
+                connection.execute(
+                    """
+                    INSERT INTO audit_events(
+                        entity_type, entity_id, event_type,
+                        actor, payload_json, created_at
+                    ) VALUES ('response_group', ?,
+                              'late_cases_merged_into_response',
+                              'Сотрудник', ?, ?)
+                    """,
+                    (
+                        group_id,
+                        json.dumps(
+                            {
+                                "added_case_count": len(case_ids),
+                                "added_taxpayer_count": len(additions),
+                                "duplicate_taxpayer_count": (
+                                    len(ready_group["taxpayers"])
+                                    - len(additions)
+                                ),
+                                "word_regenerated": bool(additions),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        now,
+                    ),
+                )
+        except Exception:
+            if replaced and backup is not None and backup.exists():
+                try:
+                    backup.replace(output)
+                except OSError:
+                    pass
+            elif backup is not None:
+                backup.unlink(missing_ok=True)
+            raise
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+        return group_id, output
+
     def get_response_group(
         self, group_id: str
     ) -> dict[str, Any] | None:
@@ -5404,8 +6290,13 @@ class WorkflowService:
         now = utc_now()
         with self.db.connect() as connection:
             connection.execute(
-                "UPDATE response_groups SET opened_for_print_at = ? WHERE id = ?",
-                (now, group_id),
+                """
+                UPDATE response_groups
+                SET opened_for_print_at = ?, word_reopen_required = 0,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, group_id),
             )
             connection.execute(
                 """
@@ -5476,6 +6367,41 @@ class WorkflowService:
             parameters,
         )
 
+    def _propose_outgoing_numbers(
+        self,
+        first_number: str,
+        letters: list[dict[str, Any]],
+    ) -> tuple[dict[str, str], int]:
+        """Assign only currently free numbers, preserving prior choices."""
+        occupied_rows = self.db.fetch_all(
+            """
+            SELECT outgoing_number
+            FROM response_letters
+            WHERE outgoing_number IS NOT NULL AND outgoing_number != ''
+            """
+        )
+        occupied: set[int] = set()
+        for row in occupied_rows:
+            number = self._canonical_outgoing_number(row["outgoing_number"])
+            assert number is not None
+            occupied.add(int(number))
+
+        candidate = int(first_number)
+        skipped_occupied_count = 0
+        proposals: dict[str, str] = {}
+        for letter in letters:
+            while candidate in occupied:
+                candidate += 1
+                skipped_occupied_count += 1
+            if candidate > 999_999_999:
+                raise WorkflowValidationError(
+                    "Диапазон исходящих номеров превышает 999999999"
+                )
+            proposals[letter["id"]] = str(candidate)
+            occupied.add(candidate)
+            candidate += 1
+        return proposals, skipped_occupied_count
+
     def preview_outgoing_numbers(
         self,
         first_number: str | int,
@@ -5487,29 +6413,16 @@ class WorkflowService:
             business_date,
             only_unnumbered=True,
         )
-        if letters and int(first) + len(letters) - 1 > 999_999_999:
-            raise WorkflowValidationError(
-                "Диапазон исходящих номеров превышает 999999999"
-            )
+        updates, skipped_occupied_count = self._propose_outgoing_numbers(
+            first, letters
+        )
         proposals: list[dict[str, Any]] = []
-        for offset, letter in enumerate(letters):
+        for letter in letters:
             proposal = dict(letter)
-            proposal["proposed_number"] = str(int(first) + offset)
+            proposal["proposed_number"] = updates[letter["id"]]
             proposals.append(proposal)
 
         proposed_numbers = [item["proposed_number"] for item in proposals]
-        if proposed_numbers:
-            placeholders = ",".join("?" for _ in proposed_numbers)
-            occupied = self.db.fetch_all(
-                "SELECT outgoing_number FROM response_letters "
-                f"WHERE outgoing_number IN ({placeholders})",
-                proposed_numbers,
-            )
-            if occupied:
-                raise WorkflowValidationError(
-                    "Исходящий номер "
-                    f"{occupied[0]['outgoing_number']} уже используется"
-                )
         return {
             "business_date": day.isoformat(),
             "first_number": first,
@@ -5518,6 +6431,7 @@ class WorkflowService:
             ),
             "count": len(proposals),
             "letters": proposals,
+            "skipped_occupied_count": skipped_occupied_count,
         }
 
     def _response_group_render_data(
@@ -5639,11 +6553,61 @@ class WorkflowService:
                     f"{occupied['outgoing_number']} уже используется"
                 )
 
-        group_ids = sorted({row["response_group_id"] for row in rows})
+        before = {row["id"]: row["outgoing_number"] for row in rows}
+        changed_rows = [
+            row
+            for row in rows
+            if before[row["id"]] != normalized[row["id"]]
+        ]
+        if not changed_rows:
+            return {
+                "letter_count": 0,
+                "group_count": 0,
+                "superseded_scan_count": 0,
+                "word_reopen_required": False,
+            }
+
+        changed_letter_ids = [row["id"] for row in changed_rows]
+        changed_placeholders = ",".join("?" for _ in changed_letter_ids)
+        # Нельзя менять номер во время получения листов: физическая копия
+        # Word уже могла попасть на сканер.
+        active_session = self.db.fetch_one(
+            f"""
+            SELECT id FROM signed_scan_sessions
+            WHERE response_letter_id IN ({changed_placeholders})
+              AND status IN ('collecting', 'technical_error')
+            LIMIT 1
+            """,
+            changed_letter_ids,
+        )
+        if active_session:
+            raise WorkflowValidationError(
+                "Сначала завершите или отмените текущее сканирование."
+            )
+        # Черновик (включая уже отправленное письмо) — внешний объект. Его
+        # нельзя оставить с подписанным PDF, который перестанет совпадать с
+        # обновлённым Word.
+        existing_outlook = self.db.fetch_one(
+            f"""
+            SELECT id FROM outlook_outgoing_messages
+            WHERE response_letter_id IN ({changed_placeholders})
+            LIMIT 1
+            """,
+            changed_letter_ids,
+        )
+        if existing_outlook:
+            raise WorkflowValidationError(
+                "Нельзя изменить исходящий номер: для письма уже создан "
+                "черновик Outlook или подтверждена отправка."
+            )
+
+        group_ids = sorted(
+            {row["response_group_id"] for row in changed_rows}
+        )
         rendered: dict[str, tuple[Path, Path, bool]] = {}
         backups: dict[str, Path] = {}
         preserved_backups: set[str] = set()
-        before = {row["id"]: row["outgoing_number"] for row in rows}
+        superseded_scan_count = 0
         try:
             for group_id in group_ids:
                 rendered[group_id] = self._render_group_number_update(
@@ -5670,6 +6634,32 @@ class WorkflowService:
                     raise WorkflowValidationError(
                         "Список исходящих номеров уже изменился. Обновите страницу."
                     )
+                active_session = connection.execute(
+                    f"""
+                    SELECT id FROM signed_scan_sessions
+                    WHERE response_letter_id IN ({changed_placeholders})
+                      AND status IN ('collecting', 'technical_error')
+                    LIMIT 1
+                    """,
+                    changed_letter_ids,
+                ).fetchone()
+                if active_session:
+                    raise WorkflowValidationError(
+                        "Сначала завершите или отмените текущее сканирование."
+                    )
+                existing_outlook = connection.execute(
+                    f"""
+                    SELECT id FROM outlook_outgoing_messages
+                    WHERE response_letter_id IN ({changed_placeholders})
+                    LIMIT 1
+                    """,
+                    changed_letter_ids,
+                ).fetchone()
+                if existing_outlook:
+                    raise WorkflowValidationError(
+                        "Нельзя изменить исходящий номер: для письма уже создан "
+                        "черновик Outlook или подтверждена отправка."
+                    )
                 if requested_numbers:
                     number_placeholders = ",".join(
                         "?" for _ in requested_numbers
@@ -5686,7 +6676,17 @@ class WorkflowService:
                             "Исходящий номер "
                             f"{occupied['outgoing_number']} уже используется"
                         )
-                for row in rows:
+                active_scans = connection.execute(
+                    f"""
+                    SELECT id, response_letter_id
+                    FROM signed_response_scans
+                    WHERE response_letter_id IN ({changed_placeholders})
+                      AND status IN ('needs_confirmation', 'confirmed')
+                    """,
+                    changed_letter_ids,
+                ).fetchall()
+                superseded_scan_count = len(active_scans)
+                for row in changed_rows:
                     letter_id = row["id"]
                     new_number = normalized[letter_id]
                     connection.execute(
@@ -5730,13 +6730,49 @@ class WorkflowService:
                             now,
                         ),
                     )
+                if active_scans:
+                    connection.execute(
+                        f"""
+                        UPDATE signed_response_scans
+                        SET status = 'superseded', updated_at = ?
+                        WHERE response_letter_id IN ({changed_placeholders})
+                          AND status IN ('needs_confirmation', 'confirmed')
+                        """,
+                        (now, *changed_letter_ids),
+                    )
+                    for scan in active_scans:
+                        connection.execute(
+                            """
+                            INSERT INTO audit_events(
+                                entity_type, entity_id, event_type,
+                                actor, payload_json, created_at
+                            ) VALUES (?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                "signed_response_scan",
+                                scan["id"],
+                                "signed_scan_superseded_by_outgoing_number",
+                                actor,
+                                json.dumps(
+                                    {
+                                        "response_letter_id": scan[
+                                            "response_letter_id"
+                                        ],
+                                        "reason": "outgoing_number_changed",
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                now,
+                            ),
+                        )
                 for group_id, (temporary, output, overflow) in rendered.items():
                     temporary.replace(output)
                     connection.execute(
                         """
                         UPDATE response_groups
                         SET response_page_overflow = ?,
-                            opened_for_print_at = NULL, updated_at = ?
+                            opened_for_print_at = NULL,
+                            word_reopen_required = 1, updated_at = ?
                         WHERE id = ?
                         """,
                         (int(overflow), now, group_id),
@@ -5768,8 +6804,10 @@ class WorkflowService:
                     backup.unlink(missing_ok=True)
 
         return {
-            "letter_count": len(letter_ids),
+            "letter_count": len(changed_letter_ids),
             "group_count": len(group_ids),
+            "superseded_scan_count": superseded_scan_count,
+            "word_reopen_required": True,
         }
 
     @staticmethod
@@ -5812,29 +6850,20 @@ class WorkflowService:
             raise WorkflowValidationError(
                 "Список готовых писем изменился. Обновите страницу."
             )
-        try:
-            start_index = current_ids.index(expected_letter_ids[0])
-        except ValueError as exc:
-            raise WorkflowValidationError(
-                "Список готовых писем изменился. Обновите страницу."
-            ) from exc
-        if expected_letter_ids != current_ids[start_index:]:
+        if expected_letter_ids != current_ids:
             raise WorkflowValidationError(
                 "Список готовых писем изменился. Обновите страницу."
             )
-        if int(first) + len(expected_letter_ids) - 1 > 999_999_999:
-            raise WorkflowValidationError(
-                "Диапазон исходящих номеров превышает 999999999"
-            )
-        updates = {
-            letter_id: str(int(first) + offset)
-            for offset, letter_id in enumerate(expected_letter_ids)
-        }
+        updates, skipped_occupied_count = self._propose_outgoing_numbers(
+            first, letters
+        )
         summary = self._apply_outgoing_number_updates(updates, actor=actor)
         summary.update(
             {
                 "first_number": first,
-                "last_number": updates[expected_letter_ids[-1]],
+                "first_assigned_number": updates[current_ids[0]],
+                "last_number": updates[current_ids[-1]],
+                "skipped_occupied_count": skipped_occupied_count,
             }
         )
         return summary

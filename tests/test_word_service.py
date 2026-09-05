@@ -40,10 +40,32 @@ def test_renders_single_response_without_placeholders(
     assert output.exists()
     assert "02312201410117" in text
     assert 'ОсОО "Тест"' in text
-    assert "Заместителю начальника управления" in text
-    assert "Зам. начальника управления" not in text
+    assert "Зам. начальника управления" in text
+    assert "Заместителю начальника управления" not in text
     assert "[Дата.Сегодня]" not in text
     assert "[ФИО.Исп]" not in text
+
+
+@pytest.mark.parametrize(
+    "position",
+    (
+        "Заместитель начальника управления",
+        "Заместителя начальника управления",
+        "Заместителю начальника управления",
+        "Заместителем начальника управления",
+        "Заместителе начальника управления",
+        "Зам. начальника управления",
+    ),
+)
+def test_shortens_deputy_in_every_case_for_word(
+    templates_dir,
+    position,
+):
+    service = WordTemplateService(templates_dir)
+
+    assert service._position_for_word(position) == (
+        "Зам. начальника управления"
+    )
 
 
 def test_renders_non_bishkek_city_with_its_region(tmp_path, templates_dir):
@@ -265,7 +287,7 @@ def test_renders_multiple_taxpayers_on_separate_lines(
     assert output.exists()
     assert "02312201410117" in text
     assert "02801202210185" in text
-    assert "Заместителю начальника управления" in text
+    assert "Зам. начальника управления" in text
     assert "[Перечисления.Субьект]" not in text
     assert "[ИНН.Субьект]" not in text
 

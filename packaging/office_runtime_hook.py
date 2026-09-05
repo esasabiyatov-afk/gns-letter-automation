@@ -12,4 +12,6 @@ os.environ.setdefault("GNS_TOLUBAY_VERIFY_TLS", "false")
 # During Outlook synchronization, confirm only the known Outlook certificate
 # dialog.  Other dialogs and all send actions remain under user control.
 os.environ.setdefault("GNS_OUTLOOK_ALLOW_INSECURE_CERTIFICATE", "true")
+# Office test builds send only to the hard-coded approved Gmail recipient.
+os.environ.setdefault("GNS_OUTLOOK_ALLOW_TEST_SEND", "true")
 os.environ.setdefault("GNS_PROCESSING_WORKERS", "1")

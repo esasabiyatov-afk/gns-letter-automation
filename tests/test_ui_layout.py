@@ -375,6 +375,25 @@ def test_work_sections_are_server_rendered_one_at_a_time(workflow, monkeypatch):
     assert "Параметры Word" not in responses.text
 
 
+def test_manual_review_uses_70_30_queue_and_history_layout():
+    package_dir = Path(main.__file__).parent
+    template = (package_dir / "templates" / "_work_review.html").read_text(
+        encoding="utf-8"
+    )
+    stylesheet = (package_dir / "static" / "styles.css").read_text(
+        encoding="utf-8"
+    )
+    script = (package_dir / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert 'class="manual-review-layout"' in template
+    assert 'data-testid="manual-review-queue"' in template
+    assert 'data-testid="manual-review-history"' in template
+    assert "review.review_history" in template
+    assert "grid-template-columns: minmax(0, 7fr) minmax(280px, 3fr)" in stylesheet
+    assert "data-review-history-list" in script
+    assert "prependReviewHistoryItem(odbCase, payload)" in script
+
+
 def test_shared_navigation_is_compact_and_message_is_not_duplicated(
     workflow,
     monkeypatch,
@@ -460,6 +479,7 @@ def test_created_response_card_reveals_all_saved_taxpayers(workflow, monkeypatch
     from starlette.testclient import TestClient
 
     from test_daily_batch import _insert_ready_case
+    from test_daily_batch import _png_scan as make_png_scan
 
     stylesheet = (Path(main.__file__).parent / "static" / "styles.css").read_text(
         encoding="utf-8"
@@ -475,6 +495,8 @@ def test_created_response_card_reveals_all_saved_taxpayers(workflow, monkeypatch
     assert 'class="response-list"' in template
     assert 'data-testid="created-response-taxpayer-disclosure"' in template
     assert 'class="action-menu"' in template
+    assert "overview.pending_generated_groups" not in template
+    assert "overview.sent_generated_groups" not in template
     assert "Подробнее" not in template
     assert "data-page-size" not in template
 
@@ -500,17 +522,150 @@ def test_created_response_card_reveals_all_saved_taxpayers(workflow, monkeypatch
     ) == 1
     rendered = unescape(response.text)
     assert all(name in rendered for name in taxpayer_names)
+    assert 'data-testid="created-pending-section"' in response.text
+    assert 'data-testid="created-sent-section"' in response.text
+    assert "Ждут отправки" in response.text
+    assert "Отправленные" in response.text
+
+    now = utc_now()
+    for index, letter in enumerate(generated_group["letters"], start=1):
+        scan = workflow.register_signed_response_scan(
+            letter["id"], f"sent-{index}.png", make_png_scan()
+        )
+        workflow.db.execute(
+            """
+            INSERT INTO outlook_outgoing_messages(
+                id, response_letter_id, signed_scan_id, status,
+                recipient_email, subject, attachment_name,
+                attachment_sha256, draft_key, outlook_entry_id,
+                sent_at, created_at, updated_at
+            ) VALUES (?, ?, ?, 'sent', 'office@example.test',
+                      'Ответ', 'Ответ.pdf', ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"sent-message-{index}",
+                letter["id"],
+                scan["id"],
+                f"hash-{index}",
+                f"draft-{index}",
+                f"outlook-{index}",
+                now,
+                now,
+                now,
+            ),
+        )
+
+    sent_overview = workflow.today_overview(view="created")
+    assert not sent_overview["pending_generated_groups"]
+    assert len(sent_overview["sent_generated_groups"]) == 1
+    assert sent_overview["sent_generated_groups"][0]["is_fully_sent"]
+
+    sent_response = TestClient(main.app).get(
+        "/?tab=responses&response_view=created"
+    )
+    assert sent_response.status_code == 200
+    assert "created-response-sent" in sent_response.text
+    assert "Все созданные письма отправлены" in sent_response.text
 
 
-def test_response_menu_opens_one_combined_letter_page():
+def test_response_menu_opens_the_whole_combined_letter_group():
     template = (
         Path(main.__file__).parent / "templates" / "_work_responses.html"
     ).read_text(encoding="utf-8")
 
-    assert template.count('data-testid="open-case-with-document"') == 1
-    assert "Открыть письмо и данные" in template
+    assert template.count('data-testid="open-response-group"') == 1
+    assert (
+        'href="/cases/{{ group.case_ids[0] }}?return_to=responses&amp;group_key={{ group.group_key }}"'
+        in template
+    )
+    assert "Открыть все письма и данные" in template
+    assert "Остальные" not in template
     assert "Открыть исходное письмо" not in template
     assert 'target="_blank"' not in template
+
+
+def test_prepare_response_reveals_all_taxpayers_and_all_cases(
+    workflow, monkeypatch
+):
+    from html import unescape
+
+    from starlette.testclient import TestClient
+
+    from test_daily_batch import _insert_ready_case
+
+    first_name = 'ОсОО "Первое обращение группы"'
+    second_name = 'ОсОО "Второе обращение группы"'
+    first_case = _insert_ready_case(
+        workflow, "12345678901234", first_name
+    )
+    second_case = _insert_ready_case(
+        workflow, "23456789012345", second_name
+    )
+    now = utc_now()
+    page_id_by_case = {}
+    for index, case_id in enumerate((first_case, second_case), start=1):
+        case = workflow.get_case(case_id)
+        page_id = f"group-letter-{index}"
+        page_id_by_case[case_id] = page_id
+        workflow.db.execute(
+            """
+            INSERT INTO pages(
+                id, upload_id, case_id, page_number, page_type,
+                status, created_at, updated_at
+            ) VALUES (?, ?, ?, 1, 'letter', 'completed', ?, ?)
+            """,
+            (page_id, case["upload_id"], case_id, now, now),
+        )
+
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    group = workflow.today_overview(view="prepare")["not_found_groups"][0]
+    monkeypatch.setattr(main, "workflow", workflow)
+    client = TestClient(main.app)
+
+    prepare = client.get("/?tab=responses&response_view=prepare")
+    rendered_prepare = unescape(prepare.text)
+
+    assert prepare.status_code == 200
+    assert prepare.text.count(
+        'data-testid="prepare-response-taxpayer-disclosure"'
+    ) == 1
+    assert first_name in rendered_prepare
+    assert second_name in rendered_prepare
+    first_group_case = group["case_ids"][0]
+    second_group_case = group["case_ids"][1]
+    assert (
+        f"/cases/{first_group_case}?return_to=responses&amp;"
+        f'group_key={group["group_key"]}'
+    ) in prepare.text
+
+    first_detail = client.get(
+        f"/cases/{first_group_case}",
+        params={"return_to": "responses", "group_key": group["group_key"]},
+    )
+    rendered_first_detail = unescape(first_detail.text)
+
+    assert first_detail.status_code == 200
+    assert first_detail.text.count(
+        'data-testid="response-group-navigation"'
+    ) == 1
+    assert "1 из 2" in rendered_first_detail
+    assert f'/pages/{page_id_by_case[first_group_case]}/pdf' in first_detail.text
+    assert f'/pages/{page_id_by_case[second_group_case]}/pdf' not in first_detail.text
+    assert (
+        f"/cases/{second_group_case}?return_to=responses&amp;"
+        f'group_key={group["group_key"]}'
+    ) in first_detail.text
+
+    second_detail = client.get(
+        f"/cases/{second_group_case}",
+        params={"return_to": "responses", "group_key": group["group_key"]},
+    )
+    rendered_second_detail = unescape(second_detail.text)
+
+    assert second_detail.status_code == 200
+    assert "2 из 2" in rendered_second_detail
+    assert f'/pages/{page_id_by_case[second_group_case]}/pdf' in second_detail.text
+    assert f'/pages/{page_id_by_case[first_group_case]}/pdf' not in second_detail.text
 
 
 def test_case_page_embeds_the_linked_letter_pdf(workflow, monkeypatch):
@@ -550,6 +705,9 @@ def test_case_page_embeds_the_linked_letter_pdf(workflow, monkeypatch):
     response = TestClient(main.app).get(
         f"/cases/{case_id}?return_to=responses"
     )
+    case_template = (
+        Path(main.__file__).parent / "templates" / "case_detail.html"
+    ).read_text(encoding="utf-8")
 
     assert response.status_code == 200
     assert 'data-testid="case-workspace"' in response.text
@@ -563,6 +721,11 @@ def test_case_page_embeds_the_linked_letter_pdf(workflow, monkeypatch):
     assert "← Ответы" in response.text
     assert "← Проверка" not in response.text
     assert '/?tab=responses&amp;response_view=prepare' in response.text
+    assert "Проверить заново вручную" in response.text
+    assert 'class="action-menu"' not in case_template
+    assert case_template.index('class="case-document-toolbar"') < (
+        case_template.index('data-testid="response-group-navigation"')
+    )
 
 
 def test_case_page_without_source_keeps_data_on_the_same_page(
@@ -593,22 +756,41 @@ def test_created_response_actions_are_reachable_without_card_expansion():
     template = (package_dir / "templates" / "_work_responses.html").read_text(encoding="utf-8")
     drawer = (package_dir / "templates" / "_response_letter_drawer.html").read_text(encoding="utf-8")
     script = (package_dir / "static" / "app.js").read_text(encoding="utf-8")
+    stylesheet = (package_dir / "static" / "styles.css").read_text(
+        encoding="utf-8"
+    )
 
     assert 'class="created-letter-line"' in template
     assert "Исх. №" in template
     assert "Открыть письмо" in template
     assert "Сканировать" in template
     assert "Подготовить письмо в Outlook" in template
+    assert "Отправить все готовые" in template
+    assert 'action="/today/outlook-test-send-all"' in template
+    assert 'action="/response-letters/{{ letter.id }}/outlook-test-send"' in template
+    assert "Подготовить черновик Outlook" in template
     assert "Открыть письмо повторно" in template
     assert "Скачать копию Word" in template
     assert "Подробнее" not in template
     assert "/scan-session/start" in template
-    assert 'class="number-sequence-bar"' not in template
+    sequence_start = template.index('class="outgoing-sequence-form"')
+    sequence_end = template.index("</form>", sequence_start)
+    sequence_form = template[sequence_start:sequence_end]
+    assert 'action="/today/outgoing-numbers/assign"' in sequence_form
+    assert 'name="letter_ids"' in sequence_form
+    assert 'name="first_number"' in sequence_form
+    assert "<button" not in sequence_form
+    assert 'type="submit"' not in sequence_form
     assert "data-number-sequence-start" not in script
     assert "data-inline-number-form" in template
     assert "data-inline-number-input" in template
+    assert "data-inline-number-submit" not in template
+    assert "data-inline-number-state" in template
+    assert 'class="letter-recipient-email"' in template
     assert "data-inline-number-form" in script
-    assert "letter_ids" in script
+    assert "input.addEventListener(\"change\", save)" in script
+    assert "Сохранение…" in script
+    assert ".created-pending-section { overflow: visible; }" in stylesheet
     assert "Сохранить скан" in drawer
     assert "Добавить лист" in drawer
     assert "Открыть PDF" not in drawer

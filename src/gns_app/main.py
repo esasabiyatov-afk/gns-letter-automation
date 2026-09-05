@@ -433,11 +433,15 @@ EVENT_LABELS = {
     "outlook_draft_failed": "Ошибка создания черновика Outlook",
     "outlook_test_message_sent": "Отправлено тестовое письмо Outlook",
     "outlook_test_send_failed": "Ошибка тестовой отправки Outlook",
+    "outlook_test_batch_send_completed": "Завершена пакетная тестовая отправка Outlook",
     "outlook_sent_confirmed": "Отправка подтверждена папкой Outlook",
     "outlook_resend_draft_created": "Создан повторный черновик Outlook",
     "outlook_resend_confirmed": "Повторная отправка подтверждена Outlook",
     "gns_offices_replaced": "Обновлён справочник налоговых органов",
     "gns_office_emails_updated": "Обновлены официальные email подразделений",
+    "gns_office_added": "Добавлен район и почта",
+    "gns_office_updated": "Изменены район и почта",
+    "gns_office_deleted": "Удалён район из справочника",
     "gns_office_location_expanded": "Район дополнен областью или городом",
     "gns_office_suggested": "Предложен налоговый орган по OCR",
     "ocr_recipient_suggested": "Предложены должность и ФИО по OCR",
@@ -460,6 +464,9 @@ EVENT_LABELS = {
     "grouped_response_created": "Создан общий ответ Word",
     "outgoing_number_assigned": "Назначен исходящий номер",
     "outgoing_number_changed": "Изменён исходящий номер",
+    "signed_scan_superseded_by_outgoing_number": (
+        "Подписанный скан устарел после изменения исходящего номера"
+    ),
     "abs_account_manually_checked": "Вручную проверено наличие счёта в АБС",
     "signed_response_scan_registered": "Зарегистрирован подписанный скан",
     "signed_response_scan_confirmed": "Подписанный скан проверен",
@@ -545,6 +552,7 @@ def context(request: Request, **values):
             settings.outlook_allow_insecure_certificate
         ),
         "outlook_test_mode": outlook_outgoing.test_mode_enabled(),
+        "outlook_inbox_test_mode": bool(settings.outlook_test_email.strip()),
         "outlook_test_email": outlook_outgoing.get_test_recipient(),
         "outlook_test_send_enabled": outlook_outgoing.test_send_enabled(),
         **values,
@@ -687,6 +695,11 @@ def index(
             overview=overview,
             outgoing_preview=outgoing_preview,
             outgoing_start=outgoing_start,
+            outlook_ready_test_send_count=(
+                outlook_outgoing.ready_test_send_count()
+                if response_view == "created"
+                else 0
+            ),
             active_letter=active_letter,
             active_group=active_group,
             abs_login_required=(
@@ -912,6 +925,9 @@ def settings_page(request: Request, message: str = "", error: str = ""):
             outlook_allowed_senders=", ".join(
                 sorted(outlook_importer.get_forwarding_senders())
             ),
+            outlook_direct_sender_rules=", ".join(
+                outlook_importer.get_sender_exception_rules()
+            ),
             outlook_import_since=outlook_importer.get_import_since().isoformat(),
             outlook_mailbox=outlook_importer.get_mailbox(),
             outlook_auto_enabled=outlook_importer.get_auto_enabled(),
@@ -919,6 +935,7 @@ def settings_page(request: Request, message: str = "", error: str = ""):
             outlook_auto_status=outlook_importer.get_automation_status(),
             outlook_import_stats=outlook_importer.stats(),
             outlook_subject_template=outlook_outgoing.get_subject_template(),
+            gns_offices=workflow.list_gns_offices(),
             message=message,
             error=error,
         ),
@@ -992,6 +1009,7 @@ def request_outlook_send_receive():
 def update_outlook_import_settings(
     background_tasks: BackgroundTasks,
     outlook_allowed_senders: str = Form(""),
+    outlook_direct_sender_rules: str = Form(""),
     outlook_import_since: str = Form(...),
     outlook_mailbox: str = Form(""),
     outlook_auto_enabled: bool = Form(False),
@@ -1004,6 +1022,7 @@ def update_outlook_import_settings(
         outlook_outgoing.validate_subject_template(outlook_subject_template)
         outlook_importer.update_settings(
             allowed_senders=outlook_allowed_senders,
+            direct_sender_rules=outlook_direct_sender_rules,
             import_since=outlook_import_since,
             mailbox=outlook_mailbox,
             auto_enabled=outlook_auto_enabled,
@@ -1069,6 +1088,35 @@ def send_response_letter_outlook_test_message(
     )
     return RedirectResponse(
         f"/today?message={quote(message)}#group-{quote(group_id)}",
+        status_code=303,
+    )
+
+
+@app.post("/today/outlook-test-send-all")
+def send_all_ready_outlook_test_messages():
+    try:
+        result = outlook_outgoing.send_all_ready_test_messages(workflow)
+    except OutlookIntegrationError as exc:
+        return RedirectResponse(
+            f"/today?error={quote(str(exc))}",
+            status_code=303,
+        )
+    sent_count = len(result["sent"])
+    error_count = len(result["errors"])
+    if result["ready"] == 0:
+        message = "Готовых писем для отправки пока нет."
+    elif error_count:
+        first_error = result["errors"][0]["message"]
+        message = (
+            f"Отправлено: {sent_count}. С ошибкой: {error_count}. "
+            f"Первая ошибка: {first_error}"
+        )
+    else:
+        message = (
+            f"Все готовые тестовые письма отправлены: {sent_count}."
+        )
+    return RedirectResponse(
+        f"/today?message={quote(message)}",
         status_code=303,
     )
 
@@ -1154,6 +1202,53 @@ def update_settings(
         )
     return RedirectResponse(
         "/settings?message=" + quote("Настройки сохранены.") + "#processing",
+        status_code=303,
+    )
+
+
+@app.post("/settings/offices/save")
+def save_gns_office_settings(
+    office_id: int = Form(0),
+    district_place: str = Form(...),
+    email_address: str = Form(""),
+    backup_emails: str = Form(""),
+    aliases: str = Form(""),
+):
+    try:
+        workflow.save_gns_office(
+            district_place,
+            email_address,
+            backup_emails,
+            aliases,
+            office_id=office_id or None,
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            f"/settings?error={quote(str(exc))}#offices",
+            status_code=303,
+        )
+    message = "Район добавлен." if not office_id else "Изменения сохранены."
+    return RedirectResponse(
+        f"/settings?message={quote(message)}#offices",
+        status_code=303,
+    )
+
+
+@app.post("/settings/offices/{office_id}/delete")
+def delete_gns_office_settings(office_id: int):
+    try:
+        workflow.delete_gns_office(
+            office_id,
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            f"/settings?error={quote(str(exc))}#offices",
+            status_code=303,
+        )
+    return RedirectResponse(
+        f"/settings?message={quote('Район удалён.')}#offices",
         status_code=303,
     )
 
@@ -1348,10 +1443,16 @@ def assign_outgoing_numbers(
             + quote(str(exc)),
             status_code=303,
         )
+    skipped_note = (
+        " Занятые номера пропущены."
+        if summary["skipped_occupied_count"]
+        else ""
+    )
     message = quote(
-        "Назначено исходящих номеров: "
-        f"{summary['letter_count']} — с {summary['first_number']} "
+        "Пустым письмам назначено исходящих номеров: "
+        f"{summary['letter_count']} — с {summary['first_assigned_number']} "
         f"по {summary['last_number']}."
+        + skipped_note
     )
     return RedirectResponse(
         "/?tab=responses&response_view=created&message=" + message,
@@ -1364,21 +1465,59 @@ def update_outgoing_number(
     letter_id: str,
     outgoing_number: str = Form(""),
     group_id: str = Form(""),
+    autosave: bool = Form(False),
 ):
     try:
-        workflow.set_outgoing_number(
+        summary = workflow.set_outgoing_number(
             letter_id,
             outgoing_number,
             actor=workflow.get_active_employee() or "Сотрудник",
         )
     except WorkflowValidationError as exc:
+        if autosave:
+            return JSONResponse(
+                {"ok": False, "error": str(exc)},
+                status_code=400,
+            )
         return RedirectResponse(
-            f"/today?error={quote(str(exc))}#group-{quote(group_id)}",
+            "/?tab=responses&response_view=created&error="
+            + quote(str(exc))
+            + f"#group-{quote(group_id)}",
             status_code=303,
         )
+    if autosave:
+        letter = workflow.get_response_letter(letter_id) or {}
+        scan_invalidated = bool(summary.get("superseded_scan_count"))
+        word_reopen_required = bool(summary.get("word_reopen_required"))
+        if scan_invalidated:
+            message = (
+                "Номер сохранён. Подписанный скан устарел: откройте Word "
+                "и отсканируйте ответ заново."
+            )
+        elif word_reopen_required:
+            message = "Номер сохранён. Word обновлён: откройте его заново."
+        else:
+            message = "Номер сохранён"
+        return JSONResponse(
+            {
+                "ok": True,
+                "outgoing_number": letter.get("outgoing_number") or "",
+                "scan_invalidated": scan_invalidated,
+                "word_reopen_required": word_reopen_required,
+                "message": message,
+            }
+        )
+    message = "Исходящий номер обновлён."
+    if summary.get("superseded_scan_count"):
+        message += (
+            " Подписанный скан устарел: откройте Word и отсканируйте "
+            "ответ заново."
+        )
+    elif summary.get("word_reopen_required"):
+        message += " Word обновлён: откройте его заново."
     return RedirectResponse(
-        "/today?message="
-        + quote("Исходящий номер обновлён.")
+        "/?tab=responses&response_view=created&message="
+        + quote(message)
         + f"#group-{quote(group_id)}",
         status_code=303,
     )
@@ -2379,6 +2518,7 @@ def case_detail(
     message: str = "",
     error: str = "",
     abs_login: bool = False,
+    group_key: str = "",
 ):
     case = workflow.get_case(case_id)
     if not case:
@@ -2386,6 +2526,26 @@ def case_detail(
     taxpayers = workflow.get_taxpayers(case_id)
     source_page = workflow.get_case_source_page(case_id)
     source_upload = workflow.get_upload(case["upload_id"])
+    response_group = None
+    response_group_position = 0
+    previous_group_case_id = None
+    next_group_case_id = None
+    if group_key:
+        response_group = workflow.get_daily_response_group(group_key)
+        if not response_group or case_id not in response_group["case_ids"]:
+            raise HTTPException(
+                404,
+                "Обращение уже не входит в эту группу ответа",
+            )
+        response_group_position = response_group["case_ids"].index(case_id) + 1
+        if response_group_position > 1:
+            previous_group_case_id = response_group["case_ids"][
+                response_group_position - 2
+            ]
+        if response_group_position < len(response_group["case_ids"]):
+            next_group_case_id = response_group["case_ids"][
+                response_group_position
+            ]
     return templates.TemplateResponse(
         request,
         "case_detail.html",
@@ -2419,6 +2579,10 @@ def case_detail(
             recipient_position_display=workflow.names.position_display(
                 case.get("recipient_position") or ""
             ),
+            response_group=response_group,
+            response_group_position=response_group_position,
+            previous_group_case_id=previous_group_case_id,
+            next_group_case_id=next_group_case_id,
             abs_login_required=(
                 abs_login
                 or (

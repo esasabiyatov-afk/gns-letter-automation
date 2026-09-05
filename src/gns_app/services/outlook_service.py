@@ -55,6 +55,11 @@ ACCOUNT_TYPE_LABELS = {
     5: "Другой",
 }
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+DOMAIN_RE = re.compile(
+    r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z]{2,63}$",
+    re.IGNORECASE,
+)
 EMAIL_IN_TEXT_RE = re.compile(
     r"(?i)(?<![a-z0-9._%+-])"
     r"([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})"
@@ -65,7 +70,7 @@ FORWARDED_HEADER_LINE_RE = re.compile(
     r"subject|тема)\s*:"
 )
 FORWARDED_FROM_LABELS = frozenset({"from", "от"})
-OUTLOOK_TEST_SEND_RECIPIENT = "esasabiyatov@gmail.com"
+OUTLOOK_TEST_SEND_RECIPIENT = "esensabiyatov@gmail.com"
 PR_INTERNET_MESSAGE_ID = (
     "http://schemas.microsoft.com/mapi/proptag/0x1035001E"
 )
@@ -554,6 +559,7 @@ class OutlookGateway(Protocol):
         attachment_name: str,
         sending_account: str = "",
         create_if_missing: bool = True,
+        display: bool = True,
     ) -> OutlookDraftResult: ...
 
     def send_draft(
@@ -593,6 +599,8 @@ class OutlookWorkflow(Protocol):
     ) -> dict[str, Any] | None: ...
 
     def match_gns_office(self, text: str) -> dict[str, Any] | None: ...
+
+    def office_delivery_email(self, office: dict[str, Any] | None) -> str: ...
 
 
 def _safe_text(value: Any) -> str:
@@ -882,6 +890,7 @@ class PyWin32OutlookGateway:
         attachment_name: str,
         sending_account: str = "",
         create_if_missing: bool = True,
+        display: bool = True,
     ) -> OutlookDraftResult:
         if sys.platform != "win32":
             raise OutlookUnsupportedPlatformError(
@@ -978,19 +987,36 @@ class PyWin32OutlookGateway:
                 )
                 stage = "save_draft"
                 mail.Save()
-            stage = "display_draft"
-            mail.Display()
-            inspector = _safe_attribute(mail, "GetInspector", None)
-            if inspector is not None:
-                try:
-                    if (
-                        int(_safe_attribute(inspector, "WindowState", -1))
-                        == OL_WINDOW_STATE_MINIMIZED
-                    ):
-                        inspector.WindowState = OL_WINDOW_STATE_NORMAL
-                    inspector.Activate()
-                except Exception:
-                    pass
+            else:
+                # Drafts created by an older app version had an empty body.
+                # Fill only missing required fields and preserve user edits.
+                stage = "complete_existing_draft"
+                changed = False
+                if not _safe_text(_safe_attribute(mail, "To")).strip():
+                    mail.To = recipient_email.strip().casefold()
+                    changed = True
+                if not _safe_text(_safe_attribute(mail, "Subject")).strip():
+                    mail.Subject = subject.strip()
+                    changed = True
+                if not _safe_text(_safe_attribute(mail, "Body")).strip():
+                    mail.Body = body
+                    changed = True
+                if changed:
+                    mail.Save()
+            if display:
+                stage = "display_draft"
+                mail.Display()
+                inspector = _safe_attribute(mail, "GetInspector", None)
+                if inspector is not None:
+                    try:
+                        if (
+                            int(_safe_attribute(inspector, "WindowState", -1))
+                            == OL_WINDOW_STATE_MINIMIZED
+                        ):
+                            inspector.WindowState = OL_WINDOW_STATE_NORMAL
+                        inspector.Activate()
+                    except Exception:
+                        pass
             return OutlookDraftResult(
                 entry_id=_safe_text(_safe_attribute(mail, "EntryID")),
                 recipient_email=_safe_text(_safe_attribute(mail, "To")),
@@ -1077,6 +1103,18 @@ class PyWin32OutlookGateway:
             if not attachment_name.casefold().endswith(".pdf"):
                 raise OutlookConnectionError(
                     "Вложение тестового черновика должно быть PDF."
+                )
+            if int(_safe_attribute(attachment, "Size", 0) or 0) <= 0:
+                raise OutlookConnectionError(
+                    "PDF-вложение тестового черновика пустое."
+                )
+            if not _safe_text(_safe_attribute(mail, "Subject")).strip():
+                raise OutlookConnectionError(
+                    "Тема тестового черновика не заполнена."
+                )
+            if not _safe_text(_safe_attribute(mail, "Body")).strip():
+                raise OutlookConnectionError(
+                    "Текст тестового черновика не заполнен."
                 )
 
             stage = "select_account"
@@ -1428,14 +1466,15 @@ class PyWin32OutlookGateway:
         cls,
         mail: Any,
         allowed_domains: frozenset[str],
+        allowed_senders: frozenset[str] = frozenset(),
     ) -> str:
         """Return a GNS sender named in a relay message's From/От field.
 
         A direct sender is available through Outlook's MAPI fields.  A normal
         Outlook forward has no separate original-sender field.  For a trusted
         reception mailbox, the sender line in the forwarded text is therefore
-        treated like the direct sender: any `sti.gov.kg` or `salyk.kg` address
-        there is accepted.  A bare address elsewhere in the text is ignored.
+        treated like the direct sender: a system domain or configured sender
+        exception there is accepted. A bare address elsewhere is ignored.
         """
 
         candidates: list[str] = []
@@ -1450,7 +1489,10 @@ class PyWin32OutlookGateway:
                     continue
                 original_mail = attachment.GetEmbeddedItem()
                 sender_smtp = cls._sender_smtp(original_mail)
-                if cls._has_allowed_domain(sender_smtp, allowed_domains):
+                if (
+                    sender_smtp in allowed_senders
+                    or cls._has_allowed_domain(sender_smtp, allowed_domains)
+                ):
                     candidates.append(sender_smtp)
             except Exception:
                 continue
@@ -1472,7 +1514,10 @@ class PyWin32OutlookGateway:
             from_value = body[from_header.end() : value_end]
             for value in EMAIL_IN_TEXT_RE.findall(from_value):
                 sender_smtp = value.casefold()
-                if cls._has_allowed_domain(sender_smtp, allowed_domains):
+                if (
+                    sender_smtp in allowed_senders
+                    or cls._has_allowed_domain(sender_smtp, allowed_domains)
+                ):
                     candidates.append(sender_smtp)
 
         return candidates[0] if candidates else ""
@@ -1502,7 +1547,11 @@ class PyWin32OutlookGateway:
             return True, ""
         if transport_sender not in forwarding_senders:
             return False, ""
-        original_sender = cls._forwarded_gns_sender(mail, allowed_domains)
+        original_sender = cls._forwarded_gns_sender(
+            mail,
+            allowed_domains,
+            direct_senders,
+        )
         return bool(original_sender), original_sender
 
     @classmethod
@@ -1835,6 +1884,7 @@ class SubprocessOutlookGateway:
         attachment_name: str,
         sending_account: str = "",
         create_if_missing: bool = True,
+        display: bool = True,
     ) -> OutlookDraftResult:
         payload = self._call_bridge(
             "draft",
@@ -1848,6 +1898,7 @@ class SubprocessOutlookGateway:
                 "attachment_name": attachment_name,
                 "sending_account": sending_account,
                 "create_if_missing": create_if_missing,
+                "display": display,
             },
             timeout_seconds=max(120, self.timeout_seconds),
         )
@@ -2085,6 +2136,7 @@ class OutlookService:
         attachment_name: str,
         sending_account: str = "",
         create_if_missing: bool = True,
+        display: bool = True,
     ) -> OutlookDraftResult:
         creator = getattr(self.gateway, "create_draft", None)
         if creator is None:
@@ -2101,6 +2153,7 @@ class OutlookService:
                 attachment_name=attachment_name,
                 sending_account=sending_account,
                 create_if_missing=create_if_missing,
+                display=display,
             )
 
     def send_draft(
@@ -2223,12 +2276,14 @@ class OutlookService:
 
 class OutlookOutgoingService:
     SUBJECT_TEMPLATE_SETTING = "outlook_outgoing_subject_template"
-    DEFAULT_SUBJECT_TEMPLATE = (
-        "Ответ на запрос ГНС, исх. № {outgoing_number}"
+    DEFAULT_SUBJECT_TEMPLATE = "Ответ на запрос ГНС"
+    DEFAULT_BODY = (
+        "Здравствуйте!\r\n\r\n"
+        "Направляем ответ ГНС. Документ приложен к письму."
     )
-    SUBJECT_FIELDS = frozenset(
-        {"outgoing_number", "office_name", "recipient_name", "date"}
-    )
+    # Исходящий номер принадлежит самому Word/PDF. Его нельзя передавать в
+    # Outlook: ни в тему, ни в текст, ни в имя вложения.
+    SUBJECT_FIELDS = frozenset({"office_name", "recipient_name", "date"})
     TEST_RECIPIENT_ALLOWLIST = frozenset({OUTLOOK_TEST_SEND_RECIPIENT})
 
     def __init__(
@@ -2244,7 +2299,11 @@ class OutlookOutgoingService:
 
     def get_test_recipient(self) -> str:
         recipient = self.settings.outlook_test_email.strip().casefold()
-        return recipient if recipient in self.TEST_RECIPIENT_ALLOWLIST else ""
+        if recipient in self.TEST_RECIPIENT_ALLOWLIST:
+            return recipient
+        if self.settings.outlook_allow_test_send:
+            return OUTLOOK_TEST_SEND_RECIPIENT
+        return ""
 
     def test_mode_enabled(self) -> bool:
         return bool(self.get_test_recipient())
@@ -2281,6 +2340,11 @@ class OutlookOutgoingService:
         for _, field_name, format_spec, conversion in parsed:
             if field_name is None:
                 continue
+            if field_name == "outgoing_number":
+                raise OutlookIntegrationError(
+                    "Исходящий номер используется только внутри Word/PDF и "
+                    "не добавляется в тему Outlook."
+                )
             if (
                 field_name not in cls.SUBJECT_FIELDS
                 or format_spec
@@ -2288,8 +2352,7 @@ class OutlookOutgoingService:
             ):
                 raise OutlookIntegrationError(
                     "В теме разрешены только подстановки: "
-                    "{outgoing_number}, {office_name}, "
-                    "{recipient_name}, {date}."
+                    "{office_name}, {recipient_name}, {date}."
                 )
         return template
 
@@ -2343,7 +2406,6 @@ class OutlookOutgoingService:
             formatted_date = date.today().strftime("%d.%m.%Y")
         subject = self.get_subject_template().format_map(
             {
-                "outgoing_number": str(letter.get("outgoing_number") or ""),
                 "office_name": str(office.get("office_name") or ""),
                 "recipient_name": str(
                     letter.get("recipient_display_name") or ""
@@ -2374,7 +2436,11 @@ class OutlookOutgoingService:
         started = time.monotonic()
         try:
             with self._draft_lock:
-                result = self._create_draft_locked(workflow, letter_id)
+                result = self._create_draft_locked(
+                    workflow,
+                    letter_id,
+                    display=True,
+                )
         except OutlookIntegrationError as exc:
             record_exception(
                 "outlook",
@@ -2398,27 +2464,28 @@ class OutlookOutgoingService:
         self,
         workflow: OutlookWorkflow,
         letter_id: str,
+        *,
+        display: bool,
     ) -> dict[str, Any]:
         letter = workflow.get_response_letter(letter_id)
         if not letter:
             raise OutlookIntegrationError("Готовое письмо не найдено.")
-        outgoing_number = str(letter.get("outgoing_number") or "").strip()
-        if not outgoing_number:
+        if not str(letter.get("outgoing_number") or "").strip():
             raise OutlookIntegrationError(
-                "Сначала назначьте письму исходящий номер."
+                "Сначала назначьте исходящий номер внутри Word."
             )
         scan = workflow.get_confirmed_signed_response_scan(letter_id)
         if not scan:
             raise OutlookIntegrationError(
-                "Сначала загрузите и подтвердите подписанный ответ."
+                "Сначала загрузите подписанный ответ."
             )
         office = workflow.match_gns_office(
             str(letter.get("district_place") or "")
         )
         test_recipient = self.get_test_recipient()
-        recipient_email = test_recipient or str(
-            office.get("email_address") if office else ""
-        ).strip().casefold()
+        recipient_email = test_recipient or workflow.office_delivery_email(
+            office
+        )
         if not EMAIL_RE.fullmatch(recipient_email):
             raise OutlookIntegrationError(
                 "Для подразделения ГНС не настроен однозначный email."
@@ -2437,10 +2504,12 @@ class OutlookOutgoingService:
             raise OutlookIntegrationError(
                 "PDF подписанного ответа отсутствует."
             )
+        if pdf_path.stat().st_size <= 0:
+            raise OutlookIntegrationError(
+                "PDF подписанного ответа пустой."
+            )
         subject = self.render_subject(letter, office or {})
-        attachment_name = sanitize_filename(
-            f"Ответ_исх_{outgoing_number}.pdf"
-        )
+        attachment_name = "Ответ_ГНС.pdf"
         attachment_sha256 = self._sha256_file(pdf_path)
         draft_key = (
             f"gns-test-scan-{scan['id']}"
@@ -2453,7 +2522,10 @@ class OutlookOutgoingService:
             (scan["id"],),
         )
         reopening_existing = bool(
-            existing and existing.get("status") == "draft_created"
+            existing
+            and existing.get("status") == "draft_created"
+            and str(existing.get("recipient_email") or "").casefold()
+            == recipient_email
         )
         if existing:
             if existing.get("status") == "sent":
@@ -2507,11 +2579,12 @@ class OutlookOutgoingService:
                 draft_key=draft_key,
                 recipient_email=recipient_email,
                 subject=subject,
-                body="",
+                body=self.DEFAULT_BODY,
                 attachment_path=attachment_path,
                 attachment_name=attachment_name,
                 sending_account=self.get_mailbox(),
                 create_if_missing=not reopening_existing,
+                display=display,
             )
         except OutlookIntegrationError as exc:
             if not reopening_existing:
@@ -2580,6 +2653,25 @@ class OutlookOutgoingService:
         letter_id: str,
     ) -> dict[str, Any]:
         with self._draft_lock:
+            if not self.test_send_enabled():
+                raise OutlookIntegrationError(
+                    "Тестовая отправка Outlook не включена при запуске приложения."
+                )
+            scan = workflow.get_confirmed_signed_response_scan(letter_id)
+            if scan:
+                existing = self.db.fetch_one(
+                    "SELECT * FROM outlook_outgoing_messages "
+                    "WHERE signed_scan_id = ?",
+                    (scan["id"],),
+                )
+                if existing and existing.get("status") == "sent":
+                    existing["already_sent"] = True
+                    return existing
+            self._create_draft_locked(
+                workflow,
+                letter_id,
+                display=False,
+            )
             return self._send_test_message_locked(workflow, letter_id)
 
     def _send_test_message_locked(
@@ -2598,7 +2690,7 @@ class OutlookOutgoingService:
         scan = workflow.get_confirmed_signed_response_scan(letter_id)
         if not scan:
             raise OutlookIntegrationError(
-                "Сначала загрузите и подтвердите подписанный ответ."
+                "Сначала загрузите подписанный ответ."
             )
         row = self.db.fetch_one(
             "SELECT * FROM outlook_outgoing_messages WHERE signed_scan_id = ?",
@@ -2689,6 +2781,121 @@ class OutlookOutgoingService:
         updated["already_sent"] = False
         return updated
 
+    def ready_test_send_count(self) -> int:
+        if not self.test_send_enabled():
+            return 0
+        row = self.db.fetch_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM response_letters
+            JOIN response_groups
+              ON response_groups.id = response_letters.response_group_id
+            WHERE response_groups.status = 'created'
+              AND TRIM(COALESCE(response_letters.outgoing_number, '')) != ''
+              AND EXISTS (
+                  SELECT 1
+                  FROM signed_response_scans
+                  WHERE signed_response_scans.response_letter_id =
+                        response_letters.id
+                    AND signed_response_scans.status = 'confirmed'
+                    AND signed_response_scans.size_bytes > 0
+                    AND signed_response_scans.page_count > 0
+              )
+              AND response_letters.taxpayer_count > 0
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM outlook_outgoing_messages
+                  WHERE outlook_outgoing_messages.response_letter_id =
+                        response_letters.id
+                    AND outlook_outgoing_messages.status = 'sent'
+              )
+            """
+        ) or {"count": 0}
+        return int(row.get("count") or 0)
+
+    def send_all_ready_test_messages(
+        self,
+        workflow: OutlookWorkflow,
+    ) -> dict[str, Any]:
+        """Create hidden drafts and send every complete test response once."""
+
+        if not self.test_send_enabled():
+            raise OutlookIntegrationError(
+                "Тестовая отправка Outlook не включена при запуске приложения."
+            )
+        with self._draft_lock:
+            letters = self.db.fetch_all(
+                """
+                SELECT response_letters.id
+                FROM response_letters
+                JOIN response_groups
+                  ON response_groups.id = response_letters.response_group_id
+                WHERE response_groups.status = 'created'
+                  AND TRIM(COALESCE(response_letters.outgoing_number, '')) != ''
+                  AND EXISTS (
+                      SELECT 1
+                      FROM signed_response_scans
+                      WHERE signed_response_scans.response_letter_id =
+                            response_letters.id
+                        AND signed_response_scans.status = 'confirmed'
+                        AND signed_response_scans.size_bytes > 0
+                        AND signed_response_scans.page_count > 0
+                  )
+                  AND response_letters.taxpayer_count > 0
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM outlook_outgoing_messages
+                      WHERE outlook_outgoing_messages.response_letter_id =
+                            response_letters.id
+                        AND outlook_outgoing_messages.status = 'sent'
+                  )
+                ORDER BY response_groups.created_at,
+                         response_groups.rowid,
+                         CAST(response_letters.outgoing_number AS INTEGER),
+                         response_letters.letter_order
+                """
+            )
+            sent: list[str] = []
+            already_sent: list[str] = []
+            errors: list[dict[str, str]] = []
+            for letter in letters:
+                letter_id = str(letter["id"])
+                try:
+                    self._create_draft_locked(
+                        workflow,
+                        letter_id,
+                        display=False,
+                    )
+                    result = self._send_test_message_locked(
+                        workflow,
+                        letter_id,
+                    )
+                    target = already_sent if result.get("already_sent") else sent
+                    target.append(letter_id)
+                except OutlookIntegrationError as exc:
+                    errors.append(
+                        {"letter_id": letter_id, "message": str(exc)}
+                    )
+            summary = {
+                "ready": len(letters),
+                "sent": sent,
+                "already_sent": already_sent,
+                "errors": errors,
+            }
+            self.db.audit(
+                "outlook",
+                "test_batch_send",
+                "outlook_test_batch_send_completed",
+                {
+                    "ready_count": len(letters),
+                    "sent_count": len(sent),
+                    "already_sent_count": len(already_sent),
+                    "error_count": len(errors),
+                },
+                actor=workflow.get_active_employee(),
+            )
+            return summary
+
     def create_resend_draft(
         self,
         workflow: OutlookWorkflow,
@@ -2700,11 +2907,15 @@ class OutlookOutgoingService:
             row = self.db.fetch_one(
                 """
                 SELECT outlook_outgoing_messages.*,
-                       signed_response_scans.pdf_path AS scan_pdf_path
+                       signed_response_scans.pdf_path AS scan_pdf_path,
+                       response_letters.outgoing_number
                 FROM outlook_outgoing_messages
                 JOIN signed_response_scans
                   ON signed_response_scans.id =
                      outlook_outgoing_messages.signed_scan_id
+                JOIN response_letters
+                  ON response_letters.id =
+                     outlook_outgoing_messages.response_letter_id
                 WHERE outlook_outgoing_messages.id = ?
                 """,
                 (message_id,),
@@ -2737,6 +2948,25 @@ class OutlookOutgoingService:
             )
             sequence = int(row.get("resend_sequence") or 0)
             draft_key = str(row.get("resend_draft_key") or "")
+            # Повторный черновик всегда создаётся с нейтральными данными.
+            # Для уже созданного до этой версии черновика сохраняем старые
+            # реквизиты только чтобы корректно завершить его сверку Outlook.
+            resend_subject = str(
+                row.get("resend_subject")
+                or (
+                    row.get("subject")
+                    if reopening and not row.get("resend_subject")
+                    else self.DEFAULT_SUBJECT_TEMPLATE
+                )
+            )
+            resend_attachment_name = str(
+                row.get("resend_attachment_name")
+                or (
+                    row.get("attachment_name")
+                    if reopening and not row.get("resend_attachment_name")
+                    else "Ответ_ГНС.pdf"
+                )
+            )
             if not reopening:
                 sequence += 1
                 draft_key = f"gns-resend-{stored_message_id}-{sequence}"
@@ -2745,11 +2975,19 @@ class OutlookOutgoingService:
                     UPDATE outlook_outgoing_messages
                     SET resend_sequence = ?, resend_status = 'creating',
                         resend_draft_key = ?, resend_outlook_entry_id = NULL,
+                        resend_subject = ?, resend_attachment_name = ?,
                         resent_at = NULL, resend_error_message = NULL,
                         updated_at = ?
                     WHERE id = ? AND status = 'sent'
                     """,
-                    (sequence, draft_key, utc_now(), stored_message_id),
+                    (
+                        sequence,
+                        draft_key,
+                        resend_subject,
+                        resend_attachment_name,
+                        utc_now(),
+                        stored_message_id,
+                    ),
                 )
 
             staging_root = ensure_within(
@@ -2760,17 +2998,17 @@ class OutlookOutgoingService:
                 staging_root / f"{stored_message_id}-resend-{sequence}",
                 staging_root,
             )
-            attachment_path = run_dir / str(row["attachment_name"])
+            attachment_path = run_dir / resend_attachment_name
             try:
                 run_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(pdf_path, attachment_path)
                 result = self.outlook.create_draft(
                     draft_key=draft_key,
                     recipient_email=str(row["recipient_email"]),
-                    subject=str(row["subject"]),
-                    body="",
+                    subject=resend_subject,
+                    body=self.DEFAULT_BODY,
                     attachment_path=attachment_path,
-                    attachment_name=str(row["attachment_name"]),
+                    attachment_name=resend_attachment_name,
                     sending_account=self.get_mailbox(),
                     create_if_missing=not reopening,
                 )
@@ -2835,25 +3073,44 @@ class OutlookOutgoingService:
                     "rejected": 0,
                     "ambiguous": 0,
                 }
-            candidates = tuple(
-                OutlookSentCandidate(
-                    draft_key=str(
-                        (
-                            row.get("resend_draft_key")
-                            if row.get("resend_status") == "draft_created"
-                            else row.get("draft_key")
-                        )
-                        or ""
-                    ),
-                    recipient_email=str(row.get("recipient_email") or ""),
-                    subject=str(row.get("subject") or ""),
-                    attachment_name=str(row.get("attachment_name") or ""),
-                    attachment_sha256=str(
-                        row.get("attachment_sha256") or ""
-                    ),
+            candidates: list[OutlookSentCandidate] = []
+            for row in rows:
+                is_resend = row.get("resend_status") == "draft_created"
+                candidates.append(
+                    OutlookSentCandidate(
+                        draft_key=str(
+                            (
+                                row.get("resend_draft_key")
+                                if is_resend
+                                else row.get("draft_key")
+                            )
+                            or ""
+                        ),
+                        recipient_email=str(
+                            row.get("recipient_email") or ""
+                        ),
+                        subject=str(
+                            (
+                                row.get("resend_subject")
+                                if is_resend and row.get("resend_subject")
+                                else row.get("subject")
+                            )
+                            or ""
+                        ),
+                        attachment_name=str(
+                            (
+                                row.get("resend_attachment_name")
+                                if is_resend
+                                and row.get("resend_attachment_name")
+                                else row.get("attachment_name")
+                            )
+                            or ""
+                        ),
+                        attachment_sha256=str(
+                            row.get("attachment_sha256") or ""
+                        ),
+                    )
                 )
-                for row in rows
-            )
             created_days: list[date] = []
             for row in rows:
                 try:
@@ -2879,7 +3136,7 @@ class OutlookOutgoingService:
             )
             try:
                 scan = self.outlook.scan_sent_items(
-                    candidates=candidates,
+                    candidates=tuple(candidates),
                     sent_since=sent_since,
                     staging_dir=staging.worker_dir,
                     max_attachment_bytes=self.settings.max_upload_bytes,
@@ -3010,6 +3267,8 @@ class OutlookOutgoingService:
 
 class OutlookInboxImporter:
     ALLOWED_SENDERS_SETTING = "outlook_allowed_senders"
+    DIRECT_ALLOWED_SENDERS_SETTING = "outlook_direct_allowed_senders"
+    EXTRA_ALLOWED_DOMAINS_SETTING = "outlook_extra_allowed_domains"
     IMPORT_SINCE_SETTING = "outlook_import_since"
     MAILBOX_SETTING = "outlook_mailbox"
     AUTO_ENABLED_SETTING = "outlook_auto_enabled"
@@ -3018,8 +3277,8 @@ class OutlookInboxImporter:
     DEFAULT_AUTO_INTERVAL_MINUTES = 5
     MIN_AUTO_INTERVAL_MINUTES = 1
     MAX_AUTO_INTERVAL_MINUTES = 1440
-    # В рабочем режиме письма принимаются по доменам ГНС. Точный тестовый
-    # адрес добавляется только явным GNS_OUTLOOK_TEST_EMAIL.
+    # В рабочем режиме домены ГНС разрешены всегда, а дополнительные точные
+    # адреса и домены хранятся в локальных настройках.
     DEFAULT_ALLOWED_SENDERS = frozenset()
     DEFAULT_ALLOWED_DOMAINS = frozenset({"sti.gov.kg", "salyk.kg"})
 
@@ -3038,34 +3297,51 @@ class OutlookInboxImporter:
         test_email = self.settings.outlook_test_email.strip().casefold()
         if test_email:
             return frozenset({test_email})
-        return self.DEFAULT_ALLOWED_SENDERS
+        return self.get_direct_sender_exceptions()
+
+    def _get_setting_values(self, key: str) -> frozenset[str]:
+        row = self.db.fetch_one(
+            "SELECT value FROM settings WHERE key = ?",
+            (key,),
+        )
+        if not row:
+            return frozenset()
+        return frozenset(
+            value.strip().casefold()
+            for value in str(row["value"]).replace(";", ",").split(",")
+            if value.strip()
+        )
+
+    def get_direct_sender_exceptions(self) -> frozenset[str]:
+        return self._get_setting_values(self.DIRECT_ALLOWED_SENDERS_SETTING)
+
+    def get_extra_allowed_domains(self) -> frozenset[str]:
+        return self._get_setting_values(self.EXTRA_ALLOWED_DOMAINS_SETTING)
+
+    def get_sender_exception_rules(self) -> tuple[str, ...]:
+        return tuple(
+            [*sorted(self.get_direct_sender_exceptions())]
+            + [
+                f"@{domain}"
+                for domain in sorted(self.get_extra_allowed_domains())
+            ]
+        )
 
     def get_forwarding_senders(self) -> frozenset[str]:
         """Return trusted relay addresses configured by the employee.
 
         These addresses are not direct sources of requests: they can only
-        relay a message with one confirmed original sender from a GNS domain.
+        relay a message with one confirmed allowed original sender.
         """
 
         if self.settings.outlook_test_email.strip():
             return frozenset()
-        row = self.db.fetch_one(
-            "SELECT value FROM settings WHERE key = ?",
-            (self.ALLOWED_SENDERS_SETTING,),
-        )
-        if not row:
-            return self.DEFAULT_ALLOWED_SENDERS
-        values = {
-            value.strip().casefold()
-            for value in str(row["value"]).replace(";", ",").split(",")
-            if value.strip()
-        }
-        return frozenset(values)
+        return self._get_setting_values(self.ALLOWED_SENDERS_SETTING)
 
     def get_allowed_domains(self) -> frozenset[str]:
         if self.settings.outlook_test_email.strip():
             return frozenset()
-        return self.DEFAULT_ALLOWED_DOMAINS
+        return self.DEFAULT_ALLOWED_DOMAINS | self.get_extra_allowed_domains()
 
     def get_import_since(self) -> date:
         row = self.db.fetch_one(
@@ -3196,6 +3472,7 @@ class OutlookInboxImporter:
         self,
         *,
         allowed_senders: str,
+        direct_sender_rules: str | None = None,
         import_since: str,
         mailbox: str = "",
         auto_enabled: bool = False,
@@ -3211,6 +3488,33 @@ class OutlookInboxImporter:
             raise OutlookIntegrationError(
                 "Укажите корректные адреса разрешённых отправителей."
             )
+        direct_senders = set(self.get_direct_sender_exceptions())
+        extra_domains = set(self.get_extra_allowed_domains())
+        invalid_rules: list[str] = []
+        if direct_sender_rules is not None:
+            direct_senders.clear()
+            extra_domains.clear()
+            rules = {
+                value.strip().casefold()
+                for value in re.split(r"[,;\n]+", direct_sender_rules)
+                if value.strip()
+            }
+            for rule in rules:
+                if rule.startswith("@") or "@" not in rule:
+                    domain = rule.lstrip("@")
+                    if DOMAIN_RE.fullmatch(domain):
+                        extra_domains.add(domain)
+                    else:
+                        invalid_rules.append(rule)
+                elif EMAIL_RE.fullmatch(rule):
+                    direct_senders.add(rule)
+                else:
+                    invalid_rules.append(rule)
+        if invalid_rules:
+            raise OutlookIntegrationError(
+                "Укажите корректный адрес или домен отправителя."
+            )
+        extra_domains -= self.DEFAULT_ALLOWED_DOMAINS
         try:
             since = date.fromisoformat(import_since)
         except ValueError as exc:
@@ -3254,6 +3558,16 @@ class OutlookInboxImporter:
             """,
             [
                 (self.ALLOWED_SENDERS_SETTING, ",".join(sorted(values)), now),
+                (
+                    self.DIRECT_ALLOWED_SENDERS_SETTING,
+                    ",".join(sorted(direct_senders)),
+                    now,
+                ),
+                (
+                    self.EXTRA_ALLOWED_DOMAINS_SETTING,
+                    ",".join(sorted(extra_domains)),
+                    now,
+                ),
                 (self.IMPORT_SINCE_SETTING, since.isoformat(), now),
                 (self.MAILBOX_SETTING, mailbox_name, now),
                 (self.AUTO_ENABLED_SETTING, "1" if auto_enabled else "0", now),
@@ -3266,6 +3580,8 @@ class OutlookInboxImporter:
             "outlook_import_settings_updated",
             {
                 "allowed_sender_count": len(values),
+                "direct_sender_count": len(direct_senders),
+                "extra_domain_count": len(extra_domains),
                 "import_since": since.isoformat(),
                 "mailbox_configured": bool(mailbox_name),
                 "automatic_import_enabled": bool(auto_enabled),
@@ -3691,6 +4007,7 @@ def _bridge_payload(
                 create_if_missing=bool(
                     payload.get("create_if_missing", True)
                 ),
+                display=bool(payload.get("display", True)),
             )
             return {"ok": True, "draft": asdict(draft)}
         if action == "send":

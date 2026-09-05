@@ -1,5 +1,7 @@
+import pytest
+
 from gns_app.domain import ExtractedFields, ExtractedTaxpayer
-from gns_app.services.workflow import WorkflowService
+from gns_app.services.workflow import WorkflowService, WorkflowValidationError
 
 
 def test_official_gns_emails_are_loaded_by_exact_office_name(workflow):
@@ -164,6 +166,132 @@ def test_gns_offices_are_stored_and_matched_locally(workflow):
     assert len(offices) == 2
     assert match is not None
     assert match["district_place"] == "по Демо-району г.Бишкек"
+
+
+def test_employee_can_add_update_and_delete_office_email(workflow):
+    office_id = workflow.save_gns_office(
+        "по Новому району Чуйской области",
+        "main@example.kg",
+        "reserve1@example.kg, reserve2@example.kg",
+        "Новый район, Новая налоговая",
+    )
+
+    office = next(
+        item for item in workflow.list_gns_offices() if item["id"] == office_id
+    )
+    assert office["email_address"] == "main@example.kg"
+    assert office["backup_emails"] == [
+        "reserve1@example.kg",
+        "reserve2@example.kg",
+    ]
+    assert office["aliases"] == ["Новый район", "Новая налоговая"]
+    assert workflow.match_gns_office("Новая налоговая")["id"] == office_id
+    assert workflow.office_delivery_email(office) == "main@example.kg"
+
+    workflow.save_gns_office(
+        "по Новому району Иссык-Кульской области",
+        "",
+        "reserve2@example.kg",
+        "Обновлённый район",
+        office_id=office_id,
+    )
+    updated = next(
+        item for item in workflow.list_gns_offices() if item["id"] == office_id
+    )
+    assert updated["email_address"] is None
+    assert workflow.office_delivery_email(updated) == "reserve2@example.kg"
+    assert updated["aliases"] == [
+        "Обновлённый район",
+        "по Новому району Чуйской области",
+    ]
+    assert workflow.match_gns_office(
+        "по Новому району Чуйской области"
+    )["id"] == office_id
+
+    workflow.delete_gns_office(office_id)
+    assert all(
+        item["id"] != office_id for item in workflow.list_gns_offices()
+    )
+    stored = workflow.db.fetch_one(
+        "SELECT active, user_modified FROM gns_offices WHERE id = ?",
+        (office_id,),
+    )
+    assert stored == {"active": 0, "user_modified": 1}
+
+
+def test_office_settings_reject_duplicate_or_invalid_email(workflow):
+    workflow.save_gns_office(
+        "по Первому тестовому району",
+        "one@example.kg",
+    )
+
+    with pytest.raises(WorkflowValidationError, match="Некорректная почта"):
+        workflow.save_gns_office(
+            "по Второму тестовому району",
+            "не-почта",
+        )
+    with pytest.raises(WorkflowValidationError, match="другого района"):
+        workflow.save_gns_office(
+            "по Второму тестовому району",
+            "two@example.kg",
+            "one@example.kg",
+        )
+
+    workflow.save_gns_office(
+        "по Третьему тестовому району",
+        aliases="Общий алиас",
+    )
+    with pytest.raises(WorkflowValidationError, match="другим районом"):
+        workflow.save_gns_office(
+            "по Четвёртому тестовому району",
+            aliases="Общий алиас",
+        )
+
+
+def test_user_office_changes_survive_default_directory_refresh(workflow):
+    workflow.initialize_gns_offices()
+    workflow.initialize_gns_office_emails()
+    office = workflow.list_gns_offices()[0]
+    workflow.save_gns_office(
+        office["district_place"],
+        "changed@example.kg",
+        "reserve@example.kg",
+        "Ручной алиас",
+        office_id=office["id"],
+    )
+    workflow.db.execute(
+        "DELETE FROM settings WHERE key IN (?, ?)",
+        (
+            workflow.GNS_OFFICES_SOURCE_SETTING,
+            workflow.GNS_EMAILS_SOURCE_SETTING,
+        ),
+    )
+
+    workflow.initialize_gns_offices()
+    workflow.initialize_gns_office_emails()
+
+    refreshed = next(
+        item
+        for item in workflow.list_gns_offices()
+        if item["office_key"] == office["office_key"]
+    )
+    assert refreshed["email_address"] == "changed@example.kg"
+    assert refreshed["backup_emails"] == ["reserve@example.kg"]
+    assert refreshed["aliases"] == ["Ручной алиас"]
+
+
+def test_existing_office_aliases_can_be_saved_unchanged(workflow):
+    workflow.initialize_gns_offices()
+    workflow.initialize_gns_office_emails()
+
+    for office in workflow.list_gns_offices():
+        workflow.save_gns_office(
+            office["district_place"],
+            office["email_address"] or "",
+            office["backup_emails"],
+            office["aliases"],
+            office_id=office["id"],
+        )
 
 
 def test_gns_office_directory_is_read_once_for_repeated_matches(

@@ -36,8 +36,13 @@
   <main class="page-shell">
     {% if outlook_test_mode %}
       <div class="alert alert-success">
-        Почта работает в тестовом режиме: входящие PDF принимаются только от
-        {{ outlook_test_email }}, отправка разрешена только на этот же адрес.
+        {% if outlook_inbox_test_mode %}
+          Почта работает в изолированном тестовом режиме: входящие документы
+          принимаются только от {{ outlook_test_email }}; отправка разрешена только на этот же адрес.
+        {% else %}
+          Исходящие письма работают в тестовом режиме: все получатели заменены
+          на {{ outlook_test_email }}.
+        {% endif %}
       </div>
     {% endif %}
     {% block content %}{% endblock %}

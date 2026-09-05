@@ -8,6 +8,8 @@ set "APP_URL=http://127.0.0.1:8765"
 set "APP_PYTHON=%~dp0.venv\Scripts\python.exe"
 set "APP_FAST_MODELS=%LOCALAPPDATA%\GNSLetterAutomation\models\tessdata_fast"
 set "APP_BEST_MODELS=%LOCALAPPDATA%\GNSLetterAutomation\models\tessdata_best"
+rem Test mode: all outgoing mail uses the approved Gmail recipient.
+set "GNS_OUTLOOK_ALLOW_TEST_SEND=true"
 
 rem Если приложение уже работает, просто открыть его и не запускать второй сервер.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "try { $r = Invoke-WebRequest -UseBasicParsing -Uri '%APP_URL%/health' -TimeoutSec 2; if ($r.StatusCode -eq 200) { Start-Process '%APP_URL%'; exit 0 } } catch {}; exit 1" >nul 2>nul

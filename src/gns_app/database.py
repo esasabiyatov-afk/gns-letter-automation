@@ -235,8 +235,11 @@ CREATE TABLE IF NOT EXISTS gns_offices (
     district_place TEXT NOT NULL,
     postal_address TEXT,
     email_address TEXT,
+    backup_emails_json TEXT NOT NULL DEFAULT '[]',
     aliases_json TEXT NOT NULL DEFAULT '[]',
     active INTEGER NOT NULL DEFAULT 1,
+    user_modified INTEGER NOT NULL DEFAULT 0,
+    is_custom INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -260,6 +263,7 @@ CREATE TABLE IF NOT EXISTS response_groups (
     response_path TEXT,
     response_page_overflow INTEGER,
     opened_for_print_at TEXT,
+    word_reopen_required INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -388,6 +392,8 @@ CREATE TABLE IF NOT EXISTS outlook_outgoing_messages (
     resend_sequence INTEGER NOT NULL DEFAULT 0,
     resend_status TEXT,
     resend_draft_key TEXT,
+    resend_subject TEXT,
+    resend_attachment_name TEXT,
     resend_outlook_entry_id TEXT,
     resent_at TEXT,
     resend_error_message TEXT,
@@ -561,6 +567,21 @@ class Database:
             connection.execute(
                 "ALTER TABLE gns_offices ADD COLUMN email_address TEXT"
             )
+        if "backup_emails_json" not in existing:
+            connection.execute(
+                "ALTER TABLE gns_offices ADD COLUMN "
+                "backup_emails_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "user_modified" not in existing:
+            connection.execute(
+                "ALTER TABLE gns_offices ADD COLUMN "
+                "user_modified INTEGER NOT NULL DEFAULT 0"
+            )
+        if "is_custom" not in existing:
+            connection.execute(
+                "ALTER TABLE gns_offices ADD COLUMN "
+                "is_custom INTEGER NOT NULL DEFAULT 0"
+            )
 
     @staticmethod
     def _ensure_outlook_message_columns(connection: sqlite3.Connection) -> None:
@@ -597,6 +618,11 @@ class Database:
         if "opened_for_print_at" not in existing:
             connection.execute(
                 "ALTER TABLE response_groups ADD COLUMN opened_for_print_at TEXT"
+            )
+        if "word_reopen_required" not in existing:
+            connection.execute(
+                "ALTER TABLE response_groups ADD COLUMN "
+                "word_reopen_required INTEGER NOT NULL DEFAULT 0"
             )
         groups = connection.execute(
             """
@@ -689,7 +715,7 @@ class Database:
                 """
                 UPDATE outlook_outgoing_messages
                 SET draft_key = CASE
-                    WHEN lower(recipient_email) = 'esasabiyatov@gmail.com'
+                    WHEN lower(recipient_email) = 'esensabiyatov@gmail.com'
                     THEN 'gns-test-scan-' || signed_scan_id
                     ELSE 'gns-scan-' || signed_scan_id
                 END
@@ -700,6 +726,8 @@ class Database:
             "resend_sequence": "INTEGER NOT NULL DEFAULT 0",
             "resend_status": "TEXT",
             "resend_draft_key": "TEXT",
+            "resend_subject": "TEXT",
+            "resend_attachment_name": "TEXT",
             "resend_outlook_entry_id": "TEXT",
             "resent_at": "TEXT",
             "resend_error_message": "TEXT",
