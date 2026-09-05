@@ -251,7 +251,7 @@ def test_initialize_cleans_edge_quote_and_audits_change(tmp_path):
             id, upload_id, status, source_kind, district_place,
             fields_confirmed, created_at, updated_at
         ) VALUES ('case-1', 'upload-1', 'ready_for_abs', 'qr_official',
-                  'по городу Балыкчы Ысык-Кульской области"', 1,
+                  'по городу Ош"', 1,
                   '2026-01-01T00:00:00+00:00',
                   '2026-01-01T00:00:00+00:00')
         """
@@ -261,13 +261,13 @@ def test_initialize_cleans_edge_quote_and_audits_change(tmp_path):
 
     case = db.fetch_one("SELECT * FROM cases WHERE id = 'case-1'")
     assert case["district_place"] == (
-        "по городу Балыкчы Ысык-Кульской области"
+        "по г.Ош Ошской области"
     )
     event = db.fetch_one(
         """
         SELECT * FROM audit_events
         WHERE entity_id = 'case-1'
-          AND event_type = 'district_place_edge_noise_removed'
+          AND event_type = 'district_place_normalized'
         """
     )
     assert event is not None

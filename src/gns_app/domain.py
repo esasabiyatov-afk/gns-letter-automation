@@ -73,6 +73,7 @@ class AbsStatus(StrEnum):
     AUTH_ERROR = "auth_error"
     UNAVAILABLE = "unavailable"
     TECHNICAL_ERROR = "technical_error"
+    INVALID_INN = "invalid_inn"
 
 
 class OdbStatus(StrEnum):

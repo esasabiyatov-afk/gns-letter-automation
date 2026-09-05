@@ -746,7 +746,7 @@ class Database:
                 (
                     "case",
                     row["id"],
-                    "district_place_edge_noise_removed",
+                    "district_place_normalized",
                     "system",
                     json.dumps(
                         {"before": original, "after": cleaned},

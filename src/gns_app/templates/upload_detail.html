@@ -10,7 +10,7 @@
 <div class="page-heading upload-page-heading">
   <div>
     <a class="back-link" href="/?tab=incoming">← Входящие</a>
-    <p class="eyebrow">ПАКЕТНЫЙ PDF</p>
+    <p class="eyebrow">ВХОДЯЩИЙ ДОКУМЕНТ</p>
     <h1 title="{{ upload.original_filename }}">{{ upload.original_filename }}</h1>
     <p>{{ upload.page_count }} {{ page_word(upload.page_count) }} · SHA-256 {{ upload.sha256[:12] }}…</p>
   </div>
@@ -79,7 +79,7 @@
       id="upload-page-pdf"
       data-testid="upload-page-pdf"
       src="/pages/{{ selected_page.id }}/pdf#page=1&zoom=page-fit"
-      title="PDF, страница {{ selected_page.page_number }}">
+      title="Документ, страница {{ selected_page.page_number }}">
     </iframe>
   </section>
 
@@ -155,7 +155,7 @@
 {% else %}
   <div class="empty-state large" data-testid="upload-pages-empty">
     <strong>Страницы ещё не зарегистрированы</strong>
-    <span>Они появятся здесь во время обработки PDF.</span>
+    <span>Они появятся здесь во время обработки документа.</span>
   </div>
 {% endif %}
 {% endblock %}

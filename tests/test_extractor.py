@@ -40,7 +40,7 @@ def test_official_district_removes_only_stray_edge_quote():
     fields = FieldExtractor().extract_official_letter(text)
 
     assert fields.district_place == (
-        "по городу Балыкчы Ысык-Кульской области"
+        "по г.Балыкчы Ысык-Кульской области"
     )
     assert fields.taxpayers[0].name == (
         'Общество с ограниченной ответственностью "Чардж"'
@@ -61,6 +61,23 @@ def test_official_recipient_can_have_two_name_parts():
 
     assert fields.recipient_position == "Зам. начальника управления"
     assert fields.recipient_full_name == "Жоробеков Тынчтыкбек"
+    assert fields.confidence == 0.96
+
+
+def test_official_recipient_accepts_any_explicit_position_from_qr_text():
+    text = """
+    Учреждение "Управление государственной налоговой службы по Ат-Башинскому
+    району Нарынской области" в соответствии со статьёй 146 запрашивает информацию.
+    Наименование: ОсОО "Тест"
+    ИНН: 02312201410117
+    Период: с 01.01.2022 по 30.06.2026
+    Начальник отдела Телтаев Рахатбек Замирбекович
+    """
+
+    fields = FieldExtractor().extract_official_letter(text)
+
+    assert fields.recipient_position == "Начальник отдела"
+    assert fields.recipient_full_name == "Телтаев Рахатбек Замирбекович"
     assert fields.confidence == 0.96
 
 

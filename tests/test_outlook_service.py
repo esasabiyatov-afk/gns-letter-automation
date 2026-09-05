@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 from pypdf import PdfWriter
 
 from gns_app.database import utc_now
@@ -92,12 +93,14 @@ class FakeImportGateway(FakeGateway):
         sender_smtp: str = "esasabiyatov@gmail.com",
         original_sender_smtp: str = "",
         received_at: str = "2026-08-21T09:00:00+06:00",
+        attachment_filename: str = "test.pdf",
     ):
         super().__init__()
         self.source_pdf = source_pdf
         self.sender_smtp = sender_smtp
         self.original_sender_smtp = original_sender_smtp
         self.received_at = received_at
+        self.attachment_filename = attachment_filename
         self.scan_requests: list[frozenset[str]] = []
         self.received_since_requests: list[date] = []
         self.staging_dirs: list[Path] = []
@@ -155,12 +158,13 @@ class FakeImportGateway(FakeGateway):
         message_dir.mkdir(parents=True, exist_ok=True)
         attachments = []
         for index in (1, 2):
-            temporary = message_dir / f"{index:03d}_test.pdf.part"
+            suffix = Path(self.attachment_filename).suffix
+            temporary = message_dir / f"{index:03d}{suffix}.part"
             shutil.copyfile(self.source_pdf, temporary)
             attachments.append(
                 OutlookScannedAttachment(
                     attachment_index=index,
-                    original_filename="test.pdf",
+                    original_filename=self.attachment_filename,
                     temporary_path=str(temporary),
                     size_bytes=temporary.stat().st_size,
                 )
@@ -1256,11 +1260,13 @@ def test_test_mode_sends_once_only_to_fixed_address(workflow):
     assert gateway.send_requests[0]["sending_account"] == ""
 
 
-def test_com_gateway_filters_sender_and_exports_only_pdf(
+def test_com_gateway_exports_supported_documents_only(
     monkeypatch,
     tmp_path,
 ):
     source_pdf = write_test_pdf(tmp_path / "source.pdf")
+    source_png = tmp_path / "source.png"
+    Image.new("RGB", (120, 160), "white").save(source_png)
 
     class Accessor:
         def __init__(self, internet_id):
@@ -1272,18 +1278,23 @@ def test_com_gateway_filters_sender_and_exports_only_pdf(
             return ""
 
     class Attachment:
-        def __init__(self, filename):
+        def __init__(self, filename, source):
             self.FileName = filename
-            self.Size = source_pdf.stat().st_size
+            self.source = source
+            self.Size = source.stat().st_size
             self.saved = False
 
         def SaveAsFile(self, destination):
             self.saved = True
-            shutil.copyfile(source_pdf, destination)
+            shutil.copyfile(self.source, destination)
 
     class Attachments:
         def __init__(self):
-            self.values = [Attachment("letter.pdf"), Attachment("logo.png")]
+            self.values = [
+                Attachment("letter.pdf", source_pdf),
+                Attachment("photo.png", source_png),
+                Attachment("logo.gif", source_png),
+            ]
             self.Count = len(self.values)
 
         def Item(self, index):
@@ -1386,13 +1397,14 @@ def test_com_gateway_filters_sender_and_exports_only_pdf(
     assert scan.inspected_mail_count == 2
     assert scan.eligible_message_count == 1
     assert len(scan.messages) == 1
-    assert scan.messages[0].pdf_attachment_count == 1
-    assert len(scan.messages[0].attachments) == 1
+    assert scan.messages[0].pdf_attachment_count == 2
+    assert len(scan.messages[0].attachments) == 2
     assert scan.messages[0].original_sender_smtp == ""
     assert Path(scan.messages[0].attachments[0].temporary_path).is_file()
     assert (staging_dir / ".gns-ready").is_file()
     assert allowed_mail.Attachments.values[0].saved
-    assert not allowed_mail.Attachments.values[1].saved
+    assert allowed_mail.Attachments.values[1].saved
+    assert not allowed_mail.Attachments.values[2].saved
     assert not blocked_mail.Attachments.values[0].saved
     assert not older_mail.Attachments.values[0].saved
     assert items.sort_calls == [("[ReceivedTime]", True)]
@@ -2000,6 +2012,30 @@ def test_outlook_import_saves_message_once_and_reuses_duplicate_content(
     incoming = workflow.list_incoming_work()
     assert incoming[0]["intake_source"] == "inbox_folder"
     assert incoming[0]["sender_smtp"] is None
+
+
+def test_outlook_import_accepts_png_attachment(workflow, tmp_path):
+    workflow.initialize_employee_profiles()
+    source = tmp_path / "letter.png"
+    Image.new("RGB", (240, 320), "white").save(source)
+    gateway = FakeImportGateway(source, attachment_filename="letter.png")
+    importer = OutlookInboxImporter(
+        workflow.db,
+        workflow.settings,
+        OutlookService(gateway),
+    )
+    importer.update_settings(
+        allowed_senders="esasabiyatov@gmail.com",
+        import_since="2026-08-20",
+    )
+
+    summary = importer.import_new(workflow)
+
+    assert len(summary["imported"]) == 1
+    assert not summary["errors"]
+    upload = workflow.get_upload(summary["imported"][0])
+    assert upload["original_filename"] == "letter.png"
+    assert upload["page_count"] == 1
 
 
 def test_manual_pdf_with_same_content_as_outlook_stays_manual(

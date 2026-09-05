@@ -1,4 +1,13 @@
 {% extends "base.html" %}
+{% macro inn_with_diff(value, other, highlight) -%}
+  <span class="match-inn-value">
+  {%- for character in value -%}
+    {%- if highlight and (loop.index0 >= other|length or character != other[loop.index0]) -%}
+      <mark class="inn-char-difference">{{ character }}</mark>
+    {%- else -%}{{ character }}{%- endif -%}
+  {%- endfor -%}
+  </span>
+{%- endmacro %}
 {% block title %}Сравнение обращений · ГНС{% endblock %}
 {% block body_class %}workspace-page{% endblock %}
 {% block content %}
@@ -28,6 +37,7 @@
 
   <section class="match-source-grid" aria-label="Версии обращения">
     {% for source in [review.left, review.right] %}
+    {% set other_inn = review.right.taxpayer.inn if loop.index == 1 else review.left.taxpayer.inn %}
     <article class="match-source-card">
       <div class="match-source-heading">
         <div>
@@ -48,7 +58,7 @@
             Наименование лица
             {% if review.differing_field == 'name' %}<span>Отличается</span>{% endif %}
           </dt>
-          <dd>{{ source.taxpayer.name }}</dd>
+          <dd class="match-name-value">{{ source.taxpayer.name }}</dd>
           <small>{{ source_labels.get(source.taxpayer.name_source, source.taxpayer.name_source) }}</small>
         </div>
         <div{% if review.differing_field == 'inn' %} class="match-field-difference"{% endif %}>
@@ -56,8 +66,13 @@
             ИНН
             {% if review.differing_field == 'inn' %}<span>Отличается</span>{% endif %}
           </dt>
-          <dd>{{ source.taxpayer.inn }}</dd>
+          <dd>{{ inn_with_diff(source.taxpayer.inn, other_inn, review.differing_field == 'inn') }}</dd>
           <small>{{ source_labels.get(source.taxpayer.inn_source, source.taxpayer.inn_source) }}</small>
+          {% if source.taxpayer.inn|length != 14 %}
+            <small class="inn-length-warning">
+              ⚠ {{ source.taxpayer.inn|length }} цифр вместо 14. Сверьте с письмом.
+            </small>
+          {% endif %}
         </div>
         <div>
           <dt>Адресат</dt>
@@ -117,10 +132,11 @@
       <fieldset{% if review.differing_field == 'inn' %} class="match-resolution-difference"{% endif %}>
         <legend>Итоговый ИНН</legend>
         {% for source in [review.left, review.right] %}
+          {% set other_inn = review.right.taxpayer.inn if loop.index == 1 else review.left.taxpayer.inn %}
           <label>
             <input type="radio" name="inn_choice"
                    value="{{ source.taxpayer.id }}" required>
-            <span>{{ source.taxpayer.inn }}</span>
+            {{ inn_with_diff(source.taxpayer.inn, other_inn, review.differing_field == 'inn') }}
             <small>Версия {{ loop.index }} · {{ source_labels.get(source.taxpayer.inn_source, source.taxpayer.inn_source) }}</small>
           </label>
         {% endfor %}
@@ -128,7 +144,7 @@
           <input type="radio" name="inn_choice" value="manual" required>
           <span>Ввести вручную</span>
           <input type="text" name="manual_inn" inputmode="numeric"
-                 pattern="[0-9]{14}" maxlength="14"
+                 pattern="[0-9]+"
                  aria-label="Итоговый ИНН вручную">
         </label>
       </fieldset>

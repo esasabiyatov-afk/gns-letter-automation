@@ -40,13 +40,30 @@ class FieldExtractor:
         r"(?:в\s+соответствии|на\s+основании)",
         re.IGNORECASE | re.DOTALL,
     )
-    NAME_WORD = r"[А-ЯЁҢӨҮ][А-Яа-яЁёҢңӨөҮү\-]+"
+    # ФИО должно начинаться с прописной буквы даже при re.IGNORECASE у
+    # всего шаблона: иначе «отдела» ошибочно становится первой частью ФИО.
+    NAME_WORD = r"(?-i:[А-ЯЁҢӨҮ][А-Яа-яЁёҢңӨөҮү\-]+)"
+    RECIPIENT_NAME_PART = rf"(?:{NAME_WORD}|(?-i:уулу|кызы))"
+    # В официальных QR-документах должность адресата не ограничивается
+    # справочником: «начальник отдела», «заместитель директора» и другие
+    # формулировки — такие же данные первоисточника. Берём строку перед ФИО,
+    # но не поля с двоеточием (ИНН, Наименование и т. п.). Для OCR-скана
+    # ниже остаётся более строгий шаблон, чтобы не принять шум за должность.
+    OFFICIAL_RECIPIENT_RE = re.compile(
+        r"^[ \t]*(?P<position>[^\r\n:]{3,100}?)"
+        r"(?:[ \t]+|(?:\r?\n[ \t]*){1,3})(?P<name>"
+        + RECIPIENT_NAME_PART
+        + r"(?:[ \t]+"
+        + RECIPIENT_NAME_PART
+        + r"){1,3})[ \t]*(?=\r?$)",
+        re.IGNORECASE | re.MULTILINE,
+    )
     RECIPIENT_RE = re.compile(
         r"(?P<position>(?:зам\.?[ \t]+)?начальник[ау]?[ \t]+управления)"
         r"(?:[ \t]+|(?:\r?\n[ \t]*){1,3})(?P<name>"
-        + NAME_WORD
+        + RECIPIENT_NAME_PART
         + r"(?:[ \t]+"
-        + NAME_WORD
+        + RECIPIENT_NAME_PART
         + r"){1,3})[ \t]*(?=\r?$)",
         re.IGNORECASE | re.MULTILINE,
     )
@@ -238,7 +255,7 @@ class FieldExtractor:
 
         recipient_matches = [
             match
-            for match in self.RECIPIENT_RE.finditer(text)
+            for match in self.OFFICIAL_RECIPIENT_RE.finditer(text)
             if self._plausible_recipient_name(match.group("name"))
         ]
         if recipient_matches:

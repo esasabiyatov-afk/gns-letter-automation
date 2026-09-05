@@ -173,6 +173,11 @@
             {% for issue in group.issues %}<p>{{ issue }}</p>{% endfor %}
           </div>
         {% endif %}
+        {% if group.warnings %}
+          <div class="warning-note" role="status">
+            {% for warning in group.warnings %}<p>⚠ {{ warning }}</p>{% endfor %}
+          </div>
+        {% endif %}
         <div class="group-card-actions">
           <details class="group-more group-members">
             <summary>Список лиц</summary>
@@ -300,7 +305,8 @@
   {% if overview.found_groups %}
     <div class="response-group-grid">
     {% for group in overview.found_groups %}
-      <article class="response-group-card response-group-found">
+      {% set abs_found = group.taxpayers|selectattr('abs_account_result', 'equalto', 'found')|list %}
+      <article class="response-group-card response-group-found{% if abs_found %} abs-found-card{% endif %}">
         <div class="response-group-heading">
           <div>
             <h3>{{ group.recipient_display_name }}</h3>
@@ -338,7 +344,7 @@
                         value="not_found" type="submit">Счёта нет</button>
               </form>
             {% elif taxpayer.abs_account_result == 'found' %}
-              <small>Подтверждено: счёт есть</small>
+              <small class="abs-found-title">⚠ АБС: подтверждено, счёт есть</small>
             {% endif %}
             {% if taxpayer.source_page_id %}
               <a class="letter-pdf-link"
@@ -404,7 +410,7 @@
                     {{ letter.signed_scan.page_count }} стр.
                   </small>
                   {% if letter.signed_scan.status == 'confirmed' %}
-                    <strong>✓ Проверен, готов к отправке</strong>
+                    <strong>✓ Скан готов к отправке</strong>
                   {% else %}
                     <strong>Требуется проверка</strong>
                   {% endif %}
@@ -420,7 +426,7 @@
                     <label><input type="checkbox" name="bank_seal_present" value="true" required>
                       Печать банка стоит</label>
                     <button class="button button-primary" type="submit">
-                      Подтвердить скан
+                      Проверить старый скан
                     </button>
                   </form>
                 {% elif letter.signed_scan.status == 'confirmed' %}

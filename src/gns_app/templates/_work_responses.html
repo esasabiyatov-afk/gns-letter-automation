@@ -71,6 +71,9 @@
               <small>{{ group.issues|join(' ') }}</small>
             {% else %}
               <span class="status status-ready_for_response">Готово</span>
+              {% if group.warnings %}
+                <small class="inn-length-warning">⚠ {{ group.warnings|join(' ') }}</small>
+              {% endif %}
             {% endif %}
           </div>
           <div class="response-row-actions">
@@ -172,7 +175,7 @@
                   {% elif letter.outlook_message and letter.outlook_message.status == 'draft_created' %}
                     <span class="status status-ready">Письмо подготовлено</span>
                   {% elif letter.signed_scan and letter.signed_scan.status == 'confirmed' %}
-                    <span class="status status-ready">Скан подтверждён</span>
+                    <span class="status status-ready">Скан готов</span>
                   {% elif letter.signed_scan %}
                     <span class="status status-needs_review">Проверить скан</span>
                   {% elif letter.scan_session %}
@@ -270,7 +273,8 @@
     </div>
     <div class="response-list">
       {% for group in overview.found_groups %}
-        <article class="response-row manual-response-row">
+        {% set abs_found = group.taxpayers|selectattr('abs_account_result', 'equalto', 'found')|list %}
+        <article class="response-row manual-response-row{% if abs_found %} response-row-abs-found{% endif %}">
           <div class="response-person">
             <strong>{{ group.recipient_display_name }}</strong>
             <span>УГНС {{ group.district_place }}</span>
@@ -279,10 +283,12 @@
             <span>Лиц: <strong>{{ group.taxpayer_count }}</strong></span>
           </div>
           <div class="response-state">
-            <span class="status status-needs_review">Ответ вручную</span>
+            <span class="status status-needs_review">
+              {% if abs_found %}⚠ АБС: счёт найден · ответ вручную{% else %}Ответ вручную{% endif %}
+            </span>
             <small>
               {% for taxpayer in group.taxpayers %}
-                {{ taxpayer.name }}{% if not loop.last %}; {% endif %}
+                {{ taxpayer.name }}{% if taxpayer.abs_account_result == 'found' %} — АБС: счёт есть{% elif taxpayer.odb_result == 'found' %} — ОДБ: найден{% endif %}{% if not loop.last %}; {% endif %}
               {% endfor %}
             </small>
           </div>

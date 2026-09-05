@@ -70,9 +70,9 @@ def test_old_jalal_abad_city_names_match_manas_but_not_manas_district(workflow):
 def test_osh_city_email_is_not_mixed_with_osh_region_offices(workflow):
     """Only the city УГНС may receive the city Ош address.
 
-    A response group can retain the short OCR/manual value ``по городу Ош``.
-    It must still resolve to the city УГНС, while names of regional or
-    specialised offices must never silently receive that address.
+    A response group can use the short OCR/manual value ``по городу Ош``.
+    It must resolve to the city УГНС with the required regional suffix, while
+    names of specialised offices must never silently receive that address.
     """
     workflow.initialize_gns_offices()
     workflow.initialize_gns_office_emails()
@@ -92,7 +92,7 @@ def test_osh_city_email_is_not_mixed_with_osh_region_offices(workflow):
         if office is not None
     } == {city["office_key"]}
     assert city["office_name"] == "УГНС по г. Ош"
-    assert city["district_place"] == "по городу Ош"
+    assert city["district_place"] == "по г.Ош Ошской области"
     assert city["email_address"] == "032oshg@sti.gov.kg"
 
     for other_office_text in (
@@ -108,10 +108,8 @@ def test_osh_city_email_is_not_mixed_with_osh_region_offices(workflow):
     regional_wording = workflow.match_gns_office(
         "УГНС по городу Ош и Ошской области"
     )
-    assert (
-        regional_wording is None
-        or regional_wording["office_key"] != city["office_key"]
-    )
+    assert regional_wording is not None
+    assert regional_wording["office_key"] == city["office_key"]
 
 
 def test_existing_jalal_abad_case_is_migrated_to_current_city_name(workflow):
@@ -134,7 +132,7 @@ def test_existing_jalal_abad_case_is_migrated_to_current_city_name(workflow):
     workflow.initialize_gns_offices()
 
     assert workflow.get_case(case_id)["district_place"] == (
-        "по г. Манас Джалал-Абадской области"
+        "по г.Манас Джалал-Абадской области"
     )
 
 
@@ -165,7 +163,7 @@ def test_gns_offices_are_stored_and_matched_locally(workflow):
 
     assert len(offices) == 2
     assert match is not None
-    assert match["district_place"] == "по Демо-району города Бишкек"
+    assert match["district_place"] == "по Демо-району г.Бишкек"
 
 
 def test_gns_office_directory_is_read_once_for_repeated_matches(
@@ -213,7 +211,7 @@ def test_replacing_directory_expands_legacy_case_location(workflow):
     workflow.replace_gns_offices(_offices())
 
     assert workflow.get_case(case_id)["district_place"] == (
-        "по Демо-району города Бишкек"
+        "по Демо-району г.Бишкек"
     )
 
 
@@ -249,7 +247,7 @@ def test_exact_office_match_prefills_only_unconfirmed_scan_case(workflow):
     )
 
     case = workflow.get_case(case_id)
-    assert case["district_place"] == "по Демо-району города Бишкек"
+    assert case["district_place"] == "по Демо-району г.Бишкек"
     assert not case["fields_confirmed"]
 
 
@@ -453,7 +451,7 @@ def test_bundled_office_csv_contains_all_records(project_root):
         for record in records
         if record["office_name"] == "УГНС по г. Ош"
     )
-    assert osh_city["district_place"] == "по городу Ош"
+    assert osh_city["district_place"] == "по г.Ош Ошской области"
 
 
 def test_noisy_ocr_office_is_offered_as_suggestion(workflow):

@@ -3,6 +3,8 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+from PIL import Image
+
 
 def test_inbox_imports_new_pdf_and_skips_duplicate(
     workflow,
@@ -33,3 +35,18 @@ def test_inbox_imports_new_pdf_and_skips_duplicate(
     third = workflow.import_inbox()
     assert len(third["imported"]) == 1
     assert not third["skipped"]
+
+
+def test_inbox_imports_supported_image(workflow):
+    workflow.initialize_employee_profiles()
+    inbox_file = workflow.settings.inbox_dir / "Фото письма.PNG"
+    Image.new("RGB", (240, 320), "white").save(inbox_file)
+
+    result = workflow.import_inbox()
+
+    assert len(result["imported"]) == 1
+    upload = workflow.get_upload(result["imported"][0])
+    assert upload["original_filename"] == "Фото письма.PNG"
+    assert upload["page_count"] == 1
+    assert Path(upload["stored_path"]).suffix == ".pdf"
+    assert (Path(upload["stored_path"]).parent / "source.png").is_file()

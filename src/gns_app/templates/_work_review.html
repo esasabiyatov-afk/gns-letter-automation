@@ -29,10 +29,10 @@
 
     {% for group in review.account_groups %}
       {% for taxpayer in group.taxpayers %}
-        <article class="task-row" data-task-kind="abs-account">
-          <span class="task-kind">АБС</span>
+        <article class="task-row task-row-abs-found" data-task-kind="abs-account">
+          <span class="task-kind task-kind-alert">АБС · НАЙДЕН</span>
           <div class="task-main">
-            <strong>{{ taxpayer.name }}</strong>
+            <strong class="abs-found-title">⚠ Анкета найдена: {{ taxpayer.name }}</strong>
             <span>ИНН {{ taxpayer.inn }} · {{ group.district_place }}</span>
             {% if taxpayer.abs_active_account_count is not none or taxpayer.abs_closed_account_count is not none %}
               <small>

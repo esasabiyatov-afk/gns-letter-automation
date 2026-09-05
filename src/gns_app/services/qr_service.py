@@ -21,7 +21,8 @@ class QrService:
         self.allowed_paths = allowed_paths
 
     def decode(self, image_path: Path) -> QrDecodeResult:
-        image = Image.open(image_path).convert("L")
+        with Image.open(image_path) as source:
+            image = ImageOps.exif_transpose(source).convert("L")
         deferred_result: QrDecodeResult | None = None
         zxing_candidate: tuple[str, str] | None = None
 
@@ -181,7 +182,8 @@ class QrService:
 
     def decode_high_resolution(self, image_path: Path) -> QrDecodeResult:
         """A bounded retry for a genuine high-resolution PDF render."""
-        image = Image.open(image_path).convert("L")
+        with Image.open(image_path) as source:
+            image = ImageOps.exif_transpose(source).convert("L")
         deferred_result: QrDecodeResult | None = None
         zxing_candidate = self._try_decode(
             image,

@@ -21,7 +21,7 @@
         {{ session.error_message or 'Сканер сообщил об ошибке. Полученные листы сохранены.' }}
       </div>
     {% endif %}
-    <div class="scan-sheet-grid">
+    <div class="scan-sheet-grid{% if session.pages|length == 1 %} scan-sheet-grid-single{% endif %}">
       {% for page in session.pages %}
         <article class="scan-sheet">
           <a href="/signed-scan-sessions/{{ session.id }}/pages/{{ page.id }}" target="_blank">
@@ -59,7 +59,7 @@
       <form method="post" action="/signed-scan-sessions/{{ session.id }}/finalize">
         <input type="hidden" name="group_id" value="{{ active_group.id }}">
         <button class="button button-secondary" type="submit"
-                {% if not session.pages %}disabled{% endif %}>Создать PDF</button>
+                {% if not session.pages %}disabled{% endif %}>Сохранить скан</button>
       </form>
       <form method="post" action="/signed-scan-sessions/{{ session.id }}/cancel">
         <input type="hidden" name="group_id" value="{{ active_group.id }}">
@@ -82,7 +82,7 @@
     <section class="scan-pdf-preview" aria-label="Предпросмотр подписанного ответа">
       <header>
         <strong>PDF · {{ scan.page_count }} {{ page_word(scan.page_count) }}</strong>
-        <span>{{ 'Подтверждён' if scan.status == 'confirmed' else 'Нужно проверить' }}</span>
+        <span>{{ 'Готов' if scan.status == 'confirmed' else 'Нужно проверить' }}</span>
       </header>
       <iframe src="/signed-response-scans/{{ scan.id }}#page=1&amp;zoom=page-fit"
               title="Подписанный ответ, {{ scan.page_count }} {{ page_word(scan.page_count) }}">
@@ -100,7 +100,7 @@
       <form class="scan-confirm-action" method="post"
             action="/signed-response-scans/{{ scan.id }}/confirm">
         <input type="hidden" name="group_id" value="{{ active_group.id }}">
-        <button class="button button-primary" type="submit">Подтвердить скан</button>
+        <button class="button button-primary" type="submit">Проверить старый скан</button>
       </form>
     {% elif active_letter.outgoing_number and active_letter.gns_email %}
       <form method="post"

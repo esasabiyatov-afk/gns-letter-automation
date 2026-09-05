@@ -24,10 +24,12 @@ from gns_app.diagnostics import record_event, record_exception
 from gns_app.runtime_commands import module_command
 from gns_app.database import Database, utc_now
 from gns_app.services.storage import (
+    SUPPORTED_INPUT_EXTENSIONS,
     StorageError,
     ensure_within,
     sanitize_filename,
-    save_pdf_stream,
+    save_input_stream,
+    validate_input_document,
 )
 from gns_app.services.windows_focus import (
     start_outlook_certificate_dialog_watcher,
@@ -1654,15 +1656,16 @@ class PyWin32OutlookGateway:
                         _safe_attribute(attachment_collection, "Count", 0) or 0
                     )
                     attachments: list[OutlookScannedAttachment] = []
-                    pdf_count = 0
+                    supported_count = 0
                     for attachment_index in range(1, attachment_count + 1):
                         attachment = attachment_collection.Item(attachment_index)
                         original_name = _safe_text(
                             _safe_attribute(attachment, "FileName")
                         ) or "document.pdf"
-                        if Path(original_name).suffix.casefold() != ".pdf":
+                        suffix = Path(original_name).suffix.casefold()
+                        if suffix not in SUPPORTED_INPUT_EXTENSIONS:
                             continue
-                        pdf_count += 1
+                        supported_count += 1
                         size_bytes = int(
                             _safe_attribute(attachment, "Size", 0) or 0
                         )
@@ -1670,13 +1673,13 @@ class PyWin32OutlookGateway:
                             staging_dir
                             / (
                                 f"{source_key[:20]}_"
-                                f"{attachment_index:03d}.pdf.part"
+                                f"{attachment_index:03d}{suffix}.part"
                             )
                         )
                         temporary_path_text = str(temporary_path)
                         error_message = ""
                         if size_bytes > max_attachment_bytes:
-                            error_message = "PDF превышает допустимый размер"
+                            error_message = "Документ превышает допустимый размер"
                         else:
                             try:
                                 attachment.SaveAsFile(str(temporary_path))
@@ -1698,7 +1701,7 @@ class PyWin32OutlookGateway:
                             sender_smtp=sender_smtp,
                             received_at=received_time.isoformat(),
                             attachment_count=attachment_count,
-                            pdf_attachment_count=pdf_count,
+                            pdf_attachment_count=supported_count,
                             attachments=tuple(attachments),
                             original_sender_smtp=original_sender_smtp,
                         )
@@ -3298,17 +3301,19 @@ class OutlookInboxImporter:
         return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
     @staticmethod
-    def _hash_existing_pdf(path: Path, max_bytes: int) -> tuple[str, int]:
+    def _hash_existing_document(
+        path: Path,
+        max_bytes: int,
+        suffix: str,
+    ) -> tuple[str, int]:
         digest = hashlib.sha256()
         total = 0
+        validate_input_document(path, suffix)
         with path.open("rb") as stream:
-            if stream.read(5) != b"%PDF-":
-                raise StorageError("Сохранённый файл не имеет сигнатуру PDF")
-            stream.seek(0)
             while chunk := stream.read(1024 * 1024):
                 total += len(chunk)
                 if total > max_bytes:
-                    raise StorageError("PDF превышает допустимый размер")
+                    raise StorageError("Документ превышает допустимый размер")
                 digest.update(chunk)
         return digest.hexdigest(), total
 
@@ -3552,14 +3557,19 @@ class OutlookInboxImporter:
                             message_dir
                             / f"{attachment.attachment_index:03d}_{safe_name}"
                         )
+                        suffix = Path(safe_name).suffix.casefold()
                         if destination.exists():
-                            existing_digest, existing_size = self._hash_existing_pdf(
-                                destination,
-                                self.settings.max_upload_bytes,
+                            existing_digest, existing_size = (
+                                self._hash_existing_document(
+                                    destination,
+                                    self.settings.max_upload_bytes,
+                                    suffix,
+                                )
                             )
-                            source_digest, _ = self._hash_existing_pdf(
+                            source_digest, _ = self._hash_existing_document(
                                 source,
                                 self.settings.max_upload_bytes,
+                                suffix,
                             )
                             if existing_digest != source_digest:
                                 raise StorageError(
@@ -3568,10 +3578,11 @@ class OutlookInboxImporter:
                             digest, size_bytes = existing_digest, existing_size
                         else:
                             with source.open("rb") as stream:
-                                digest, size_bytes = save_pdf_stream(
+                                digest, size_bytes = save_input_stream(
                                     stream,
                                     destination,
                                     self.settings.max_upload_bytes,
+                                    suffix,
                                 )
                             saved_attachments += 1
                         existing_upload = self.db.fetch_one(
@@ -3602,7 +3613,7 @@ class OutlookInboxImporter:
                         )
                     except Exception as exc:
                         message_errors += 1
-                        error_text = str(exc)[:300] or "Ошибка сохранения PDF"
+                        error_text = str(exc)[:300] or "Ошибка сохранения документа"
                         errors.append(error_text)
                         self._upsert_attachment(
                             message.source_key,
@@ -3614,7 +3625,7 @@ class OutlookInboxImporter:
                     message,
                     status="technical_error" if message_errors else "completed",
                     error_message=(
-                        f"Не обработано PDF: {message_errors}"
+                        f"Не обработано документов: {message_errors}"
                         if message_errors
                         else ""
                     ),

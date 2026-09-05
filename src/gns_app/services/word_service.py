@@ -16,6 +16,7 @@ from lxml import etree
 
 from gns_app.services.name_service import NameService
 from gns_app.services.taxpayer_service import response_taxpayer_name
+from gns_app.text_cleanup import clean_location
 
 
 class WordTemplateError(ValueError):
@@ -248,7 +249,7 @@ class WordTemplateService:
 
         replacements = {
             self.TOKENS["today"]: self._format_date(date.today()),
-            self.TOKENS["district"]: case["district_place"].strip(),
+            self.TOKENS["district"]: clean_location(case["district_place"]),
             self.TOKENS["position"]: self.names.position_display(
                 case["recipient_position"]
             ),
@@ -372,9 +373,9 @@ class WordTemplateService:
             raise WordTemplateError("Нет подтверждённых налогоплательщиков")
         for taxpayer in taxpayers:
             inn = re.sub(r"\D", "", taxpayer.get("inn", ""))
-            if len(inn) != 14 or not taxpayer.get("name", "").strip():
+            if not inn or not taxpayer.get("name", "").strip():
                 raise WordTemplateError(
-                    "У каждого налогоплательщика нужны наименование и 14-значный ИНН"
+                    "У каждого налогоплательщика нужны наименование и ИНН"
                 )
 
     @staticmethod

@@ -331,6 +331,70 @@ def test_reopen_route_uses_the_normal_review_page(workflow, monkeypatch):
     assert response.headers["location"] == f"/review/{page_id}"
 
 
+def test_restart_returns_one_case_to_full_manual_review(workflow):
+    case_id, page_id = _insert_orphaned_scan_case(workflow, "restart")
+    now = utc_now()
+    workflow.db.execute(
+        """
+        UPDATE cases
+        SET fields_confirmed = 1, status = 'ready_for_response',
+            abs_status = 'not_found', response_status = 'grouped',
+            response_path = 'old-response.docx', updated_at = ?
+        WHERE id = ?
+        """,
+        (now, case_id),
+    )
+    workflow.db.execute(
+        """
+        UPDATE taxpayers
+        SET manually_confirmed = 1, abs_result = 'not_found',
+            odb_result = 'not_found', registry_status = 'found',
+            registry_name = 'Старые данные', updated_at = ?
+        WHERE case_id = ?
+        """,
+        (now, case_id),
+    )
+
+    page = workflow.restart_case_manual_review(
+        case_id, actor="Тестовый сотрудник"
+    )
+
+    assert page["id"] == page_id
+    assert page["status"] == "needs_review"
+    assert page["manual_confirmed"] == 0
+    restarted = workflow.get_case(case_id)
+    assert restarted["status"] == "needs_review"
+    assert restarted["fields_confirmed"] == 0
+    assert restarted["abs_status"] == "not_checked"
+    assert restarted["response_path"] is None
+    taxpayer = workflow.get_taxpayers(case_id)[0]
+    assert taxpayer["manually_confirmed"] == 0
+    assert taxpayer["abs_result"] is None
+    assert taxpayer["odb_result"] is None
+    assert taxpayer["registry_status"] is None
+    events = workflow.db.fetch_all(
+        "SELECT event_type FROM audit_events WHERE entity_id = ?", (case_id,)
+    )
+    assert "case_manual_review_restarted" in {
+        event["event_type"] for event in events
+    }
+
+
+def test_restart_route_opens_the_same_manual_form(workflow, monkeypatch):
+    from starlette.testclient import TestClient
+
+    case_id, page_id = _insert_orphaned_scan_case(workflow, "restart-route")
+    monkeypatch.setattr(main, "workflow", workflow)
+
+    response = TestClient(main.app).post(
+        f"/cases/{case_id}/restart-manual-review",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/review/{page_id}"
+
+
 def test_marking_reopened_scan_case_as_other_removes_the_orphan(workflow):
     case_id, page_id = _insert_orphaned_scan_case(workflow, "cleanup")
     workflow.reopen_incomplete_case_review(case_id)

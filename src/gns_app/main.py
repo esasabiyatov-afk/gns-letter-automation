@@ -48,7 +48,6 @@ from gns_app.services.outlook_service import (
 from gns_app.services.registry_service import RegistryLookupError
 from gns_app.services.scanner_service import ScannerCancelled, ScannerError
 from gns_app.services.taxpayer_service import TaxpayerKind, classify_taxpayer
-from gns_app.services.windows_focus import start_foreground_watcher
 from gns_app.services.word_desktop import WordDesktopError, open_word_document
 from gns_app.services.workflow import (
     WorkflowService,
@@ -170,7 +169,7 @@ async def _run_automated_outlook_import(*, claimed: bool = False) -> bool:
         state = "warning" if error_count else "success"
         message = (
             f"Проверка завершена. Новых писем: {summary['new_messages']}; "
-            f"сохранено PDF: {summary['saved_attachments']}; ошибок: {error_count}."
+            f"сохранено документов: {summary['saved_attachments']}; ошибок: {error_count}."
         )
         outlook_importer.record_automation_status(
             state=state,
@@ -377,6 +376,7 @@ ABS_STATUS_LABELS = {
     "auth_error": "ошибка входа",
     "unavailable": "АБС недоступна",
     "technical_error": "техническая ошибка",
+    "invalid_inn": "пропущена: ИНН не содержит 14 цифр",
 }
 
 ODB_STATUS_LABELS = {
@@ -396,7 +396,7 @@ REGISTRY_STATUS_LABELS = {
 }
 
 EVENT_LABELS = {
-    "upload_registered": "PDF зарегистрирован",
+    "upload_registered": "Документ зарегистрирован",
     "upload_reprocess_requested": "Запрошена повторная обработка",
     "page_reprocess_requested": "Запрошена повторная обработка страницы",
     "precise_ocr_requested": "Запрошен точный OCR",
@@ -417,6 +417,7 @@ EVENT_LABELS = {
     "page_reopened_for_case_review": "Лист возвращён на ручную проверку",
     "fake_abs_checked": "Выполнена тестовая проверка АБС",
     "abs_checked": "Выполнена проверка АБС Tolubay",
+    "abs_skipped_invalid_inn": "АБС пропущена: нестандартная длина ИНН",
     "fake_abs_startup_rolled_back": "Отменена массовая автопроверка АБС",
     "fake_abs_batch_checked": "Выполнена пакетная проверка АБС",
     "abs_batch_checked": "Выполнена пакетная проверка АБС Tolubay",
@@ -465,6 +466,7 @@ EVENT_LABELS = {
     "district_place_edge_noise_removed": (
         "Удалены лишние краевые символы в реквизите ГНС"
     ),
+    "district_place_normalized": "Нормализовано написание района или города",
     "response_regenerated_after_cleanup": (
         "Ответ пересоздан после очистки реквизита ГНС"
     ),
@@ -476,7 +478,7 @@ EVENT_LABELS = {
 }
 
 ENTITY_LABELS = {
-    "upload": "PDF",
+    "upload": "Документ",
     "page": "Страница",
     "case": "Обращение",
     "settings": "Настройка",
@@ -1015,7 +1017,7 @@ def update_outlook_import_settings(
         )
     started = _queue_outlook_import(background_tasks)
     message = (
-        "Настройки Outlook сохранены. Получение PDF запущено."
+        "Настройки Outlook сохранены. Получение документов запущено."
         if started
         else "Настройки Outlook сохранены. Проверка почты уже выполняется."
     )
@@ -1184,14 +1186,14 @@ def reset_processing_data(
 
     if action == "rescan":
         message = (
-            f"Обработка сброшена. Заново загружено PDF: {len(imported)}; "
+            f"Обработка сброшена. Заново загружено документов: {len(imported)}; "
             f"ошибок: {len(errors)}."
         )
         destination = "/"
         fragment = ""
     else:
         message = (
-            "Данные обработки очищены. Исходные PDF в папке входящих сохранены."
+            "Данные обработки очищены. Исходные документы в папке входящих сохранены."
         )
         destination = "/settings"
         fragment = "#service"
@@ -1584,7 +1586,7 @@ def finalize_response_scan_session(
         )
     return RedirectResponse(
         "/today?message="
-        + quote("PDF создан. Откройте его и подтвердите подписи и печать.")
+        + quote("Скан сохранён и готов для подготовки письма в Outlook.")
         + f"#group-{quote(group_id)}",
         status_code=303,
     )
@@ -1634,7 +1636,7 @@ def upload_response_letter_scan(
         scan_file.file.close()
     return RedirectResponse(
         "/today?message="
-        + quote("Документ загружен. Откройте его и завершите проверку.")
+        + quote("Скан сохранён и готов для подготовки письма в Outlook.")
         + f"#group-{quote(group_id)}",
         status_code=303,
     )
@@ -1657,6 +1659,7 @@ def download_signed_response_scan(scan_id: str):
     return FileResponse(
         path,
         media_type="application/pdf",
+        filename=workflow.signed_scan_download_filename(scan_id),
     )
 
 
@@ -1714,7 +1717,7 @@ def download_grouped_response(group_id: str):
             "application/vnd.openxmlformats-officedocument."
             "wordprocessingml.document"
         ),
-        filename=path.name,
+        filename=workflow.response_group_download_filename(group_id),
     )
 
 
@@ -1733,12 +1736,6 @@ def open_grouped_response_for_print(group_id: str):
         )
         if not path.exists():
             raise OSError("missing response")
-        start_foreground_watcher(
-            title_parts=(path.stem,),
-            class_parts=("opusapp",),
-            timeout_seconds=20,
-            keep_foreground_seconds=2.0,
-        )
         open_word_document(path)
         workflow.mark_response_group_opened_for_print(
             group_id,
@@ -1824,7 +1821,7 @@ def scan_inbox(background_tasks: BackgroundTasks):
     for upload_id in summary["imported"]:
         background_tasks.add_task(workflow.process_upload, upload_id)
     message = (
-        f"Папка проверена. Загружено PDF: {len(summary['imported'])}; "
+        f"Папка проверена. Загружено документов: {len(summary['imported'])}; "
         f"пропущено повторов: {len(summary['skipped'])}; "
         f"ошибок: {len(summary['errors'])}."
     )
@@ -1844,7 +1841,7 @@ def upload_detail(
 ):
     upload = workflow.get_upload(upload_id)
     if not upload:
-        raise HTTPException(404, "PDF не найден")
+        raise HTTPException(404, "Документ не найден")
     pages = workflow.get_upload_pages(upload_id)
     selected_index = next(
         (
@@ -1864,7 +1861,7 @@ def upload_detail(
             -1,
         )
         if selected_index < 0:
-            raise HTTPException(404, "Страница не найдена в этом PDF")
+            raise HTTPException(404, "Страница не найдена в этом документе")
     selected_page = pages[selected_index] if pages else None
     return templates.TemplateResponse(
         request,
@@ -2360,6 +2357,21 @@ def reopen_incomplete_case_review(case_id: str):
     return RedirectResponse(f"/review/{page['id']}", status_code=303)
 
 
+@app.post("/cases/{case_id}/restart-manual-review")
+def restart_case_manual_review(case_id: str):
+    try:
+        page = workflow.restart_case_manual_review(
+            case_id,
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            f"/cases/{case_id}?error={quote(str(exc))}",
+            status_code=303,
+        )
+    return RedirectResponse(f"/review/{page['id']}", status_code=303)
+
+
 @app.get("/cases/{case_id}", response_class=HTMLResponse)
 def case_detail(
     request: Request,
@@ -2451,6 +2463,15 @@ def correct_taxpayer(
             status_code=303,
         )
 
+    if result.get("invalid_inn"):
+        message = quote(
+            "ИНН сохранён как в письме. В нём не 14 цифр: АБС пропущена, "
+            "но подготовка ответа доступна."
+        )
+        return RedirectResponse(
+            f"/cases/{case_id}?message={message}",
+            status_code=303,
+        )
     if result["requires_abs_recheck"]:
         message = quote(
             "ИНН исправлен. Результат прежней проверки сброшен — проверьте обращение в АБС повторно."

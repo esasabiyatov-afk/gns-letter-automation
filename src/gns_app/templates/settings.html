@@ -52,9 +52,9 @@
           <p>Локальные источники входящих и подписанных ответов.</p>
         </header>
         <label class="field setting-field">
-            <span>Папка входящих PDF</span>
+            <span>Папка входящих документов</span>
             <input name="inbox_dir" value="{{ inbox_dir }}" required>
-            <small>Из этой папки команда «Проверить папку» забирает новые PDF.</small>
+            <small>Поддерживаются PDF, BMP, PNG, JPG и JPEG.</small>
         </label>
         <div class="settings-field-grid settings-field-grid-compact"
              data-testid="scanner-settings">
@@ -277,7 +277,7 @@
           <input type="checkbox" name="outlook_auto_enabled" value="true"
                  {% if outlook_auto_enabled %}checked{% endif %}>
           <span>
-            <strong>Автоматически загружать новые PDF</strong>
+            <strong>Автоматически загружать новые документы</strong>
             <small>{{ outlook_auto_status.message }}</small>
           </span>
         </label>
@@ -305,8 +305,8 @@
       {% endif %}
       <dl class="detail-list outlook-import-stats">
         <div><dt>Учтено писем</dt><dd>{{ outlook_import_stats.messages }}</dd></div>
-        <div><dt>С PDF</dt><dd>{{ outlook_import_stats.completed }}</dd></div>
-        <div><dt>Без PDF</dt><dd>{{ outlook_import_stats.no_pdf }}</dd></div>
+        <div><dt>С документами</dt><dd>{{ outlook_import_stats.completed }}</dd></div>
+        <div><dt>Без документов</dt><dd>{{ outlook_import_stats.no_pdf }}</dd></div>
         <div><dt>С ошибкой</dt><dd>{{ outlook_import_stats.errors }}</dd></div>
       </dl>
     </details>
@@ -337,19 +337,19 @@
         <h2>Сброс обработки</h2>
         <p>
           Удаляются рабочие копии, результаты распознавания, проверки и ответы.
-          Настройки, справочники и исходные PDF в папке входящих сохраняются.
+          Настройки, справочники и исходные документы в папке входящих сохраняются.
         </p>
       </header>
       <form method="post" action="/settings/reset-processing"
             class="settings-action-row">
         <button class="button button-secondary" type="submit"
                 name="action" value="clear"
-                onclick="return confirm('Очистить все данные обработки? Исходные PDF в папке входящих останутся.');">
+                onclick="return confirm('Очистить все данные обработки? Исходные документы в папке входящих останутся.');">
           Очистить обработку
         </button>
         <button class="button button-danger" type="submit"
                 name="action" value="rescan"
-                onclick="return confirm('Очистить данные и заново обработать все PDF из выбранной папки?');">
+                onclick="return confirm('Очистить данные и заново обработать все документы из выбранной папки?');">
           Очистить и обработать заново
         </button>
       </form>

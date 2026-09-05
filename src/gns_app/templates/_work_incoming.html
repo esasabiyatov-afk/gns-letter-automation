@@ -3,7 +3,7 @@
     <div>
       <h2>Входящие письма</h2>
       <p>
-        Всего PDF: {{ incoming_page.total }} ·
+        Всего документов: {{ incoming_page.total }} ·
         {% if outlook_auto_enabled %}
           Автопроверка включена{% if outlook_auto_status.checked_at %} · {{ outlook_auto_status.checked_at[:16].replace('T', ' ') }}{% endif %}
         {% else %}
@@ -18,7 +18,7 @@
         <label>
           <span>По дате</span>
           <select name="incoming_sort" data-auto-submit
-                  aria-label="Сортировка входящих PDF по дате">
+                  aria-label="Сортировка входящих документов по дате">
             <option value="newest" {% if incoming_sort == 'newest' %}selected{% endif %}>Сначала новые</option>
             <option value="oldest" {% if incoming_sort == 'oldest' %}selected{% endif %}>Сначала старые</option>
           </select>
@@ -39,14 +39,14 @@
           <form action="/uploads" method="post" enctype="multipart/form-data"
                 class="compact-upload-form">
             <label class="field">
-              <span>PDF с письмами</span>
-              <input id="pdf-file" name="file" type="file"
-                     accept="application/pdf,.pdf" required
+              <span>Письмо: PDF или изображение</span>
+              <input id="document-file" name="file" type="file"
+                     accept="application/pdf,image/bmp,image/png,image/jpeg,.pdf,.bmp,.png,.jpg,.jpeg" required
                      {% if not active_employee %}disabled{% endif %}>
             </label>
             <button class="button button-primary" type="submit"
                     {% if not active_employee %}disabled{% endif %}>
-              Загрузить PDF
+              Загрузить документ
             </button>
           </form>
           <div class="compact-divider"></div>

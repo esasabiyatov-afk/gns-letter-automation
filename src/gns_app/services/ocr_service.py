@@ -240,7 +240,7 @@ class OcrService:
             return ""
         try:
             with Image.open(image_path) as source:
-                base = source.convert("L")
+                base = ImageOps.exif_transpose(source).convert("L")
         except OSError:
             return ""
 
@@ -395,7 +395,8 @@ class OcrService:
         # Цвет сохраняется: он помогает Tesseract отделить чёрный печатный
         # текст от синих печатей и подписей. Для чёрно-белых сканов поведение
         # остаётся тем же.
-        source_image = Image.open(image_path).convert("RGB")
+        with Image.open(image_path) as source:
+            source_image = ImageOps.exif_transpose(source).convert("RGB")
         image = ImageOps.autocontrast(source_image, cutoff=1).filter(
             ImageFilter.UnsharpMask(radius=1.1, percent=115, threshold=4)
         )

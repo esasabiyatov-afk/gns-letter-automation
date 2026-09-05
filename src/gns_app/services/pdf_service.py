@@ -45,6 +45,41 @@ class PdfService:
             raise PdfProcessingError("PDF не содержит страниц")
         return count
 
+    def image_to_pdf(self, image_path: Path, output_path: Path) -> Path:
+        """Create a one-page working PDF while preserving the source image."""
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output_path.with_name(f".{output_path.name}.{uuid4().hex}.part")
+        try:
+            with Image.open(image_path) as source:
+                image = ImageOps.exif_transpose(source)
+                if image.mode in {"RGBA", "LA"} or (
+                    image.mode == "P" and "transparency" in image.info
+                ):
+                    rgba = image.convert("RGBA")
+                    flattened = Image.new("RGB", rgba.size, "white")
+                    flattened.paste(rgba, mask=rgba.getchannel("A"))
+                    image = flattened
+                else:
+                    image = image.convert("RGB")
+                image.save(
+                    temporary,
+                    format="PDF",
+                    resolution=200.0,
+                    quality=95,
+                    subsampling=0,
+                )
+            self.page_count(temporary)
+            os.replace(temporary, output_path)
+            return output_path
+        except PdfProcessingError:
+            temporary.unlink(missing_ok=True)
+            raise
+        except Exception as exc:
+            temporary.unlink(missing_ok=True)
+            raise PdfProcessingError(
+                f"Не удалось подготовить изображение для обработки: {exc}"
+            ) from exc
+
     def render_page(
         self,
         pdf_path: Path,

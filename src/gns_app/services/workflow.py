@@ -23,6 +23,7 @@ from gns_app.config import Settings
 from gns_app.database import Database, utc_now
 from gns_app.diagnostics import record_event, record_exception
 from gns_app.domain import (
+    AbsCheckResult,
     AbsStatus,
     CaseStatus,
     OdbStatus,
@@ -63,8 +64,11 @@ from gns_app.services.scanner_service import (
 )
 from gns_app.services.visual_classifier import PageVisualAnalyzer
 from gns_app.services.storage import (
+    IMAGE_INPUT_EXTENSIONS,
+    SUPPORTED_INPUT_EXTENSIONS,
     ensure_within,
     sanitize_filename,
+    save_input_stream,
     save_pdf_stream,
 )
 from gns_app.services.taxpayer_service import (
@@ -96,12 +100,6 @@ class WorkflowService:
     PROCESSING_WORKERS_SETTING = "processing_workers"
     SCANNER_DPI_SETTING = "scanner_dpi"
     SCANNER_COLOR_MODE_SETTING = "scanner_color_mode"
-    # Город Ош — отдельная административная единица. Упоминание Ошской
-    # области в той же фразе противоречит городскому маршруту и не может
-    # автоматически выбрать его по частичному совпадению.
-    INDEPENDENT_CITY_REGION_CONFLICTS = {
-        "по г ош": "ошской области",
-    }
     UI_SETTING_DEFAULTS = {
         "allow_multiple_taxpayers": False,
         "show_recipient_salutation": True,
@@ -115,7 +113,7 @@ class WorkflowService:
             while chunk := source.read(1024 * 1024):
                 digest.update(chunk)
         return digest.hexdigest()
-    OFFICIAL_PARSER_VERSION = 3
+    OFFICIAL_PARSER_VERSION = 4
     BUSINESS_TIMEZONE = timezone(timedelta(hours=6), "Asia/Bishkek")
     DEFAULT_GNS_OFFICES_PATH = (
         Path(__file__).resolve().parents[1]
@@ -670,7 +668,7 @@ class WorkflowService:
     def initialize_gns_offices(self) -> int:
         if not self.DEFAULT_GNS_OFFICES_PATH.is_file():
             return 0
-        source_hash = "district-v3:" + hashlib.sha256(
+        source_hash = "district-v5:" + hashlib.sha256(
             self.DEFAULT_GNS_OFFICES_PATH.read_bytes()
         ).hexdigest()
         row = self.db.fetch_one("SELECT COUNT(*) AS count FROM gns_offices")
@@ -861,11 +859,6 @@ class WorkflowService:
             district = self._normalize_office_text(
                 office.get("district_place") or ""
             )
-            prohibited_region = self.INDEPENDENT_CITY_REGION_CONFLICTS.get(
-                district
-            )
-            if prohibited_region and prohibited_region in normalized_text:
-                continue
             if any(term in normalized_text for term in normalized_terms):
                 matches.append(office)
         return matches[0] if len(matches) == 1 else None
@@ -1299,23 +1292,40 @@ class WorkflowService:
     ) -> str:
         upload_id = uuid4().hex
         safe_name = sanitize_filename(original_filename)
-        if Path(safe_name).suffix.casefold() != ".pdf":
-            raise WorkflowValidationError("Разрешены только PDF-файлы")
+        suffix = Path(safe_name).suffix.casefold()
+        if suffix not in SUPPORTED_INPUT_EXTENSIONS:
+            raise WorkflowValidationError(
+                "Разрешены PDF, BMP, PNG, JPG и JPEG"
+            )
         if intake_source not in self.INTAKE_SOURCES:
-            raise WorkflowValidationError("Неизвестный источник PDF")
+            raise WorkflowValidationError("Неизвестный источник документа")
 
         upload_dir = self.settings.uploads_dir / upload_id
         stored_path = upload_dir / "source.pdf"
-        digest, _ = save_pdf_stream(
-            stream,
-            stored_path,
-            self.settings.max_upload_bytes,
-        )
+        original_path = stored_path
+        if suffix == ".pdf":
+            digest, _ = save_pdf_stream(
+                stream,
+                stored_path,
+                self.settings.max_upload_bytes,
+            )
+        else:
+            original_path = upload_dir / f"source{suffix}"
+            digest, _ = save_input_stream(
+                stream,
+                original_path,
+                self.settings.max_upload_bytes,
+                suffix,
+            )
         try:
+            if suffix in IMAGE_INPUT_EXTENSIONS:
+                self.pdf.image_to_pdf(original_path, stored_path)
             page_count = self.pdf.page_count(stored_path)
         except Exception:
             stored_path.unlink(missing_ok=True)
-            upload_dir.rmdir()
+            original_path.unlink(missing_ok=True)
+            if upload_dir.exists():
+                upload_dir.rmdir()
             raise
 
         created_at = utc_now()
@@ -1371,6 +1381,19 @@ class WorkflowService:
         )
         return upload_id
 
+    def _original_input_image(self, upload: dict[str, Any]) -> Path | None:
+        suffix = Path(
+            str(upload.get("original_filename") or "")
+        ).suffix.casefold()
+        if suffix not in IMAGE_INPUT_EXTENSIONS:
+            return None
+        candidate = Path(upload["stored_path"]).parent / f"source{suffix}"
+        try:
+            candidate = ensure_within(candidate, self.settings.uploads_dir)
+        except ValueError:
+            return None
+        return candidate if candidate.is_file() else None
+
     def import_inbox(self, max_files: int = 200) -> dict[str, Any]:
         if not self.get_active_employee():
             raise WorkflowValidationError(
@@ -1382,7 +1405,8 @@ class WorkflowService:
             (
                 path
                 for path in inbox.rglob("*")
-                if path.is_file() and path.suffix.casefold() == ".pdf"
+                if path.is_file()
+                and path.suffix.casefold() in SUPPORTED_INPUT_EXTENSIONS
             ),
             key=lambda path: str(path).casefold(),
         )[:max_files]
@@ -1400,7 +1424,7 @@ class WorkflowService:
                         total += len(chunk)
                         if total > self.settings.max_upload_bytes:
                             raise WorkflowValidationError(
-                                "PDF превышает допустимый размер"
+                                "Документ превышает допустимый размер"
                             )
                         digest.update(chunk)
                 existing = self.db.fetch_one(
@@ -2228,12 +2252,18 @@ class WorkflowService:
             / upload["id"]
             / f".page-{page['page_number']:04d}-{page_id}-best.png"
         )
+        remove_output = True
         try:
-            self.pdf.render_page_high_resolution(
-                Path(upload["stored_path"]),
-                page["page_number"],
-                output_path,
-            )
+            original_image = self._original_input_image(upload)
+            if original_image is None:
+                self.pdf.render_page_high_resolution(
+                    Path(upload["stored_path"]),
+                    page["page_number"],
+                    output_path,
+                )
+            else:
+                output_path = original_image
+                remove_output = False
             result = self.ocr.recognize(
                 Path(upload["stored_path"]),
                 page["page_number"],
@@ -2288,7 +2318,8 @@ class WorkflowService:
                 {"model": "best", "error": str(exc)[:300]},
             )
         finally:
-            output_path.unlink(missing_ok=True)
+            if remove_output:
+                output_path.unlink(missing_ok=True)
 
     def _process_page(
         self, upload: dict[str, Any], page: dict[str, Any]
@@ -2337,6 +2368,7 @@ class WorkflowService:
         )
 
         source_pdf = Path(upload["stored_path"])
+        original_image = self._original_input_image(upload)
         qr_result = self.qr.decode(preview_path)
         if qr_result.status == QrStatus.NOT_FOUND:
             enhanced_qr = self.qr.decode(enhanced_path)
@@ -2347,6 +2379,15 @@ class WorkflowService:
                     else "enhanced"
                 )
                 qr_result = enhanced_qr
+        if qr_result.status != QrStatus.FOUND and original_image is not None:
+            original_qr = self.qr.decode(original_image)
+            if original_qr.status != QrStatus.NOT_FOUND:
+                original_qr.method = (
+                    f"original-image-{original_qr.method}"
+                    if original_qr.method
+                    else "original-image"
+                )
+                qr_result = original_qr
         high_resolution_path = preview_dir / (
             f".page-{page_number:04d}-{page_id}-highres.png"
         )
@@ -2463,7 +2504,7 @@ class WorkflowService:
             )
             high_resolution_path.unlink(missing_ok=True)
         else:
-            ocr_image_path = ensure_high_resolution(
+            ocr_image_path = original_image or ensure_high_resolution(
                 "ocr_high_resolution_render_failed"
             ) or rendered.preview_path
             try:
@@ -3686,9 +3727,9 @@ class WorkflowService:
         for index, taxpayer in enumerate(taxpayers, 1):
             name = clean_taxpayer_name(taxpayer.get("name", ""))
             inn = re.sub(r"\D", "", taxpayer.get("inn", ""))
-            if not name or len(inn) != 14:
+            if not name or not inn:
                 raise WorkflowValidationError(
-                    f"Налогоплательщик {index}: нужно наименование и 14 цифр ИНН"
+                    f"Налогоплательщик {index}: нужны наименование и ИНН"
                 )
             clean.append({"name": name, "inn": inn})
         return clean
@@ -3744,6 +3785,70 @@ class WorkflowService:
         if not taxpayers:
             raise WorkflowValidationError("Нет налогоплательщиков")
 
+        valid_taxpayers = [
+            taxpayer
+            for taxpayer in taxpayers
+            if len(re.sub(r"\D", "", taxpayer.get("inn") or "")) == 14
+        ]
+        invalid_taxpayers = [
+            taxpayer
+            for taxpayer in taxpayers
+            if len(re.sub(r"\D", "", taxpayer.get("inn") or "")) != 14
+        ]
+        if not valid_taxpayers:
+            now = utc_now()
+            self.db.execute(
+                "UPDATE taxpayers SET abs_result = ?, "
+                "abs_account_result = NULL, abs_active_account_count = NULL, "
+                "abs_closed_account_count = NULL, odb_result = NULL, "
+                "updated_at = ? "
+                "WHERE case_id = ?",
+                (AbsStatus.INVALID_INN, now, case_id),
+            )
+            threshold = self.get_period_threshold()
+            start = (
+                date.fromisoformat(case["period_start"])
+                if case.get("period_start")
+                else None
+            )
+            next_status = (
+                CaseStatus.MANUAL_PERIOD_RULE
+                if case.get("period_route") == "odb"
+                or (start is not None and start < threshold)
+                else CaseStatus.READY_FOR_RESPONSE
+            )
+            self.db.execute(
+                "UPDATE cases SET status = ?, abs_status = ?, updated_at = ? "
+                "WHERE id = ?",
+                (next_status, AbsStatus.INVALID_INN, now, case_id),
+            )
+            result = AbsCheckResult(
+                status=AbsStatus.INVALID_INN,
+                taxpayers=[
+                    {
+                        "inn": taxpayer["inn"],
+                        "name": taxpayer["name"],
+                        "result": AbsStatus.INVALID_INN,
+                    }
+                    for taxpayer in invalid_taxpayers
+                ],
+                message=(
+                    "Проверка АБС пропущена: ИНН не содержит 14 цифр. "
+                    "Сотрудник должен сверить его с письмом."
+                ),
+                is_fake=self.abs_is_fake(),
+            )
+            self.db.audit(
+                "case",
+                case_id,
+                "abs_skipped_invalid_inn",
+                {
+                    "taxpayer_count": len(invalid_taxpayers),
+                    "next_status": next_status,
+                },
+            )
+            return result
+
         username = username.strip()
         session_reused = False
         if not username or not password:
@@ -3776,7 +3881,7 @@ class WorkflowService:
             },
         )
         try:
-            result = self.abs.check(username, password, taxpayers)
+            result = self.abs.check(username, password, valid_taxpayers)
         except Exception as exc:
             self._clear_abs_session()
             self.db.execute(
@@ -3807,6 +3912,14 @@ class WorkflowService:
                 },
             )
             raise
+        result.taxpayers.extend(
+            {
+                "inn": taxpayer["inn"],
+                "name": taxpayer["name"],
+                "result": AbsStatus.INVALID_INN,
+            }
+            for taxpayer in invalid_taxpayers
+        )
         failed_statuses = {
             AbsStatus.AUTH_ERROR,
             AbsStatus.UNAVAILABLE,
@@ -3900,6 +4013,13 @@ class WorkflowService:
         case = self.get_case(case_id)
         if not case or case.get("status") != CaseStatus.READY_FOR_ABS:
             return False
+        taxpayers = self.get_taxpayers(case_id)
+        if taxpayers and all(
+            len(re.sub(r"\D", "", taxpayer.get("inn") or "")) != 14
+            for taxpayer in taxpayers
+        ):
+            self.check_abs(case_id)
+            return True
         if self.abs_is_fake():
             self.check_abs(case_id, "local-auto", "local-auto")
             self._clear_abs_session()
@@ -3966,7 +4086,8 @@ class WorkflowService:
         refreshed = self.get_taxpayers(case_id)
         all_absent = all(
             (
-                taxpayer.get("abs_result") == AbsStatus.NOT_FOUND
+                taxpayer.get("abs_result")
+                in {AbsStatus.NOT_FOUND, AbsStatus.INVALID_INN}
                 or taxpayer.get("abs_account_result") == "not_found"
             )
             and taxpayer.get("odb_result") == OdbStatus.NOT_FOUND
@@ -4054,7 +4175,8 @@ class WorkflowService:
         )
         all_absent = all(
             (
-                item.get("abs_result") == AbsStatus.NOT_FOUND
+                item.get("abs_result")
+                in {AbsStatus.NOT_FOUND, AbsStatus.INVALID_INN}
                 or item.get("abs_account_result") == "not_found"
             )
             and item.get("odb_result") == OdbStatus.NOT_FOUND
@@ -4128,7 +4250,8 @@ class WorkflowService:
             item.get("abs_account_result") == "found" for item in refreshed
         )
         all_absent = all(
-            item.get("abs_result") == AbsStatus.NOT_FOUND
+            item.get("abs_result")
+            in {AbsStatus.NOT_FOUND, AbsStatus.INVALID_INN}
             or item.get("abs_account_result") == "not_found"
             for item in refreshed
         )
@@ -4684,6 +4807,7 @@ class WorkflowService:
             extra_where = (
                 "cases.status = 'ready_for_response' "
                 "AND (taxpayers.abs_result = 'not_found' "
+                "OR taxpayers.abs_result = 'invalid_inn' "
                 "OR taxpayers.abs_account_result = 'not_found')"
             )
         else:
@@ -4802,6 +4926,7 @@ class WorkflowService:
                     "case_ids": [],
                     "taxpayers": [],
                     "issues": [],
+                    "warnings": [],
                     "_positions": set(),
                     "_display_names": set(),
                     "_employees": set(),
@@ -4824,6 +4949,13 @@ class WorkflowService:
             )
 
             inn = re.sub(r"\D", "", row.get("taxpayer_inn") or "")
+            if len(inn) != 14:
+                warning = (
+                    f"ИНН содержит {len(inn)} цифр вместо 14. "
+                    "Сверьте его с исходным письмом."
+                )
+                if warning not in group["warnings"]:
+                    group["warnings"].append(warning)
             raw_name = " ".join(
                 (row.get("taxpayer_name") or "").split()
             )
@@ -5040,9 +5172,10 @@ class WorkflowService:
             )
 
         group_id = uuid4().hex
-        output = (
-            self.settings.responses_dir
-            / f"response-group-{day.isoformat()}-{group_id}.docx"
+        output = self.settings.responses_dir / self._response_word_filename(
+            group["recipient_display_name"],
+            day.isoformat(),
+            group_id,
         )
         case_snapshot = {
             "district_place": group["district_place"],
@@ -5191,6 +5324,74 @@ class WorkflowService:
             "SELECT * FROM response_groups WHERE id = ?",
             (group_id,),
         )
+
+    @staticmethod
+    def _filename_part(value: str | None, fallback: str) -> str:
+        normalized = re.sub(r"\s+", " ", str(value or "")).strip()
+        cleaned = Path(sanitize_filename(normalized or fallback)).stem
+        return cleaned[:72].strip(" ._") or fallback
+
+    @classmethod
+    def _response_word_filename(
+        cls,
+        recipient_display_name: str | None,
+        date_label: str,
+        unique_id: str,
+    ) -> str:
+        recipient = cls._filename_part(recipient_display_name, "адресат")
+        return sanitize_filename(
+            f"Ответ_{recipient}_{date_label}_{unique_id[:6]}.docx"
+        )
+
+    @classmethod
+    def _signed_scan_filename(cls, letter: dict[str, Any]) -> str:
+        recipient = cls._filename_part(
+            letter.get("recipient_display_name"), "адресат"
+        )
+        outgoing_number = str(letter.get("outgoing_number") or "").strip()
+        document_mark = (
+            f"исх-{cls._filename_part(outgoing_number, 'номер')}"
+            if outgoing_number
+            else f"от-{letter.get('business_date') or 'без-даты'}"
+        )
+        return sanitize_filename(
+            f"Скан_ответа_{recipient}_{document_mark}.pdf"
+        )
+
+    def response_group_download_filename(self, group_id: str) -> str:
+        group = self.get_response_group(group_id)
+        if not group:
+            raise WorkflowValidationError("Общий ответ не найден")
+        letters = self.db.fetch_all(
+            """
+            SELECT outgoing_number FROM response_letters
+            WHERE response_group_id = ? ORDER BY letter_order
+            """,
+            (group_id,),
+        )
+        numbers = [
+            str(letter["outgoing_number"]).strip()
+            for letter in letters
+            if str(letter.get("outgoing_number") or "").strip()
+        ]
+        suffix = (
+            f"исх-{numbers[0]}"
+            if len(letters) == 1 and len(numbers) == 1
+            else str(group["business_date"])
+        )
+        recipient = self._filename_part(
+            group.get("recipient_display_name"), "адресат"
+        )
+        return sanitize_filename(f"Ответ_{recipient}_{suffix}.docx")
+
+    def signed_scan_download_filename(self, scan_id: str) -> str:
+        scan = self.get_signed_response_scan(scan_id)
+        if not scan:
+            raise WorkflowValidationError("Подписанный скан не найден")
+        letter = self.get_response_letter(scan["response_letter_id"])
+        if not letter:
+            raise WorkflowValidationError("Готовое письмо не найдено")
+        return self._signed_scan_filename(letter)
 
     def mark_response_group_opened_for_print(
         self,
@@ -6154,7 +6355,10 @@ class WorkflowService:
             self.settings.runtime_dir,
         )
         scan_dir.mkdir(parents=True, exist_ok=False)
-        pdf_path = scan_dir / "signed-response.pdf"
+        letter = self.get_response_letter(session["response_letter_id"])
+        if not letter:
+            raise WorkflowValidationError("Готовое письмо не найдено")
+        pdf_path = scan_dir / self._signed_scan_filename(letter)
         manifest_path = scan_dir / "source-pages.json"
         try:
             page_count = self._make_session_pages_pdf(pages, pdf_path)
@@ -6198,18 +6402,23 @@ class WorkflowService:
                         id, response_letter_id, status, source,
                         original_filename, original_path, pdf_path,
                         sha256, size_bytes, page_count,
+                        correct_letter_confirmed, signature_confirmed,
+                        bank_seal_confirmed, confirmed_by, confirmed_at,
                         created_at, updated_at
-                    ) VALUES (?, ?, 'needs_confirmation', 'wia', ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, 'confirmed', 'wia', ?, ?, ?, ?, ?, ?,
+                              1, 1, 1, ?, ?, ?, ?)
                     """,
                     (
                         scan_id,
                         session["response_letter_id"],
-                        f"Сессия WIA — {page_count} стр.",
+                        self._signed_scan_filename(letter),
                         str(manifest_path),
                         str(pdf_path),
                         digest,
                         pdf_path.stat().st_size,
                         page_count,
+                        actor,
+                        now,
                         now,
                         now,
                     ),
@@ -6234,7 +6443,14 @@ class WorkflowService:
                             "sha256": digest,
                             "page_count": page_count,
                             "session_id": session_id,
+                            "confirmed_during_scan": True,
                         },
+                    ),
+                    (
+                        "signed_response_scan",
+                        scan_id,
+                        "signed_response_scan_confirmed",
+                        {"confirmed_during_scan": True},
                     ),
                     (
                         "signed_scan_session",
@@ -6359,7 +6575,7 @@ class WorkflowService:
             if not size_bytes:
                 raise WorkflowValidationError("Получен пустой файл скана")
             temporary.replace(original)
-            pdf_path = scan_dir / "signed-response.pdf"
+            pdf_path = scan_dir / self._signed_scan_filename(letter)
             page_count = self._make_scan_pdf(original, pdf_path)
             now = utc_now()
             with self.db.connect() as connection:
@@ -6378,8 +6594,11 @@ class WorkflowService:
                         id, response_letter_id, status, source,
                         original_filename, original_path, pdf_path,
                         sha256, size_bytes, page_count,
+                        correct_letter_confirmed, signature_confirmed,
+                        bank_seal_confirmed, confirmed_by, confirmed_at,
                         created_at, updated_at
-                    ) VALUES (?, ?, 'needs_confirmation', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, 'confirmed', ?, ?, ?, ?, ?, ?, ?,
+                              1, 1, 1, ?, ?, ?, ?)
                     """,
                     (
                         scan_id,
@@ -6391,6 +6610,8 @@ class WorkflowService:
                         digest.hexdigest(),
                         size_bytes,
                         page_count,
+                        actor,
+                        now,
                         now,
                         now,
                     ),
@@ -6412,7 +6633,26 @@ class WorkflowService:
                                 "source": source,
                                 "sha256": digest.hexdigest(),
                                 "page_count": page_count,
+                                "confirmed_during_scan": True,
                             },
+                            ensure_ascii=False,
+                        ),
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO audit_events(
+                        entity_type, entity_id, event_type,
+                        actor, payload_json, created_at
+                    ) VALUES ('signed_response_scan', ?,
+                              'signed_response_scan_confirmed', ?, ?, ?)
+                    """,
+                    (
+                        scan_id,
+                        actor,
+                        json.dumps(
+                            {"confirmed_during_scan": True},
                             ensure_ascii=False,
                         ),
                         now,
@@ -6638,7 +6878,11 @@ class WorkflowService:
                 "Обращение ещё не готово к созданию ответа"
             )
         taxpayers = self.get_taxpayers(case_id)
-        output = self.settings.responses_dir / f"response-{case_id}.docx"
+        output = self.settings.responses_dir / self._response_word_filename(
+            case.get("recipient_display_name"),
+            datetime.now(self.BUSINESS_TIMEZONE).date().isoformat(),
+            case_id,
+        )
         _, likely_overflow = self.word.render(output, case, taxpayers)
         self.db.execute(
             """
@@ -7363,9 +7607,9 @@ class WorkflowService:
                     raise WorkflowValidationError(
                         "Укажите итоговое наименование"
                     )
-                if len(clean_inn) != 14:
+                if not clean_inn:
                     raise WorkflowValidationError(
-                        "Итоговый ИНН должен содержать ровно 14 цифр"
+                        "Укажите итоговый ИНН"
                     )
                 record_ids = [item["id"] for item in records]
                 placeholders = ",".join("?" for _ in record_ids)
@@ -7631,6 +7875,219 @@ class WorkflowService:
         self._refresh_upload_status(case["upload_id"])
         return self.get_page(source_page["id"]) or source_page
 
+    def restart_case_manual_review(
+        self,
+        case_id: str,
+        *,
+        actor: str = "Сотрудник",
+    ) -> dict[str, Any]:
+        """Return one unsent case to the manual form without erasing evidence."""
+        case = self.get_case(case_id)
+        if not case:
+            raise WorkflowValidationError("Обращение не найдено")
+        source_page = self.get_case_source_page(case_id)
+        if not source_page or source_page.get("upload_id") != case.get("upload_id"):
+            raise WorkflowValidationError(
+                "Не найден исходный лист этого обращения"
+            )
+        if source_page.get("case_id") not in {None, case_id}:
+            raise WorkflowValidationError(
+                "Исходный лист уже связан с другим обращением"
+            )
+
+        outbound = self.db.fetch_one(
+            """
+            SELECT outlook_outgoing_messages.status,
+                   outlook_outgoing_messages.resend_status
+            FROM response_group_cases
+            JOIN response_letters
+              ON response_letters.response_group_id =
+                 response_group_cases.response_group_id
+            JOIN outlook_outgoing_messages
+              ON outlook_outgoing_messages.response_letter_id =
+                 response_letters.id
+            WHERE response_group_cases.case_id = ?
+              AND (
+                   outlook_outgoing_messages.status IN ('sent', 'draft_created')
+                   OR outlook_outgoing_messages.resend_status IN (
+                       'sent', 'draft_created'
+                   )
+              )
+            LIMIT 1
+            """,
+            (case_id,),
+        )
+        if outbound:
+            if outbound["status"] == "sent" or outbound["resend_status"] == "sent":
+                raise WorkflowValidationError(
+                    "Письмо уже отправлено через Outlook; его нельзя вернуть "
+                    "в обработку"
+                )
+            raise WorkflowValidationError(
+                "Сначала удалите созданный черновик Outlook, затем запустите "
+                "проверку заново"
+            )
+
+        group_rows = self.db.fetch_all(
+            """
+            SELECT response_group_id FROM response_group_cases
+            WHERE case_id = ?
+            """,
+            (case_id,),
+        )
+        group_ids = [str(row["response_group_id"]) for row in group_rows]
+        now = utc_now()
+        before = {
+            "status": case.get("status"),
+            "fields_confirmed": bool(case.get("fields_confirmed")),
+            "abs_status": case.get("abs_status"),
+            "response_status": case.get("response_status"),
+            "source_page_status": source_page.get("status"),
+        }
+        with self.db.connect() as connection:
+            if group_ids:
+                placeholders = ",".join("?" for _ in group_ids)
+                connection.execute(
+                    f"""
+                    UPDATE signed_response_scans
+                    SET status = 'superseded', updated_at = ?
+                    WHERE response_letter_id IN (
+                        SELECT id FROM response_letters
+                        WHERE response_group_id IN ({placeholders})
+                    ) AND status IN ('needs_confirmation', 'confirmed')
+                    """,
+                    (now, *group_ids),
+                )
+                connection.execute(
+                    f"""
+                    UPDATE signed_scan_sessions
+                    SET status = 'cancelled', error_message = NULL, updated_at = ?
+                    WHERE response_letter_id IN (
+                        SELECT id FROM response_letters
+                        WHERE response_group_id IN ({placeholders})
+                    ) AND status IN ('collecting', 'technical_error')
+                    """,
+                    (now, *group_ids),
+                )
+                connection.execute(
+                    f"""
+                    UPDATE response_groups
+                    SET status = 'superseded', updated_at = ?
+                    WHERE id IN ({placeholders})
+                    """,
+                    (now, *group_ids),
+                )
+                connection.execute(
+                    f"""
+                    UPDATE cases
+                    SET status = ?, response_status = NULL,
+                        response_path = NULL, response_page_overflow = NULL,
+                        updated_at = ?
+                    WHERE id IN (
+                        SELECT case_id FROM response_group_cases
+                        WHERE response_group_id IN ({placeholders})
+                    )
+                    """,
+                    (CaseStatus.READY_FOR_RESPONSE, now, *group_ids),
+                )
+
+            connection.execute(
+                """
+                UPDATE case_match_reviews
+                SET status = 'superseded', updated_at = ?
+                WHERE status = 'pending'
+                  AND (left_case_id = ? OR right_case_id = ?)
+                """,
+                (now, case_id, case_id),
+            )
+            connection.execute(
+                """
+                UPDATE taxpayers
+                SET manually_confirmed = 0,
+                    abs_result = NULL, abs_account_result = NULL,
+                    abs_active_account_count = NULL,
+                    abs_closed_account_count = NULL, odb_result = NULL,
+                    registry_status = NULL, registry_name = NULL,
+                    registry_director = NULL, registry_checked_at = NULL,
+                    registry_provider = NULL, updated_at = ?
+                WHERE case_id = ?
+                """,
+                (now, case_id),
+            )
+            connection.execute(
+                """
+                UPDATE cases
+                SET status = ?, fields_confirmed = 0,
+                    abs_status = ?, response_status = NULL,
+                    response_path = NULL, response_page_overflow = NULL,
+                    match_review_previous_status = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    CaseStatus.NEEDS_REVIEW,
+                    AbsStatus.NOT_CHECKED,
+                    now,
+                    case_id,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE pages
+                SET case_id = ?, page_type = ?, type_confidence = 1,
+                    manual_confirmed = 0, status = ?,
+                    issue_code = ?, issue_message = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    case_id,
+                    PageType.LETTER,
+                    PageStatus.NEEDS_REVIEW,
+                    "manual_restart_requested",
+                    "Проверьте реквизиты письма заново. Результаты АБС и ОДБ сброшены.",
+                    now,
+                    source_page["id"],
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO audit_events(
+                    entity_type, entity_id, event_type,
+                    actor, payload_json, created_at
+                ) VALUES ('case', ?, 'case_manual_review_restarted', ?, ?, ?)
+                """,
+                (
+                    case_id,
+                    actor,
+                    json.dumps(
+                        {
+                            "source_page_id": source_page["id"],
+                            "superseded_response_groups": group_ids,
+                            "before": before,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO audit_events(
+                    entity_type, entity_id, event_type,
+                    actor, payload_json, created_at
+                ) VALUES ('page', ?, 'page_manual_review_restarted', ?, ?, ?)
+                """,
+                (
+                    source_page["id"],
+                    actor,
+                    json.dumps({"case_id": case_id}, ensure_ascii=False),
+                    now,
+                ),
+            )
+
+        self.reconcile_case_match_reviews()
+        self._refresh_upload_status(case["upload_id"])
+        return self.get_page(source_page["id"]) or source_page
+
     def get_taxpayers(self, case_id: str) -> list[dict[str, Any]]:
         return self.db.fetch_all(
             """
@@ -7723,9 +8180,9 @@ class WorkflowService:
         clean_inn = re.sub(r"\D", "", selected_inn)
         if not clean_name:
             raise WorkflowValidationError("Укажите итоговое наименование")
-        if len(clean_inn) != 14:
+        if not clean_inn:
             raise WorkflowValidationError(
-                "Итоговый ИНН должен содержать ровно 14 цифр"
+                "Укажите итоговый ИНН"
             )
 
         record_ids = [record["taxpayer_id"] for record in records]
@@ -7834,6 +8291,13 @@ class WorkflowService:
                     now,
                 ),
             )
+        for case_id in recheck_case_ids:
+            taxpayers = self.get_taxpayers(case_id)
+            if taxpayers and all(
+                len(re.sub(r"\D", "", item.get("inn") or "")) != 14
+                for item in taxpayers
+            ):
+                self.auto_check_abs(case_id)
         return {
             "updated_records": len(record_ids),
             "requires_abs_recheck": bool(recheck_case_ids),
@@ -7875,8 +8339,8 @@ class WorkflowService:
         clean_inn = re.sub(r"\D", "", inn)
         if not clean_name:
             raise WorkflowValidationError("Укажите наименование")
-        if len(clean_inn) != 14:
-            raise WorkflowValidationError("ИНН должен содержать ровно 14 цифр")
+        if not clean_inn:
+            raise WorkflowValidationError("Укажите ИНН")
         duplicate = self.db.fetch_one(
             """
             SELECT id FROM taxpayers
@@ -7968,10 +8432,16 @@ class WorkflowService:
             actor=actor,
         )
         self.reconcile_case_match_reviews()
-        return {
+        invalid_inn = inn_changed and len(clean_inn) != 14
+        if invalid_inn:
+            self.auto_check_abs(case_id)
+        result = {
             "changed_fields": changed_fields,
-            "requires_abs_recheck": inn_changed,
+            "requires_abs_recheck": inn_changed and not invalid_inn,
         }
+        if invalid_inn:
+            result["invalid_inn"] = True
+        return result
 
     def list_cases(self) -> list[dict[str, Any]]:
         return self.db.fetch_all(

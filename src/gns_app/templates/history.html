@@ -91,9 +91,14 @@
           <summary aria-label="Документы письма">⋯</summary>
           <div class="action-menu-panel action-menu-panel-right">
             <a href="/cases/{{ item.id }}?return_to=history">Открыть письмо и данные</a>
-            <a href="/uploads/{{ item.upload_id }}">Открыть входящий PDF</a>
+            <a href="/uploads/{{ item.upload_id }}">Открыть входящий документ</a>
             {% if item.response_group_id %}<a href="/response-groups/{{ item.response_group_id }}">Скачать Word</a>{% endif %}
             {% if item.signed_scan_id %}<a href="/signed-response-scans/{{ item.signed_scan_id }}" target="_blank">Открыть подписанный PDF</a>{% endif %}
+            {% if item.mail_status != 'sent' and item.resend_status != 'sent' %}
+              <form method="post" action="/cases/{{ item.id }}/restart-manual-review">
+                <button type="submit">Проверить заново вручную</button>
+              </form>
+            {% endif %}
             {% if item.mail_status == 'sent' and item.outlook_message_id and item.signed_scan_id %}
               <form method="post" action="/outlook-messages/{{ item.outlook_message_id }}/resend-draft"
                     onsubmit="return confirm('Создать повторный черновик с сохранённым подписанным PDF?');">

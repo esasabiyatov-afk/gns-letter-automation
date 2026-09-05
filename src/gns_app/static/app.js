@@ -752,7 +752,13 @@
       const inn = (innInput?.value || "").replace(/\D/g, "");
       if (inn.length !== 14) {
         row.dataset.registryLookupKey = "";
-        result?.replaceChildren();
+        if (result) {
+          result.className = "registry-live-result";
+          result.textContent = inn.length
+            ? `Внимание: в ИНН ${inn.length} цифр вместо 14. Сверьте с письмом; продолжить можно.`
+            : "";
+          result.classList.toggle("is-warning", Boolean(inn.length));
+        }
         return;
       }
       const lookupKey = `${inn}|${inn.startsWith("4") ? nameInput?.value || "" : ""}`;
@@ -893,21 +899,6 @@
     officeInput.addEventListener("blur", () => {
       window.setTimeout(() => { officePicker.hidden = true; }, 100);
     });
-  }
-
-  const positionChoice = document.querySelector("#recipient-position-choice");
-  const positionValue = document.querySelector("#recipient-position-value");
-  const positionCustom = document.querySelector("#recipient-position-custom");
-  if (positionChoice && positionValue && positionCustom) {
-    const syncPosition = () => {
-      const custom = positionChoice.value === "other";
-      positionCustom.hidden = !custom;
-      positionValue.value = custom ? positionCustom.value.trim() : positionChoice.value;
-      if (custom) autoGrow(positionCustom);
-    };
-    positionChoice.addEventListener("change", syncPosition);
-    positionCustom.addEventListener("input", syncPosition);
-    syncPosition();
   }
 
   const recipientFullName = document.querySelector("[name='recipient_full_name']");

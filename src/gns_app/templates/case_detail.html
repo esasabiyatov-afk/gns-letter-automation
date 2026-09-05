@@ -29,8 +29,8 @@
     <div class="case-document-toolbar">
       <div>
         <p class="eyebrow">ИСХОДНОЕ ПИСЬМО</p>
-        <strong title="{{ source_upload.original_filename if source_upload else 'Исходный PDF' }}">
-          {{ source_upload.original_filename if source_upload else 'Исходный PDF' }}
+        <strong title="{{ source_upload.original_filename if source_upload else 'Исходный документ' }}">
+          {{ source_upload.original_filename if source_upload else 'Исходный документ' }}
         </strong>
       </div>
       {% if source_page %}
@@ -91,6 +91,11 @@
         <div>
           <strong>{{ taxpayer.name }}</strong>
           <small>ИНН {{ taxpayer.inn }}</small>
+          {% if taxpayer.inn|length != 14 %}
+            <small class="inn-length-warning">
+              ⚠ В ИНН {{ taxpayer.inn|length }} цифр вместо 14. Сверьте с письмом.
+            </small>
+          {% endif %}
           {% if taxpayer.registry_status %}
             <small class="registry-state registry-{{ taxpayer.registry_status }}">
               {{ taxpayer.registry_provider or "Реестр" }}:
@@ -218,6 +223,18 @@
         </small>
       {% endif %}
     {% endif %}
+    <details class="action-menu">
+      <summary aria-label="Дополнительные действия">⋯</summary>
+      <div class="action-menu-panel action-menu-panel-right">
+        <form method="post" action="/cases/{{ case.id }}/restart-manual-review">
+          <button type="submit">Проверить заново вручную</button>
+        </form>
+        <span class="action-menu-note">
+          Сбросит результаты АБС и ОДБ, сохранит исходный PDF и журнал.
+          Отправленное письмо вернуть нельзя.
+        </span>
+      </div>
+    </details>
   </div>
 </section>
 

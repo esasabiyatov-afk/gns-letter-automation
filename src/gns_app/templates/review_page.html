@@ -138,24 +138,18 @@
           </small>
         </label>
         {% set current_position = case.get('recipient_position') or '' %}
-        {% set position_is_preset = current_position in ['Зам. начальника управления', 'Начальник управления'] %}
-        <div class="field position-field">
+        <label class="field position-field">
           <span>Должность адресата</span>
-          <select id="recipient-position-choice">
-            <option value="" {% if not current_position %}selected{% endif %}>Выберите должность</option>
-            <option value="Зам. начальника управления"
-                    {% if current_position == 'Зам. начальника управления' %}selected{% endif %}>Зам. начальника управления</option>
-            <option value="Начальник управления"
-                    {% if current_position == 'Начальник управления' %}selected{% endif %}>Начальник управления</option>
-            <option value="other"
-                    {% if current_position and not position_is_preset %}selected{% endif %}>Другое</option>
-          </select>
-          <input type="hidden" name="recipient_position" id="recipient-position-value"
+          <input name="recipient_position" id="recipient-position-value"
+                 list="recipient-position-options" autocomplete="off"
+                 placeholder="Введите или выберите должность"
                  value="{{ current_position }}">
-          <textarea id="recipient-position-custom" rows="2" data-autogrow
-                    placeholder="Введите должность полностью"
-                    {% if not current_position or position_is_preset %}hidden{% endif %}>{{ current_position if current_position and not position_is_preset else '' }}</textarea>
-        </div>
+          <datalist id="recipient-position-options">
+            <option value="Зам. начальника управления">
+            <option value="Начальник управления">
+          </datalist>
+          <small class="field-hint">Можно сразу ввести любую должность из письма.</small>
+        </label>
         <label class="field recipient-field">
           <span>Полное ФИО адресата</span>
           <textarea name="recipient_full_name" rows="1" data-autogrow autocomplete="off"
@@ -248,7 +242,8 @@
             <label class="field inn-field">
               <span>ИНН</span>
               <input name="taxpayer_inn" value="{{ taxpayer.inn }}"
-                     inputmode="numeric" maxlength="14" placeholder="14 цифр">
+                     inputmode="numeric" pattern="[0-9]+"
+                     placeholder="ИНН как в письме">
             </label>
             {% if ui_preferences.allow_multiple_taxpayers %}
               <button type="button" class="remove-row" aria-label="Удалить">×</button>

@@ -133,7 +133,7 @@ def test_work_incoming_paginates_50_pdfs_and_keeps_sort(workflow, monkeypatch):
 
     newest = client.get("/?tab=incoming")
     assert newest.text.count('data-testid="incoming-row"') == 50
-    assert "Всего PDF: 51" in newest.text
+    assert "Всего документов: 51" in newest.text
     assert "document-50.pdf" in newest.text
     assert "document-00.pdf" not in newest.text
     assert "1 из 2" in newest.text
@@ -609,11 +609,24 @@ def test_created_response_actions_are_reachable_without_card_expansion():
     assert "data-inline-number-input" in template
     assert "data-inline-number-form" in script
     assert "letter_ids" in script
-    assert "Подтвердить скан" in drawer
+    assert "Сохранить скан" in drawer
     assert "Добавить лист" in drawer
     assert "Открыть PDF" not in drawer
     assert 'type="checkbox"' not in drawer
     assert 'class="scan-pdf-preview"' in drawer
+
+
+def test_recipient_position_is_one_editable_field_without_custom_input():
+    package_dir = Path(main.__file__).parent
+    template = (package_dir / "templates" / "review_page.html").read_text(
+        encoding="utf-8"
+    )
+    script = (package_dir / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert 'name="recipient_position"' in template
+    assert 'list="recipient-position-options"' in template
+    assert "recipient-position-custom" not in template
+    assert "recipient-position-choice" not in script
 
 
 def test_taxpayer_counter_uses_person_not_record_terminology():
@@ -663,6 +676,35 @@ def test_identity_conflict_is_only_shown_in_manual_review(workflow, monkeypatch)
     assert comparison.text.count('class="match-resolution-difference"') == 1
 
 
+def test_inn_comparison_highlights_only_different_digits(workflow, monkeypatch):
+    from starlette.testclient import TestClient
+
+    monkeypatch.setattr(main, "workflow", workflow)
+    from test_daily_batch import _insert_ready_case
+
+    name = 'ОсОО "Одинаковое название"'
+    _insert_ready_case(workflow, "00000000223323", name)
+    _insert_ready_case(
+        workflow,
+        "00000000221323",
+        name,
+        source_kind="manual",
+    )
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    review_id = workflow.list_case_match_reviews()[0]["id"]
+
+    comparison = TestClient(main.app).get(f"/review/matches/{review_id}")
+
+    assert comparison.status_code == 200
+    assert comparison.text.count(
+        '<mark class="inn-char-difference">3</mark>'
+    ) == 2
+    assert comparison.text.count(
+        '<mark class="inn-char-difference">1</mark>'
+    ) == 2
+    assert "цифр вместо 14" not in comparison.text
+
+
 def test_history_search_combines_incoming_word_number_and_scan(
     workflow,
     monkeypatch,
@@ -682,12 +724,6 @@ def test_history_search_combines_incoming_word_number_and_scan(
     workflow.set_outgoing_number(letter["id"], "9544")
     scan = workflow.register_signed_response_scan(
         letter["id"], "signed.png", _png_scan()
-    )
-    workflow.confirm_signed_response_scan(
-        scan["id"],
-        correct_letter=True,
-        signature_present=True,
-        bank_seal_present=True,
     )
     monkeypatch.setattr(main, "workflow", workflow)
 

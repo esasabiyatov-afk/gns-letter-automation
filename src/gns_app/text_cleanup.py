@@ -9,12 +9,70 @@ import unicodedata
 # не удаляются: они законны, например, в наименовании ОсОО "Чардж".
 LOCATION_EDGE_NOISE = "\"'«»„“”‹›,;:|"
 
+# Бишкек остаётся самостоятельной формой. Для остальных городов, в которых
+# есть отдельное подразделение ГНС, ответ всегда содержит также область.
+# Значения взяты из поставляемого локального справочника адресов ГНС.
+CITY_REGION_SUFFIXES = {
+    "балыкчы": ("Балыкчы", "Иссык-Кульской области"),
+    "баткен": ("Баткен", "Баткенской области"),
+    "кара-куль": ("Кара-Куль", "Джалал-Абадской области"),
+    "каракөл": ("Каракол", "Иссык-Кульской области"),
+    "каракол": ("Каракол", "Иссык-Кульской области"),
+    "кызыл-кия": ("Кызыл-Кия", "Баткенской области"),
+    "майлуу-суу": ("Майлуу-Суу", "Джалал-Абадской области"),
+    "манас": ("Манас", "Джалал-Абадской области"),
+    "нарын": ("Нарын", "Нарынской области"),
+    "ош": ("Ош", "Ошской области"),
+    "сулюкта": ("Сулюкта", "Баткенской области"),
+    "талас": ("Талас", "Таласской области"),
+    "таш-кумыр": ("Таш-Кумыр", "Джалал-Абадской области"),
+    "токмок": ("Токмок", "Чуйской области"),
+}
+CITY_LOCATION_RE = re.compile(
+    r"\bг\.(?P<city>"
+    + "|".join(
+        re.escape(city)
+        for city in sorted(CITY_REGION_SUFFIXES, key=len, reverse=True)
+    )
+    + r")\b",
+    flags=re.IGNORECASE,
+)
+REGION_TAIL_RE = re.compile(
+    r"^\s*,?\s*(?:и\s+)?[А-Яа-яЁёҢңӨөҮү-]+\s+област\w*\b",
+    flags=re.IGNORECASE,
+)
+
 
 def clean_location(value: str | None) -> str:
     if not value:
         return ""
     normalized = re.sub(r"\s+", " ", value).strip()
-    return normalized.strip(LOCATION_EDGE_NOISE).strip()
+    normalized = normalized.strip(LOCATION_EDGE_NOISE).strip()
+    normalized = re.sub(
+        r"\bгород(?:а|ов|у|ом|е|ам|ами|ах)?\b\.?\s*",
+        "г.",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r"\bг\.\s*", "г.", normalized, flags=re.IGNORECASE)
+
+    def add_city_region(match: re.Match[str]) -> str:
+        city, region = CITY_REGION_SUFFIXES[match.group("city").casefold()]
+        tail = normalized[match.end() :]
+        expected_tail = re.match(
+            rf"^\s*,?\s*(?:и\s+)?{re.escape(region)}\b",
+            tail,
+            flags=re.IGNORECASE,
+        )
+        if expected_tail:
+            return f"г.{city}"
+        if REGION_TAIL_RE.match(tail) or re.match(
+            r"^\s+и\b", tail, flags=re.IGNORECASE
+        ):
+            return match.group(0)
+        return f"г.{city} {region}"
+
+    return CITY_LOCATION_RE.sub(add_city_region, normalized)
 
 
 def clean_taxpayer_name(value: str | None) -> str:

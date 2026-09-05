@@ -46,6 +46,24 @@ def test_renders_single_response_without_placeholders(
     assert "[ФИО.Исп]" not in text
 
 
+def test_renders_non_bishkek_city_with_its_region(tmp_path, templates_dir):
+    service = WordTemplateService(templates_dir)
+    output = tmp_path / "osh.docx"
+
+    service.render(
+        output,
+        {
+            "district_place": "по городу Ош",
+            "recipient_position": "Начальнику управления",
+            "recipient_display_name": "Получателю",
+            "employee_name": "Сотрудник",
+        },
+        [{"name": 'ОсОО "Тест"', "inn": "02312201410117"}],
+    )
+
+    assert "по г.Ош Ошской области" in _all_word_text(output)
+
+
 def test_render_returns_overflow_flag_alongside_path(tmp_path, templates_dir):
     service = WordTemplateService(templates_dir)
     output = tmp_path / "single.docx"
@@ -289,7 +307,7 @@ def test_split_response_repeats_full_letter_on_new_page(tmp_path, templates_dir)
     service.render_pages(output, case, taxpayers, taxpayers_per_page=2)
 
     text = _all_word_text(output)
-    assert text.count("по Ленинскому району города Бишкек") >= 2
+    assert text.count("по Ленинскому району г.Бишкек") >= 2
     assert text.count("Настоящим ЗАО АКБ") >= 2
     assert all(item["inn"] in text for item in taxpayers)
 

@@ -457,6 +457,87 @@ def test_same_name_with_different_inn_is_blocked_until_confirmation(workflow):
     assert "отличается ИНН" in review["issue_message"]
 
 
+@pytest.mark.parametrize(
+    ("inn", "warning"),
+    [
+        ("223323", "6 цифр вместо 14"),
+        ("123456789012345", "15 цифр вместо 14"),
+    ],
+)
+def test_nonstandard_inn_warns_but_does_not_block_response(
+    workflow, inn, warning
+):
+    case_id = _insert_ready_case(
+        workflow,
+        inn,
+        'ОсОО "ИНН из письма"',
+    )
+    workflow.db.execute(
+        "UPDATE cases SET period_start = NULL, period_end = NULL, "
+        "period_route = 'no_odb' WHERE id = ?",
+        (case_id,),
+    )
+
+    assert workflow.auto_check_abs(case_id)
+
+    case = workflow.get_case(case_id)
+    taxpayer = workflow.get_taxpayers(case_id)[0]
+    group = workflow.today_overview()["not_found_groups"][0]
+    assert case["status"] == CaseStatus.READY_FOR_RESPONSE
+    assert case["abs_status"] == AbsStatus.INVALID_INN
+    assert taxpayer["abs_result"] == AbsStatus.INVALID_INN
+    assert group["can_generate"]
+    assert warning in group["warnings"][0]
+
+    _group_id, output = workflow.generate_daily_response(group["group_key"])
+    assert output.exists()
+
+
+def test_manual_fields_accept_nonstandard_numeric_inn(workflow):
+    taxpayers = workflow._validate_manual_fields(
+        "г.Ош",
+        "Начальнику",
+        "Получатель",
+        "",
+        "",
+        "no_odb",
+        "Сотрудник",
+        [{"name": 'ОсОО "ИНН из письма"', "inn": "223323"}],
+    )
+
+    assert taxpayers == [
+        {"name": 'ОсОО "ИНН из письма"', "inn": "223323"}
+    ]
+
+
+def test_abs_checks_valid_inn_and_skips_nonstandard_in_same_letter(workflow):
+    case_id = _insert_ready_case(
+        workflow,
+        "12345678901234",
+        'ОсОО "Обычный ИНН"',
+    )
+    workflow._replace_taxpayers(
+        case_id,
+        [
+            {"name": 'ОсОО "Обычный ИНН"', "inn": "12345678901234"},
+            {"name": 'ОсОО "ИНН из письма"', "inn": "223323"},
+        ],
+    )
+    workflow.db.execute(
+        "UPDATE cases SET period_start = NULL, period_end = NULL, "
+        "period_route = 'no_odb' WHERE id = ?",
+        (case_id,),
+    )
+
+    result = workflow.check_abs(case_id, "batch-user", "one-time-secret")
+
+    taxpayers = {item["inn"]: item for item in workflow.get_taxpayers(case_id)}
+    assert result.status == AbsStatus.NOT_FOUND
+    assert taxpayers["12345678901234"]["abs_result"] == AbsStatus.NOT_FOUND
+    assert taxpayers["223323"]["abs_result"] == AbsStatus.INVALID_INN
+    assert workflow.get_case(case_id)["status"] == CaseStatus.READY_FOR_RESPONSE
+
+
 def test_distinct_decision_restores_both_versions_without_requeue(workflow):
     inn = "12345678901234"
     _insert_ready_case(workflow, inn, 'ОсОО "Первое лицо"')
@@ -1096,7 +1177,7 @@ def _png_scan() -> BytesIO:
     return stream
 
 
-def test_signed_a4_scan_is_registered_previewed_and_confirmed(workflow):
+def test_signed_a4_scan_is_registered_and_ready_without_second_step(workflow):
     _, letter = _ready_response_letter(workflow)
 
     scan = workflow.register_signed_response_scan(
@@ -1106,28 +1187,21 @@ def test_signed_a4_scan_is_registered_previewed_and_confirmed(workflow):
         actor="Тестовый сотрудник",
     )
 
-    assert scan["status"] == "needs_confirmation"
     assert scan["source"] == "upload"
+    assert scan["status"] == "confirmed"
     assert len(PdfReader(scan["pdf_path"]).pages) == 1
     overview_letter = workflow.today_overview()["generated_groups"][0][
         "letters"
     ][0]
     assert overview_letter["signed_scan"]["id"] == scan["id"]
-    with pytest.raises(WorkflowValidationError, match="Подтвердите"):
+    with pytest.raises(WorkflowValidationError, match="уже проверен"):
         workflow.confirm_signed_response_scan(
             scan["id"],
             correct_letter=True,
             signature_present=True,
-            bank_seal_present=False,
+            bank_seal_present=True,
+            actor="Тестовый сотрудник",
         )
-
-    workflow.confirm_signed_response_scan(
-        scan["id"],
-        correct_letter=True,
-        signature_present=True,
-        bank_seal_present=True,
-        actor="Тестовый сотрудник",
-    )
 
     confirmed = workflow.get_signed_response_scan(scan["id"])
     assert confirmed["status"] == "confirmed"
@@ -1147,8 +1221,45 @@ def test_new_signed_scan_supersedes_previous_without_deleting_it(workflow):
     )
 
     assert workflow.get_signed_response_scan(first["id"])["status"] == "superseded"
-    assert workflow.get_signed_response_scan(second["id"])["status"] == "needs_confirmation"
+    assert workflow.get_signed_response_scan(second["id"])["status"] == "confirmed"
     assert Path(first["original_path"]).is_file()
+
+
+def test_restart_manual_review_supersedes_only_unsent_response_group(workflow):
+    case_id = _insert_ready_case(
+        workflow, "12345678901234", 'ОсОО "Первый"'
+    )
+    case = workflow.get_case(case_id)
+    assert case is not None
+    page_id = uuid4().hex
+    now = utc_now()
+    workflow.db.execute(
+        """
+        INSERT INTO pages(
+            id, upload_id, case_id, page_number, status,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, 1, 'completed', ?, ?)
+        """,
+        (page_id, case["upload_id"], case_id, now, now),
+    )
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    group = workflow.today_overview()["not_found_groups"][0]
+    group_id, _ = workflow.generate_daily_response(group["group_key"])
+    letter = workflow.db.fetch_one(
+        "SELECT * FROM response_letters WHERE response_group_id = ?",
+        (group_id,),
+    )
+    assert letter is not None
+    scan = workflow.register_signed_response_scan(
+        letter["id"], "signed.png", _png_scan()
+    )
+
+    page = workflow.restart_case_manual_review(case_id)
+
+    assert page["id"] == page_id
+    assert workflow.get_case(case_id)["status"] == "needs_review"
+    assert workflow.get_response_group(group_id)["status"] == "superseded"
+    assert workflow.get_signed_response_scan(scan["id"])["status"] == "superseded"
 
 
 def test_signed_scan_preserves_multi_page_pdf(workflow):
@@ -1166,7 +1277,7 @@ def test_signed_scan_preserves_multi_page_pdf(workflow):
 
     assert scan["page_count"] == 2
     assert len(PdfReader(scan["pdf_path"]).pages) == 2
-    assert scan["status"] == "needs_confirmation"
+    assert scan["status"] == "confirmed"
 
 
 def test_device_scan_is_registered_through_wia_gateway(workflow, monkeypatch):
@@ -1184,7 +1295,7 @@ def test_device_scan_is_registered_through_wia_gateway(workflow, monkeypatch):
     scan = workflow.acquire_signed_response_scan(letter["id"])
 
     assert scan["source"] == "wia"
-    assert scan["status"] == "needs_confirmation"
+    assert scan["status"] == "confirmed"
     assert scan_profiles == [{"dpi": 150, "color_mode": "grayscale"}]
 
 
@@ -1312,7 +1423,7 @@ def test_cancelled_wia_session_does_not_create_or_supersede_scan(workflow):
 
     assert workflow.get_signed_scan_session(session["id"])["status"] == "cancelled"
     assert workflow.get_signed_response_scan(existing["id"])["status"] == (
-        "needs_confirmation"
+        "confirmed"
     )
 
 
@@ -1324,14 +1435,14 @@ def test_ready_file_upload_closes_unfinished_wia_session(workflow):
         letter["id"], "ready-from-mfu.png", _png_scan()
     )
 
-    assert scan["status"] == "needs_confirmation"
+    assert scan["status"] == "confirmed"
     assert workflow.get_signed_scan_session(session["id"])["status"] == (
         "cancelled"
     )
     assert workflow.get_active_signed_scan_session(letter["id"]) is None
 
 
-def test_signed_scan_upload_and_confirmation_routes(workflow, monkeypatch):
+def test_signed_scan_upload_route_marks_scan_ready(workflow, monkeypatch):
     from starlette.testclient import TestClient
 
     from gns_app import main
@@ -1356,7 +1467,7 @@ def test_signed_scan_upload_and_confirmation_routes(workflow, monkeypatch):
     preview = client.get(f"/signed-response-scans/{scan['id']}")
     assert preview.status_code == 200
     assert preview.headers["content-type"] == "application/pdf"
-    assert "content-disposition" not in preview.headers
+    assert "filename*=utf-8''" in preview.headers["content-disposition"]
 
     drawer = client.get(
         "/?tab=responses&response_view=created"
@@ -1370,16 +1481,6 @@ def test_signed_scan_upload_and_confirmation_routes(workflow, monkeypatch):
     assert "Открыть PDF" not in drawer.text
     assert 'type="checkbox"' not in drawer.text
 
-    confirmed = client.post(
-        f"/signed-response-scans/{scan['id']}/confirm",
-        data={"group_id": group_id},
-        follow_redirects=False,
-    )
-    assert confirmed.status_code == 303
-    assert confirmed.headers["location"].startswith(
-        "/?tab=responses&response_view=created"
-        f"&focus_letter={letter['id']}&message="
-    )
     assert workflow.get_signed_response_scan(scan["id"])["status"] == "confirmed"
 
 
@@ -1400,13 +1501,6 @@ def test_confirmed_multi_page_scan_creates_one_idempotent_outlook_draft(
     scan = workflow.register_signed_response_scan(
         letter["id"], "Подписанный ответ.pdf", stream
     )
-    workflow.confirm_signed_response_scan(
-        scan["id"],
-        correct_letter=True,
-        signature_present=True,
-        bank_seal_present=True,
-    )
-
     class DraftGateway:
         def __init__(self):
             self.requests = []
@@ -1470,12 +1564,6 @@ def test_outlook_sent_reconciliation_updates_status_once(workflow, monkeypatch):
     workflow.set_outgoing_number(letter["id"], "9546")
     scan = workflow.register_signed_response_scan(
         letter["id"], "scan.png", _png_scan()
-    )
-    workflow.confirm_signed_response_scan(
-        scan["id"],
-        correct_letter=True,
-        signature_present=True,
-        bank_seal_present=True,
     )
 
     class Gateway:
@@ -1596,12 +1684,6 @@ def test_repeat_draft_reuses_exact_confirmed_scan_and_is_confirmed(workflow):
     workflow.set_outgoing_number(letter["id"], "9550")
     scan = workflow.register_signed_response_scan(
         letter["id"], "scan.png", _png_scan()
-    )
-    workflow.confirm_signed_response_scan(
-        scan["id"],
-        correct_letter=True,
-        signature_present=True,
-        bank_seal_present=True,
     )
     expected_pdf = Path(scan["pdf_path"]).read_bytes()
 
@@ -1804,6 +1886,8 @@ def test_real_abs_account_counts_are_persisted_without_auto_confirmation(
     )
     assert "Активных счетов: 2 · закрытых: 1" in visible_text
     assert "Расчётный счёт" in response.text
+    assert "task-row-abs-found" in response.text
+    assert "АБС · НАЙДЕН" in response.text
     assert 'name="account_result" value="found"' in response.text
     assert 'name="account_result" value="not_found"' in response.text
 
@@ -1824,6 +1908,8 @@ def test_real_abs_account_counts_are_persisted_without_auto_confirmation(
     manual_page = client.get("/?tab=responses&response_view=manual")
     assert manual_page.status_code == 200
     assert "12345678901234" in manual_page.text
+    assert "response-row-abs-found" in manual_page.text
+    assert "АБС: счёт найден" in manual_page.text
 
 
 def test_found_abs_questionnaire_with_account_stays_manual(workflow):
