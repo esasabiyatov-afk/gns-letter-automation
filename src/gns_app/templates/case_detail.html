@@ -221,11 +221,11 @@
     {% elif case.status == 'ready_for_abs' %}
       {% if abs_session_active %}
         <form method="post" action="/cases/{{ case.id }}/abs">
-          <button class="button button-primary" type="submit">Проверить в АБС</button>
+          <button class="button button-primary" type="submit">Проверить все в АБС</button>
         </form>
       {% else %}
         <button class="button button-primary" type="button" data-open-dialog="abs-dialog">
-          Войти и проверить в АБС
+          Войти и проверить все в АБС
         </button>
       {% endif %}
     {% elif case.status == 'ready_for_response' %}
@@ -305,8 +305,8 @@
       <button type="button" class="modal-close" data-close-dialog>×</button>
     </div>
     <p class="warning-note">
-      Войдите один раз. Следующие готовые письма проверяются автоматически.
-      После ошибки АБС приложение попросит войти снова.
+      Вход запускает все готовые обращения в фоне. При ошибке приложение
+      остановит очередь и попросит войти снова.
       {% if abs_is_fake %}
         Используется фейковая база.
       {% else %}

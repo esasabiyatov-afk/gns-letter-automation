@@ -417,6 +417,44 @@
            data-settings-panel="service" hidden>
     <section class="settings-card">
       <header>
+        <h2>Автозапуск</h2>
+      </header>
+      {% if autostart_status.supported %}
+        <div class="settings-capability settings-capability-compact">
+          <span class="status {% if autostart_status.enabled %}status-completed{% else %}status-pending{% endif %}">
+            {% if autostart_status.enabled %}Включён{% else %}Выключен{% endif %}
+          </span>
+          <div>
+            <strong>Запускать вместе с Windows</strong>
+            <small>Приложение стартует в фоне, без открытия браузера.</small>
+          </div>
+        </div>
+        <form method="post" action="/settings/autostart"
+              class="settings-action-row">
+          {% if autostart_status.enabled %}
+            <input type="hidden" name="enabled" value="false">
+            <button class="button button-secondary" type="submit">
+              Отключить
+            </button>
+          {% else %}
+            <input type="hidden" name="enabled" value="true">
+            <button class="button button-primary" type="submit">
+              {% if autostart_status.needs_update %}Обновить{% else %}Включить{% endif %}
+            </button>
+          {% endif %}
+        </form>
+        {% if autostart_status.error %}
+          <small>{{ autostart_status.error }}</small>
+        {% else %}
+          <small>После переноса папки нажмите «Обновить».</small>
+        {% endif %}
+      {% else %}
+        <p>Доступно в портативной EXE-сборке Windows.</p>
+      {% endif %}
+    </section>
+
+    <section class="settings-card">
+      <header>
         <h2>Диагностика</h2>
         <p>
           Архив содержит технические статусы без документов, ИНН, паролей,

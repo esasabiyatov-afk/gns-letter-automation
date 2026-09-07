@@ -151,6 +151,10 @@ class WorkflowService:
         self.abs = create_abs_gateway(settings)
         # Только оперативная память процесса: в БД и журнал не попадает.
         self._abs_session_credentials: tuple[str, str] | None = None
+        # Одна проверка АБС за раз. Дополнительно каждая карточка захватывается
+        # атомарным UPDATE по статусу, поэтому повторный клик не запустит её
+        # параллельно второй раз.
+        self._abs_check_lock = RLock()
         self.registry = CompositeRegistryClient(
             OsooRegistryClient(),
             ReestrKgClient(),
@@ -181,6 +185,53 @@ class WorkflowService:
         reset_session = getattr(self.abs, "reset_session", None)
         if callable(reset_session):
             reset_session()
+
+    def recover_interrupted_abs_checks(self) -> int:
+        """Return checks interrupted by process termination to the ABS queue."""
+
+        now = utc_now()
+        with self.db.connect() as connection:
+            rows = connection.execute(
+                "SELECT id FROM cases WHERE status = ? ORDER BY created_at, id",
+                (CaseStatus.ABS_CHECKING,),
+            ).fetchall()
+            case_ids = [str(row["id"]) for row in rows]
+            if not case_ids:
+                return 0
+            placeholders = ",".join("?" for _ in case_ids)
+            connection.execute(
+                f"""
+                UPDATE cases
+                SET status = ?, abs_status = ?, updated_at = ?
+                WHERE id IN ({placeholders})
+                """,
+                (
+                    CaseStatus.READY_FOR_ABS,
+                    AbsStatus.TECHNICAL_ERROR,
+                    now,
+                    *case_ids,
+                ),
+            )
+            for case_id in case_ids:
+                connection.execute(
+                    """
+                    INSERT INTO audit_events(
+                        entity_type, entity_id, event_type,
+                        actor, payload_json, created_at
+                    ) VALUES ('case', ?, 'abs_interrupted_requeued',
+                              'system', ?, ?)
+                    """,
+                    (
+                        case_id,
+                        json.dumps(
+                            {"next_status": CaseStatus.READY_FOR_ABS},
+                            ensure_ascii=False,
+                        ),
+                        now,
+                    ),
+                )
+        self._clear_abs_session()
+        return len(case_ids)
 
     def abs_login_required(self) -> bool:
         if self.abs_session_active():
@@ -1152,10 +1203,11 @@ class WorkflowService:
             return None
         matches: list[dict[str, Any]] = []
         for office, normalized_terms in terms_by_office:
-            district = self._normalize_office_text(
-                office.get("district_place") or ""
-            )
-            if any(term in normalized_text for term in normalized_terms):
+            # A character substring can turn an official QR phrase into a
+            # different office.  Accept only complete normalized phrases from
+            # the directory or its approved aliases.
+            padded_text = f" {normalized_text} "
+            if any(f" {term} " in padded_text for term in normalized_terms):
                 matches.append(office)
         return matches[0] if len(matches) == 1 else None
 
@@ -4067,9 +4119,22 @@ class WorkflowService:
         username: str = "",
         password: str = "",
     ):
+        with self._abs_check_lock:
+            return self._check_abs_locked(case_id, username, password)
+
+    def _check_abs_locked(
+        self,
+        case_id: str,
+        username: str = "",
+        password: str = "",
+    ):
         case = self.get_case(case_id)
         if not case:
             raise WorkflowValidationError("Обращение не найдено")
+        if case["status"] != CaseStatus.READY_FOR_ABS:
+            raise WorkflowValidationError(
+                "Обращение уже не ожидает проверку АБС"
+            )
         if not case["fields_confirmed"]:
             raise WorkflowValidationError(
                 "Перед АБС нужно подтвердить все поля письма"
@@ -4094,14 +4159,6 @@ class WorkflowService:
         ]
         if not valid_taxpayers:
             now = utc_now()
-            self.db.execute(
-                "UPDATE taxpayers SET abs_result = ?, "
-                "abs_account_result = NULL, abs_active_account_count = NULL, "
-                "abs_closed_account_count = NULL, odb_result = NULL, "
-                "updated_at = ? "
-                "WHERE case_id = ?",
-                (AbsStatus.INVALID_INN, now, case_id),
-            )
             threshold = self.get_period_threshold()
             start = (
                 date.fromisoformat(case["period_start"])
@@ -4113,11 +4170,6 @@ class WorkflowService:
                 if case.get("period_route") == "odb"
                 or (start is not None and start < threshold)
                 else CaseStatus.READY_FOR_RESPONSE
-            )
-            self.db.execute(
-                "UPDATE cases SET status = ?, abs_status = ?, updated_at = ? "
-                "WHERE id = ?",
-                (next_status, AbsStatus.INVALID_INN, now, case_id),
             )
             result = AbsCheckResult(
                 status=AbsStatus.INVALID_INN,
@@ -4135,15 +4187,56 @@ class WorkflowService:
                 ),
                 is_fake=self.abs_is_fake(),
             )
-            self.db.audit(
-                "case",
-                case_id,
-                "abs_skipped_invalid_inn",
-                {
-                    "taxpayer_count": len(invalid_taxpayers),
-                    "next_status": next_status,
-                },
-            )
+            with self.db.connect() as connection:
+                claimed = connection.execute(
+                    """
+                    UPDATE cases
+                    SET status = ?, abs_status = ?, updated_at = ?
+                    WHERE id = ? AND status = ?
+                    """,
+                    (
+                        next_status,
+                        AbsStatus.INVALID_INN,
+                        now,
+                        case_id,
+                        CaseStatus.READY_FOR_ABS,
+                    ),
+                )
+                if claimed.rowcount != 1:
+                    raise WorkflowValidationError(
+                        "Обращение уже обрабатывается в АБС"
+                    )
+                connection.execute(
+                    """
+                    UPDATE taxpayers
+                    SET abs_result = ?, abs_account_result = NULL,
+                        abs_active_account_count = NULL,
+                        abs_closed_account_count = NULL, odb_result = NULL,
+                        updated_at = ?
+                    WHERE case_id = ?
+                    """,
+                    (AbsStatus.INVALID_INN, now, case_id),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO audit_events(
+                        entity_type, entity_id, event_type,
+                        actor, payload_json, created_at
+                    ) VALUES ('case', ?, 'abs_skipped_invalid_inn',
+                              'system', ?, ?)
+                    """,
+                    (
+                        case_id,
+                        json.dumps(
+                            {
+                                "taxpayer_count": len(invalid_taxpayers),
+                                "next_status": next_status,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        now,
+                    ),
+                )
             return result
 
         username = username.strip()
@@ -4157,15 +4250,26 @@ class WorkflowService:
                     "Введите логин и пароль для проверки АБС"
                 )
 
-        self.db.execute(
-            "UPDATE cases SET status = ?, abs_status = ?, updated_at = ? WHERE id = ?",
-            (
-                CaseStatus.ABS_CHECKING,
-                AbsStatus.CHECKING,
-                utc_now(),
-                case_id,
-            ),
-        )
+        check_started_at = utc_now()
+        with self.db.connect() as connection:
+            claimed = connection.execute(
+                """
+                UPDATE cases
+                SET status = ?, abs_status = ?, updated_at = ?
+                WHERE id = ? AND status = ?
+                """,
+                (
+                    CaseStatus.ABS_CHECKING,
+                    AbsStatus.CHECKING,
+                    check_started_at,
+                    case_id,
+                    CaseStatus.READY_FOR_ABS,
+                ),
+            )
+            if claimed.rowcount != 1:
+                raise WorkflowValidationError(
+                    "Обращение уже обрабатывается в АБС"
+                )
         abs_started = monotonic_time.monotonic()
         record_event(
             "abs",
@@ -4177,23 +4281,215 @@ class WorkflowService:
                 "session_reused": session_reused,
             },
         )
+        failed_statuses = {
+            AbsStatus.AUTH_ERROR,
+            AbsStatus.UNAVAILABLE,
+            AbsStatus.TECHNICAL_ERROR,
+        }
+
+        def requeue_failed_check(status: AbsStatus) -> None:
+            failed_at = utc_now()
+            with self.db.connect() as connection:
+                current = connection.execute(
+                    "SELECT status FROM cases WHERE id = ?",
+                    (case_id,),
+                ).fetchone()
+                if not current or current["status"] != CaseStatus.ABS_CHECKING:
+                    return
+                connection.execute(
+                    """
+                    UPDATE cases
+                    SET status = ?, abs_status = ?, updated_at = ?
+                    WHERE id = ? AND status = ?
+                    """,
+                    (
+                        CaseStatus.READY_FOR_ABS,
+                        status,
+                        failed_at,
+                        case_id,
+                        CaseStatus.ABS_CHECKING,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO audit_events(
+                        entity_type, entity_id, event_type,
+                        actor, payload_json, created_at
+                    ) VALUES ('case', ?, ?, 'system', ?, ?)
+                    """,
+                    (
+                        case_id,
+                        "fake_abs_checked" if self.abs_is_fake() else "abs_checked",
+                        json.dumps(
+                            {
+                                "status": status,
+                                "completed_taxpayers_preserved": True,
+                                "next_status": CaseStatus.READY_FOR_ABS,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        failed_at,
+                    ),
+                )
+
+        checkpoint_statuses = {
+            AbsStatus.FOUND,
+            AbsStatus.NOT_FOUND,
+            AbsStatus.MULTIPLE,
+        }
+        checkpoint_results: dict[str, dict[str, Any]] = {}
+        for taxpayer in valid_taxpayers:
+            if taxpayer.get("abs_result") in checkpoint_statuses:
+                checkpoint_results[str(taxpayer["id"])] = {
+                    "inn": taxpayer["inn"],
+                    "name": taxpayer["name"],
+                    "result": taxpayer["abs_result"],
+                    "active_account_count": taxpayer.get(
+                        "abs_active_account_count"
+                    ),
+                    "closed_account_count": taxpayer.get(
+                        "abs_closed_account_count"
+                    ),
+                }
+
+        def persist_checkpoint(
+            taxpayer: dict[str, Any], result_item: dict[str, Any]
+        ) -> None:
+            saved_at = utc_now()
+            with self.db.connect() as connection:
+                current = connection.execute(
+                    "SELECT status FROM cases WHERE id = ?", (case_id,)
+                ).fetchone()
+                if not current or current["status"] != CaseStatus.ABS_CHECKING:
+                    raise WorkflowValidationError(
+                        "Состояние обращения изменилось во время проверки АБС"
+                    )
+                updated = connection.execute(
+                    """
+                    UPDATE taxpayers
+                    SET abs_result = ?, abs_account_result = NULL,
+                        abs_active_account_count = ?,
+                        abs_closed_account_count = ?, odb_result = NULL,
+                        updated_at = ?
+                    WHERE id = ? AND case_id = ? AND abs_result IS NULL
+                    """,
+                    (
+                        result_item["result"],
+                        result_item.get("active_account_count"),
+                        result_item.get("closed_account_count"),
+                        saved_at,
+                        taxpayer["id"],
+                        case_id,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise WorkflowValidationError(
+                        "Результат этого лица уже изменён; обновите страницу."
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO audit_events(
+                        entity_type, entity_id, event_type,
+                        actor, payload_json, created_at
+                    ) VALUES ('taxpayer', ?, ?, 'system', ?, ?)
+                    """,
+                    (
+                        taxpayer["id"],
+                        "fake_abs_taxpayer_checked"
+                        if self.abs_is_fake()
+                        else "abs_taxpayer_checked",
+                        json.dumps(
+                            {"status": result_item["result"]},
+                            ensure_ascii=False,
+                        ),
+                        saved_at,
+                    ),
+                )
+
         try:
-            result = self.abs.check(username, password, valid_taxpayers)
+            failed_result: AbsCheckResult | None = None
+            for taxpayer in valid_taxpayers:
+                taxpayer_id = str(taxpayer["id"])
+                if taxpayer_id in checkpoint_results:
+                    continue
+                one_result = self.abs.check(username, password, [taxpayer])
+                if one_result.status in failed_statuses:
+                    failed_result = one_result
+                    break
+                if len(one_result.taxpayers) != 1:
+                    failed_result = AbsCheckResult(
+                        status=AbsStatus.TECHNICAL_ERROR,
+                        taxpayers=[],
+                        message=(
+                            "АБС вернула неполный или противоречивый ответ. "
+                            "Выполните проверку незавершённых лиц заново."
+                        ),
+                        is_fake=self.abs_is_fake(),
+                    )
+                    break
+                item = one_result.taxpayers[0]
+                item_status = item.get("result")
+                if (
+                    str(item.get("inn") or "") != str(taxpayer["inn"])
+                    or item_status not in checkpoint_statuses
+                    or (
+                        item_status == AbsStatus.FOUND
+                        and not one_result.is_fake
+                        and any(
+                            not isinstance(item.get(key), int)
+                            or isinstance(item.get(key), bool)
+                            or item.get(key) < 0
+                            for key in (
+                                "active_account_count",
+                                "closed_account_count",
+                            )
+                        )
+                    )
+                ):
+                    failed_result = AbsCheckResult(
+                        status=AbsStatus.TECHNICAL_ERROR,
+                        taxpayers=[],
+                        message=(
+                            "АБС вернула неполный или противоречивый ответ. "
+                            "Выполните проверку незавершённых лиц заново."
+                        ),
+                        is_fake=one_result.is_fake,
+                    )
+                    break
+                persist_checkpoint(taxpayer, item)
+                checkpoint_results[taxpayer_id] = item
+
+            if failed_result is not None:
+                result = failed_result
+            else:
+                ordered_results = [
+                    checkpoint_results[str(taxpayer["id"])]
+                    for taxpayer in valid_taxpayers
+                ]
+                ordered_results.extend(
+                    {
+                        "inn": taxpayer["inn"],
+                        "name": taxpayer["name"],
+                        "result": AbsStatus.INVALID_INN,
+                    }
+                    for taxpayer in invalid_taxpayers
+                )
+                result_values = {item["result"] for item in ordered_results}
+                result = AbsCheckResult(
+                    status=(
+                        AbsStatus.MULTIPLE
+                        if AbsStatus.MULTIPLE in result_values
+                        else AbsStatus.FOUND
+                        if AbsStatus.FOUND in result_values
+                        else AbsStatus.NOT_FOUND
+                    ),
+                    taxpayers=ordered_results,
+                    message="Проверка АБС завершена.",
+                    is_fake=self.abs_is_fake(),
+                )
         except Exception as exc:
             self._clear_abs_session()
-            self.db.execute(
-                """
-                UPDATE cases
-                SET status = ?, abs_status = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    CaseStatus.READY_FOR_ABS,
-                    AbsStatus.TECHNICAL_ERROR,
-                    utc_now(),
-                    case_id,
-                ),
-            )
+            requeue_failed_check(AbsStatus.TECHNICAL_ERROR)
             username = ""
             password = ""
             record_exception(
@@ -4209,19 +4505,80 @@ class WorkflowService:
                 },
             )
             raise
-        result.taxpayers.extend(
-            {
-                "inn": taxpayer["inn"],
-                "name": taxpayer["name"],
-                "result": AbsStatus.INVALID_INN,
+
+        validated_results: list[tuple[str, dict[str, Any]]] = []
+        if result.status not in failed_statuses:
+            expected_taxpayers = valid_taxpayers + invalid_taxpayers
+            anomaly = len(result.taxpayers) != len(expected_taxpayers)
+            valid_item_statuses = {
+                AbsStatus.FOUND,
+                AbsStatus.NOT_FOUND,
+                AbsStatus.MULTIPLE,
             }
-            for taxpayer in invalid_taxpayers
-        )
-        failed_statuses = {
-            AbsStatus.AUTH_ERROR,
-            AbsStatus.UNAVAILABLE,
-            AbsStatus.TECHNICAL_ERROR,
-        }
+            if not anomaly:
+                for expected, actual in zip(
+                    expected_taxpayers,
+                    result.taxpayers,
+                    strict=True,
+                ):
+                    actual_status = actual.get("result")
+                    expected_invalid = expected in invalid_taxpayers
+                    if (
+                        str(actual.get("inn") or "") != str(expected["inn"])
+                        or (
+                            expected_invalid
+                            and actual_status != AbsStatus.INVALID_INN
+                        )
+                        or (
+                            not expected_invalid
+                            and actual_status not in valid_item_statuses
+                        )
+                    ):
+                        anomaly = True
+                        break
+                    if actual_status == AbsStatus.FOUND and not result.is_fake:
+                        for key in (
+                            "active_account_count",
+                            "closed_account_count",
+                        ):
+                            count = actual.get(key)
+                            if (
+                                not isinstance(count, int)
+                                or isinstance(count, bool)
+                                or count < 0
+                            ):
+                                anomaly = True
+                                break
+                    if anomaly:
+                        break
+                    validated_results.append((str(expected["id"]), actual))
+
+            valid_status_values = [
+                item.get("result")
+                for item in result.taxpayers[: len(valid_taxpayers)]
+            ]
+            expected_case_status = (
+                AbsStatus.MULTIPLE
+                if AbsStatus.MULTIPLE in valid_status_values
+                else AbsStatus.FOUND
+                if AbsStatus.FOUND in valid_status_values
+                else AbsStatus.NOT_FOUND
+            )
+            if result.status != expected_case_status:
+                anomaly = True
+            if anomaly:
+                self._clear_abs_session()
+                result = AbsCheckResult(
+                    status=AbsStatus.TECHNICAL_ERROR,
+                    taxpayers=[],
+                    message=(
+                        "АБС вернула неполный или противоречивый ответ. "
+                        "Результаты не сохранены; выполните проверку заново."
+                    ),
+                    is_fake=self.abs_is_fake(),
+                )
+                validated_results = []
+
         if result.status in failed_statuses or not self.abs_session_supported():
             self._clear_abs_session()
         else:
@@ -4242,26 +4599,6 @@ class WorkflowService:
                 "result_count": len(result.taxpayers),
             },
         )
-
-        for taxpayer_result in result.taxpayers:
-            self.db.execute(
-                """
-                UPDATE taxpayers
-                SET abs_result = ?, abs_account_result = NULL,
-                    abs_active_account_count = ?,
-                    abs_closed_account_count = ?,
-                    odb_result = NULL, updated_at = ?
-                WHERE case_id = ? AND inn = ?
-                """,
-                (
-                    taxpayer_result["result"],
-                    taxpayer_result.get("active_account_count"),
-                    taxpayer_result.get("closed_account_count"),
-                    utc_now(),
-                    case_id,
-                    taxpayer_result["inn"],
-                ),
-            )
 
         threshold = self.get_period_threshold()
         start = (
@@ -4285,25 +4622,88 @@ class WorkflowService:
         else:
             next_status = CaseStatus.NEEDS_REVIEW
 
-        self.db.execute(
-            """
-            UPDATE cases
-            SET status = ?, abs_status = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (next_status, result.status, utc_now(), case_id),
-        )
-        self.db.audit(
-            "case",
-            case_id,
-            "fake_abs_checked" if result.is_fake else "abs_checked",
-            {
+        if result.status in failed_statuses:
+            requeue_failed_check(result.status)
+        else:
+            completed_at = utc_now()
+            audit_payload = {
                 "status": result.status,
                 "is_fake": result.is_fake,
                 "taxpayers": result.taxpayers,
                 "next_status": next_status,
-            },
-        )
+            }
+            try:
+                with self.db.connect() as connection:
+                    current = connection.execute(
+                        "SELECT status FROM cases WHERE id = ?",
+                        (case_id,),
+                    ).fetchone()
+                    if (
+                        not current
+                        or current["status"] != CaseStatus.ABS_CHECKING
+                    ):
+                        raise WorkflowValidationError(
+                            "Состояние обращения изменилось во время проверки АБС"
+                        )
+                    for taxpayer_id, taxpayer_result in validated_results:
+                        updated = connection.execute(
+                            """
+                            UPDATE taxpayers
+                            SET abs_result = ?, abs_account_result = NULL,
+                                abs_active_account_count = ?,
+                                abs_closed_account_count = ?,
+                                odb_result = NULL, updated_at = ?
+                            WHERE id = ? AND case_id = ?
+                            """,
+                            (
+                                taxpayer_result["result"],
+                                taxpayer_result.get("active_account_count"),
+                                taxpayer_result.get("closed_account_count"),
+                                completed_at,
+                                taxpayer_id,
+                                case_id,
+                            ),
+                        )
+                        if updated.rowcount != 1:
+                            raise WorkflowValidationError(
+                                "Состав лиц изменился во время проверки АБС"
+                            )
+                    updated_case = connection.execute(
+                        """
+                        UPDATE cases
+                        SET status = ?, abs_status = ?, updated_at = ?
+                        WHERE id = ? AND status = ?
+                        """,
+                        (
+                            next_status,
+                            result.status,
+                            completed_at,
+                            case_id,
+                            CaseStatus.ABS_CHECKING,
+                        ),
+                    )
+                    if updated_case.rowcount != 1:
+                        raise WorkflowValidationError(
+                            "Состояние обращения изменилось во время проверки АБС"
+                        )
+                    connection.execute(
+                        """
+                        INSERT INTO audit_events(
+                            entity_type, entity_id, event_type,
+                            actor, payload_json, created_at
+                        ) VALUES ('case', ?, ?, 'system', ?, ?)
+                        """,
+                        (
+                            case_id,
+                            "fake_abs_checked" if result.is_fake else "abs_checked",
+                            json.dumps(audit_payload, ensure_ascii=False),
+                            completed_at,
+                        ),
+                    )
+            except Exception:
+                self._clear_abs_session()
+                requeue_failed_check(AbsStatus.TECHNICAL_ERROR)
+                raise
         return result
 
     def auto_check_abs(self, case_id: str) -> bool:
@@ -4311,20 +4711,33 @@ class WorkflowService:
         if not case or case.get("status") != CaseStatus.READY_FOR_ABS:
             return False
         taxpayers = self.get_taxpayers(case_id)
+        credentials: tuple[str, str] | None = None
+        clear_after = False
         if taxpayers and all(
             len(re.sub(r"\D", "", taxpayer.get("inn") or "")) != 14
             for taxpayer in taxpayers
         ):
-            self.check_abs(case_id)
-            return True
-        if self.abs_is_fake():
-            self.check_abs(case_id, "local-auto", "local-auto")
-            self._clear_abs_session()
-            return True
-        if self.abs_session_active():
-            self.check_abs(case_id)
-            return True
-        return False
+            credentials = ("", "")
+        elif self.abs_is_fake():
+            credentials = ("local-auto", "local-auto")
+            clear_after = True
+        elif self.abs_session_active():
+            # Реальная сеть выполняется только фоновым координатором веб-
+            # приложения, чтобы пользовательский POST не ожидал Tolubay.
+            return False
+        else:
+            return False
+        try:
+            self.check_abs(case_id, *credentials)
+        except WorkflowValidationError:
+            refreshed = self.get_case(case_id)
+            if refreshed and refreshed.get("status") != CaseStatus.READY_FOR_ABS:
+                return False
+            raise
+        finally:
+            if clear_after:
+                self._clear_abs_session()
+        return True
 
     def confirm_odb(
         self,
@@ -4525,6 +4938,14 @@ class WorkflowService:
         )
         if not case or not taxpayer:
             raise WorkflowValidationError("Налогоплательщик не найден")
+        if (
+            case.get("status") != CaseStatus.NEEDS_REVIEW
+            or case.get("abs_status")
+            not in {AbsStatus.FOUND, AbsStatus.MULTIPLE}
+        ):
+            raise WorkflowValidationError(
+                "Сначала завершите проверку обращения в АБС"
+            )
         if taxpayer.get("abs_result") != AbsStatus.FOUND:
             raise WorkflowValidationError(
                 "Отметка счёта нужна только для найденной анкеты АБС"
@@ -4581,32 +5002,56 @@ class WorkflowService:
         username: str = "",
         password: str = "",
         business_date: date | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         day = business_date or datetime.now(self.BUSINESS_TIMEZONE).date()
-        cases = self.db.fetch_all(
-            """
-            SELECT cases.id
-            FROM cases
-            WHERE cases.status = ?
-              AND cases.fields_confirmed = 1
-            ORDER BY cases.created_at, cases.id
-            """,
+        initial = self.db.fetch_one(
+            "SELECT COUNT(*) AS count FROM cases WHERE status = ?",
             (CaseStatus.READY_FOR_ABS,),
-        )
-        if not cases:
+        ) or {"count": 0}
+        total_count = int(initial["count"] or 0)
+        if not total_count:
             raise WorkflowValidationError(
                 "Нет подтверждённых обращений, ожидающих АБС"
             )
 
         counts: dict[str, int] = {}
         processed_count = 0
+        processed_taxpayer_count = 0
         requires_login = False
         error_message = ""
-        for case in cases:
-            result = self.check_abs(case["id"], username, password)
+        while True:
+            case = self.db.fetch_one(
+                """
+                SELECT id FROM cases
+                WHERE status = ?
+                ORDER BY created_at, id
+                LIMIT 1
+                """,
+                (CaseStatus.READY_FOR_ABS,),
+            )
+            if not case:
+                break
+            try:
+                result = self.check_abs(case["id"], username, password)
+            except WorkflowValidationError:
+                refreshed = self.get_case(case["id"])
+                if refreshed and refreshed.get("status") != CaseStatus.READY_FOR_ABS:
+                    continue
+                raise
             processed_count += 1
+            processed_taxpayer_count += len(result.taxpayers)
             key = str(result.status)
             counts[key] = counts.get(key, 0) + 1
+            if progress_callback:
+                progress_callback(
+                    {
+                        "processed_cases": processed_count,
+                        "processed_taxpayers": processed_taxpayer_count,
+                        "initial_cases": total_count,
+                        "last_status": key,
+                    }
+                )
             if result.status in {
                 AbsStatus.AUTH_ERROR,
                 AbsStatus.UNAVAILABLE,
@@ -4630,13 +5075,21 @@ class WorkflowService:
             {
                 "business_date": day.isoformat(),
                 "case_count": processed_count,
+                "taxpayer_count": processed_taxpayer_count,
                 "results": counts,
                 "is_fake": self.abs_is_fake(),
             },
         )
+        remaining = self.db.fetch_one(
+            "SELECT COUNT(*) AS count FROM cases WHERE status = ?",
+            (CaseStatus.READY_FOR_ABS,),
+        ) or {"count": 0}
         return {
             "business_date": day.isoformat(),
             "case_count": processed_count,
+            "taxpayer_count": processed_taxpayer_count,
+            "initial_case_count": total_count,
+            "remaining_case_count": int(remaining["count"] or 0),
             "results": counts,
             "requires_login": requires_login,
             "error_message": error_message,
@@ -4990,7 +5443,8 @@ class WorkflowService:
                 (SELECT COUNT(*)
                  FROM taxpayers
                  JOIN cases ON cases.id = taxpayers.case_id
-                 WHERE taxpayers.abs_result = 'found'
+                 WHERE cases.status = 'needs_review'
+                   AND taxpayers.abs_result = 'found'
                    AND taxpayers.abs_account_result IS NULL)
                     AS review_accounts,
                 (SELECT COUNT(*)
@@ -5290,7 +5744,8 @@ class WorkflowService:
             )
         else:
             extra_where = (
-                "(taxpayers.abs_account_result = 'found' "
+                "cases.status IN ('needs_review', 'manual_period_rule') "
+                "AND (taxpayers.abs_account_result = 'found' "
                 "OR (taxpayers.abs_result = 'found' "
                 "AND taxpayers.abs_account_result IS NULL) "
                 "OR taxpayers.odb_result = 'found') "
@@ -8998,6 +9453,55 @@ class WorkflowService:
                     """,
                     (now, *group_ids),
                 )
+                releasable_letters = connection.execute(
+                    f"""
+                    SELECT response_letters.id, response_letters.outgoing_number,
+                           response_letters.response_group_id
+                    FROM response_letters
+                    WHERE response_letters.response_group_id IN ({placeholders})
+                      AND TRIM(COALESCE(response_letters.outgoing_number, '')) != ''
+                      AND NOT EXISTS (
+                          SELECT 1 FROM outlook_outgoing_messages
+                          WHERE outlook_outgoing_messages.response_letter_id =
+                                response_letters.id
+                      )
+                    """,
+                    group_ids,
+                ).fetchall()
+                for letter in releasable_letters:
+                    connection.execute(
+                        """
+                        UPDATE response_letters
+                        SET outgoing_number = NULL, assigned_at = NULL,
+                            updated_at = ?
+                        WHERE id = ? AND outgoing_number = ?
+                        """,
+                        (now, letter["id"], letter["outgoing_number"]),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO audit_events(
+                            entity_type, entity_id, event_type,
+                            actor, payload_json, created_at
+                        ) VALUES ('response_letter', ?, 'outgoing_number_released',
+                                  ?, ?, ?)
+                        """,
+                        (
+                            letter["id"],
+                            actor,
+                            json.dumps(
+                                {
+                                    "response_group_id": letter[
+                                        "response_group_id"
+                                    ],
+                                    "before": letter["outgoing_number"],
+                                    "reason": "manual_review_superseded",
+                                },
+                                ensure_ascii=False,
+                            ),
+                            now,
+                        ),
+                    )
                 connection.execute(
                     f"""
                     UPDATE response_groups

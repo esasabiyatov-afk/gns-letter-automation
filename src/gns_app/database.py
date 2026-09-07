@@ -463,6 +463,7 @@ class Database:
             self._ensure_gns_office_columns(connection)
             self._ensure_outlook_message_columns(connection)
             self._ensure_outlook_outgoing_columns(connection)
+            self._release_legacy_superseded_outgoing_numbers(connection)
             self._clean_legacy_district_places(connection)
             self._normalize_legacy_taxpayer_names(connection)
 
@@ -738,6 +739,62 @@ class Database:
                     f"ALTER TABLE outlook_outgoing_messages "
                     f"ADD COLUMN {column} {definition}"
                 )
+
+    @staticmethod
+    def _release_legacy_superseded_outgoing_numbers(
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Free discarded numbers only when no Outlook record exists."""
+
+        rows = connection.execute(
+            """
+            SELECT response_letters.id, response_letters.outgoing_number,
+                   response_letters.response_group_id
+            FROM response_letters
+            JOIN response_groups
+              ON response_groups.id = response_letters.response_group_id
+            WHERE response_groups.status = 'superseded'
+              AND TRIM(COALESCE(response_letters.outgoing_number, '')) != ''
+              AND NOT EXISTS (
+                  SELECT 1 FROM outlook_outgoing_messages
+                  WHERE outlook_outgoing_messages.response_letter_id =
+                        response_letters.id
+              )
+            """
+        ).fetchall()
+        if not rows:
+            return
+        now = utc_now()
+        for row in rows:
+            connection.execute(
+                """
+                UPDATE response_letters
+                SET outgoing_number = NULL, assigned_at = NULL, updated_at = ?
+                WHERE id = ? AND outgoing_number = ?
+                """,
+                (now, row["id"], row["outgoing_number"]),
+            )
+            connection.execute(
+                """
+                INSERT INTO audit_events(
+                    entity_type, entity_id, event_type,
+                    actor, payload_json, created_at
+                ) VALUES ('response_letter', ?, 'outgoing_number_released',
+                          'system', ?, ?)
+                """,
+                (
+                    row["id"],
+                    json.dumps(
+                        {
+                            "response_group_id": row["response_group_id"],
+                            "before": row["outgoing_number"],
+                            "reason": "legacy_superseded_without_outlook",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    now,
+                ),
+            )
 
     @staticmethod
     def _clean_legacy_district_places(

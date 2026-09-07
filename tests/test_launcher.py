@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import sys
+from contextlib import nullcontext
 
+from gns_app import launcher
 from gns_app.launcher import _server_command, supervise
 from gns_app.runtime_commands import module_command
 
@@ -50,3 +52,22 @@ def test_frozen_commands_use_hidden_app_and_separate_worker(
         "gns_app.services.scanner_service",
         "--wia-worker",
     ]
+
+
+def test_background_start_does_not_open_browser(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        launcher,
+        "WindowsSingleInstance",
+        lambda: nullcontext(),
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_run_server_process",
+        lambda command, *, open_browser: (
+            calls.append((command, open_browser)) or 0
+        ),
+    )
+
+    assert launcher.main(["--background"]) == 0
+    assert calls == [(_server_command(), False)]

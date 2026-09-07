@@ -911,7 +911,10 @@ class PyWin32OutlookGateway:
             )
         if not subject.strip() or len(subject) > 255 or "\n" in subject or "\r" in subject:
             raise OutlookConnectionError("Тема письма Outlook указана неверно.")
-        source = attachment_path.resolve()
+        # Keep a possible 8.3 representation intact.  ``Path.resolve()`` can
+        # expand it back to a Cyrillic/long profile path on Windows 8.1, after
+        # which the Outlook COM worker cannot reopen an otherwise valid file.
+        source = attachment_path
         if not source.is_file():
             raise OutlookConnectionError("Файл для вложения Outlook не найден.")
         try:
@@ -2428,6 +2431,44 @@ class OutlookOutgoingService:
                 digest.update(chunk)
         return digest.hexdigest()
 
+    def _prepare_outgoing_attachment(
+        self,
+        source: Path,
+        *,
+        operation_key: str,
+    ) -> tuple[OutlookStagingDirectory, Path]:
+        """Copy one outgoing PDF to a worker-safe, short ASCII path."""
+
+        run_id = "out-" + hashlib.sha256(
+            operation_key.encode("ascii", "strict")
+        ).hexdigest()[:24]
+        staging = _create_outlook_staging_directory(
+            _outlook_staging_roots(self.settings.runtime_dir),
+            run_id=run_id,
+        )
+        canonical_attachment = ensure_within(
+            staging.canonical_dir / "attachment.pdf",
+            staging.canonical_dir,
+        )
+        worker_attachment = ensure_within(
+            staging.worker_dir / "attachment.pdf",
+            staging.worker_dir,
+        )
+        try:
+            shutil.copy2(source, canonical_attachment)
+            if (
+                not worker_attachment.is_file()
+                or worker_attachment.stat().st_size != source.stat().st_size
+                or self._sha256_file(worker_attachment) != self._sha256_file(source)
+            ):
+                raise OSError("outgoing staging read-back failed")
+        except (OSError, StorageError) as exc:
+            shutil.rmtree(staging.canonical_dir, ignore_errors=True)
+            raise OutlookIntegrationError(
+                "Не удалось подготовить PDF для Outlook."
+            ) from exc
+        return staging, worker_attachment
+
     def create_draft(
         self,
         workflow: OutlookWorkflow,
@@ -2566,15 +2607,12 @@ class OutlookOutgoingService:
                 ),
             )
 
-        staging_root = ensure_within(
-            self.settings.runtime_dir / "outlook_outgoing_staging",
-            self.settings.runtime_dir,
-        )
-        run_dir = ensure_within(staging_root / message_id, staging_root)
-        attachment_path = run_dir / attachment_name
+        staging: OutlookStagingDirectory | None = None
         try:
-            run_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(pdf_path, attachment_path)
+            staging, attachment_path = self._prepare_outgoing_attachment(
+                pdf_path,
+                operation_key=f"draft-{message_id}",
+            )
             result = self.outlook.create_draft(
                 draft_key=draft_key,
                 recipient_email=recipient_email,
@@ -2617,8 +2655,8 @@ class OutlookOutgoingService:
                 )
             raise OutlookIntegrationError(message) from exc
         finally:
-            if run_dir.exists():
-                shutil.rmtree(run_dir, ignore_errors=True)
+            if staging is not None and staging.canonical_dir.exists():
+                shutil.rmtree(staging.canonical_dir, ignore_errors=True)
 
         self.db.execute(
             """
@@ -2990,18 +3028,12 @@ class OutlookOutgoingService:
                     ),
                 )
 
-            staging_root = ensure_within(
-                self.settings.runtime_dir / "outlook_outgoing_staging",
-                self.settings.runtime_dir,
-            )
-            run_dir = ensure_within(
-                staging_root / f"{stored_message_id}-resend-{sequence}",
-                staging_root,
-            )
-            attachment_path = run_dir / resend_attachment_name
+            staging: OutlookStagingDirectory | None = None
             try:
-                run_dir.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(pdf_path, attachment_path)
+                staging, attachment_path = self._prepare_outgoing_attachment(
+                    pdf_path,
+                    operation_key=f"resend-{stored_message_id}-{sequence}",
+                )
                 result = self.outlook.create_draft(
                     draft_key=draft_key,
                     recipient_email=str(row["recipient_email"]),
@@ -3025,8 +3057,8 @@ class OutlookOutgoingService:
                     )
                 raise OutlookIntegrationError(str(exc)) from exc
             finally:
-                if run_dir.exists():
-                    shutil.rmtree(run_dir, ignore_errors=True)
+                if staging is not None and staging.canonical_dir.exists():
+                    shutil.rmtree(staging.canonical_dir, ignore_errors=True)
 
             now = utc_now()
             self.db.execute(

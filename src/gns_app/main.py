@@ -37,6 +37,10 @@ from gns_app.diagnostics import (
     record_exception,
 )
 from gns_app.domain import AbsStatus
+from gns_app.services.autostart_service import (
+    AutostartError,
+    WindowsAutostartService,
+)
 from gns_app.services.storage import StorageError, ensure_within
 from gns_app.services.outlook_service import (
     OutlookInboxImporter,
@@ -68,8 +72,19 @@ outlook = OutlookService(
 )
 outlook_importer = OutlookInboxImporter(db, settings, outlook)
 outlook_outgoing = OutlookOutgoingService(db, settings, outlook)
+autostart = WindowsAutostartService()
 _outlook_import_activity_lock = Lock()
 _outlook_import_active = False
+_abs_batch_activity_lock = Lock()
+_abs_batch_active = False
+_abs_batch_status: dict[str, object] = {
+    "state": "idle",
+    "message": "",
+    "processed_cases": 0,
+    "processed_taxpayers": 0,
+    "initial_cases": 0,
+    "requires_login": False,
+}
 OUTLOOK_SENT_CHECK_INTERVAL_SECONDS = 30
 INCOMING_PAGE_SIZE = 50
 
@@ -92,6 +107,174 @@ def _release_outlook_import() -> None:
 def _outlook_import_is_active() -> bool:
     with _outlook_import_activity_lock:
         return _outlook_import_active
+
+
+def _abs_queue_counts() -> dict[str, int]:
+    row = db.fetch_one(
+        """
+        SELECT
+            SUM(CASE WHEN status = 'ready_for_abs' THEN 1 ELSE 0 END) AS ready,
+            SUM(CASE WHEN status = 'abs_checking' THEN 1 ELSE 0 END) AS checking
+        FROM cases
+        """
+    ) or {}
+    return {
+        "ready": int(row.get("ready") or 0),
+        "checking": int(row.get("checking") or 0),
+    }
+
+
+def _abs_batch_snapshot() -> dict[str, object]:
+    with _abs_batch_activity_lock:
+        snapshot = dict(_abs_batch_status)
+        snapshot["active"] = _abs_batch_active
+    snapshot.update(_abs_queue_counts())
+    return snapshot
+
+
+def _abs_batch_is_active() -> bool:
+    with _abs_batch_activity_lock:
+        return _abs_batch_active
+
+
+def _abs_batch_auto_start_allowed() -> bool:
+    with _abs_batch_activity_lock:
+        return (
+            not _abs_batch_active
+            and _abs_batch_status.get("state") != "error"
+        )
+
+
+def _update_abs_batch_status(**values: object) -> None:
+    with _abs_batch_activity_lock:
+        _abs_batch_status.update(values)
+
+
+def _claim_abs_batch() -> bool:
+    global _abs_batch_active, _abs_batch_status
+    counts = _abs_queue_counts()
+    with _abs_batch_activity_lock:
+        if _abs_batch_active:
+            return False
+        _abs_batch_active = True
+        _abs_batch_status = {
+            "state": "running",
+            "message": "Проверяется вся очередь АБС…",
+            "processed_cases": 0,
+            "processed_taxpayers": 0,
+            "initial_cases": counts["ready"],
+            "requires_login": False,
+        }
+        return True
+
+
+def _finish_abs_batch(**values: object) -> None:
+    global _abs_batch_active
+    with _abs_batch_activity_lock:
+        _abs_batch_status.update(values)
+        _abs_batch_active = False
+
+
+def _run_abs_batch(username: str = "", password: str = "") -> None:
+    def progress(values: dict[str, object]) -> None:
+        _update_abs_batch_status(
+            **values,
+            message=(
+                "АБС: проверено лиц — "
+                f"{values.get('processed_taxpayers', 0)}."
+            ),
+        )
+
+    try:
+        summary = workflow.check_abs_today(
+            username,
+            password,
+            progress_callback=progress,
+        )
+        if summary["requires_login"]:
+            _finish_abs_batch(
+                state="error",
+                message=summary["error_message"],
+                requires_login=True,
+                processed_cases=summary["case_count"],
+                processed_taxpayers=summary["taxpayer_count"],
+            )
+        else:
+            _finish_abs_batch(
+                state="completed",
+                message=(
+                    "Проверка АБС завершена. Лиц: "
+                    f"{summary['taxpayer_count']}."
+                ),
+                requires_login=False,
+                processed_cases=summary["case_count"],
+                processed_taxpayers=summary["taxpayer_count"],
+            )
+    except WorkflowValidationError as exc:
+        _finish_abs_batch(
+            state="error",
+            message=str(exc),
+            requires_login=not workflow.abs_session_active(),
+        )
+    except Exception as exc:
+        record_exception(
+            "abs",
+            "background_batch",
+            exc,
+            runtime_dir=settings.runtime_dir,
+        )
+        _finish_abs_batch(
+            state="error",
+            message=(
+                "Проверка АБС прервана. Результаты незавершённого "
+                "обращения не сохранены; запустите проверку заново."
+            ),
+            requires_login=not workflow.abs_session_active(),
+        )
+    finally:
+        # Локальные ссылки на введённые значения больше не нужны. Успешный
+        # сеанс хранится только внутри WorkflowService до ошибки/остановки.
+        username = ""
+        password = ""
+
+
+def _queue_abs_batch(
+    background_tasks: BackgroundTasks,
+    username: str = "",
+    password: str = "",
+) -> bool:
+    if _abs_batch_is_active():
+        return False
+    if (
+        not workflow.abs_session_active()
+        and (not username.strip() or not password)
+    ):
+        raise WorkflowValidationError(
+            "Введите логин и пароль для проверки АБС"
+        )
+    if not _claim_abs_batch():
+        return False
+    try:
+        background_tasks.add_task(_run_abs_batch, username, password)
+    except Exception:
+        _finish_abs_batch(
+            state="error",
+            message="Не удалось запустить проверку АБС.",
+            requires_login=not workflow.abs_session_active(),
+        )
+        raise
+    return True
+
+
+async def _abs_automation_loop() -> None:
+    """Drain new ABS work in background while an authenticated session lives."""
+
+    while True:
+        if workflow.abs_session_active() and _abs_batch_auto_start_allowed():
+            counts = await asyncio.to_thread(_abs_queue_counts)
+            if counts["ready"] and _claim_abs_batch():
+                await asyncio.to_thread(_run_abs_batch)
+        await asyncio.sleep(1)
 
 
 def _queue_outlook_import(background_tasks: BackgroundTasks) -> bool:
@@ -217,6 +400,70 @@ async def _outlook_sent_status_loop() -> None:
         await asyncio.sleep(delay_seconds)
 
 
+def _run_startup_maintenance() -> None:
+    record_event(
+        "application",
+        "startup_maintenance",
+        "started",
+        runtime_dir=settings.runtime_dir,
+    )
+    operations = (
+        ("gns_office_districts", workflow.reconcile_gns_office_districts),
+        ("gns_office_hints", workflow.reconcile_gns_office_hints),
+        ("structured_ocr_hints", workflow.reconcile_structured_ocr_hints),
+        ("recipient_names", workflow.reconcile_recipient_display_names),
+        (
+            "incomplete_official_documents",
+            workflow.reprocess_incomplete_official_documents,
+        ),
+        ("official_qr_pages", workflow.reconcile_official_qr_pages),
+        ("case_match_reviews", workflow.reconcile_case_match_reviews),
+        (
+            "confident_scan_decisions",
+            workflow.reconcile_confident_scan_decisions,
+        ),
+        ("cleaned_responses", workflow.repair_cleaned_responses),
+    )
+    for operation_name, operation in operations:
+        try:
+            operation()
+        except Exception as exc:
+            record_exception(
+                "application",
+                f"startup_{operation_name}",
+                exc,
+                runtime_dir=settings.runtime_dir,
+            )
+    try:
+        ocr_health = workflow.ocr.health_check()
+        record_event(
+            "ocr",
+            "startup_health",
+            "ready" if ocr_health.get("fast_initialized") else "unavailable",
+            details=ocr_health,
+            runtime_dir=settings.runtime_dir,
+        )
+    except Exception as exc:
+        record_exception(
+            "ocr",
+            "startup_health",
+            exc,
+            runtime_dir=settings.runtime_dir,
+        )
+    record_event(
+        "application",
+        "startup_maintenance",
+        "completed",
+        runtime_dir=settings.runtime_dir,
+    )
+
+
+async def _finish_startup_in_background(resume_ids: list[str]) -> None:
+    await asyncio.to_thread(_run_startup_maintenance)
+    if resume_ids:
+        await _resume_interrupted_uploads(resume_ids)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     record_event(
@@ -232,30 +479,10 @@ async def lifespan(_: FastAPI):
     try:
         settings.ensure_directories()
         db.initialize()
+        workflow.recover_interrupted_abs_checks()
         workflow.initialize_employee_profiles()
         workflow.initialize_gns_offices()
         workflow.initialize_gns_office_emails()
-        workflow.reconcile_gns_office_districts()
-        workflow.reconcile_gns_office_hints()
-        workflow.reconcile_structured_ocr_hints()
-        workflow.reconcile_recipient_display_names()
-        workflow.reprocess_incomplete_official_documents()
-        workflow.reconcile_official_qr_pages()
-        workflow.reconcile_case_match_reviews()
-        workflow.reconcile_confident_scan_decisions()
-        workflow.repair_cleaned_responses()
-        ocr_health = workflow.ocr.health_check()
-        record_event(
-            "ocr",
-            "startup_health",
-            (
-                "ready"
-                if ocr_health.get("fast_initialized")
-                else "unavailable"
-            ),
-            details=ocr_health,
-            runtime_dir=settings.runtime_dir,
-        )
     except Exception as exc:
         record_exception(
             "application",
@@ -271,15 +498,23 @@ async def lifespan(_: FastAPI):
         runtime_dir=settings.runtime_dir,
     )
     resume_ids = workflow.interrupted_upload_ids()
-    if resume_ids:
-        asyncio.create_task(_resume_interrupted_uploads(resume_ids))
+    startup_task = asyncio.create_task(
+        _finish_startup_in_background(resume_ids)
+    )
+    abs_task = asyncio.create_task(_abs_automation_loop())
     outlook_task = asyncio.create_task(_outlook_automation_loop())
     outlook_sent_task = asyncio.create_task(_outlook_sent_status_loop())
     try:
         yield
     finally:
+        startup_task.cancel()
+        abs_task.cancel()
         outlook_task.cancel()
         outlook_sent_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await startup_task
+        with suppress(asyncio.CancelledError):
+            await abs_task
         with suppress(asyncio.CancelledError):
             await outlook_task
         with suppress(asyncio.CancelledError):
@@ -418,6 +653,7 @@ EVENT_LABELS = {
     "fake_abs_checked": "Выполнена тестовая проверка АБС",
     "abs_checked": "Выполнена проверка АБС Tolubay",
     "abs_skipped_invalid_inn": "АБС пропущена: нестандартная длина ИНН",
+    "abs_interrupted_requeued": "Прерванная проверка АБС возвращена в очередь",
     "fake_abs_startup_rolled_back": "Отменена массовая автопроверка АБС",
     "fake_abs_batch_checked": "Выполнена пакетная проверка АБС",
     "abs_batch_checked": "Выполнена пакетная проверка АБС Tolubay",
@@ -545,6 +781,7 @@ def context(request: Request, **values):
         "abs_login_required": False,
         "abs_session_supported": workflow.abs_session_supported(),
         "abs_is_fake": workflow.abs_is_fake(),
+        "abs_batch_status": _abs_batch_snapshot(),
         "abs_tls_verification_disabled": (
             workflow.abs_tls_verification_disabled()
         ),
@@ -936,6 +1173,7 @@ def settings_page(request: Request, message: str = "", error: str = ""):
             outlook_import_stats=outlook_importer.stats(),
             outlook_subject_template=outlook_outgoing.get_subject_template(),
             gns_offices=workflow.list_gns_offices(),
+            autostart_status=autostart.status(),
             message=message,
             error=error,
         ),
@@ -1300,37 +1538,50 @@ def reset_processing_data(
     )
 
 
+@app.post("/settings/autostart")
+def update_autostart(enabled: bool = Form(False)):
+    try:
+        autostart.set_enabled(enabled)
+    except AutostartError as exc:
+        return RedirectResponse(
+            f"/settings?error={quote(str(exc))}#service",
+            status_code=303,
+        )
+    message = "Автозапуск включён." if enabled else "Автозапуск отключён."
+    return RedirectResponse(
+        f"/settings?message={quote(message)}#service",
+        status_code=303,
+    )
+
+
 @app.post("/today/abs")
 def abs_check_today(
+    background_tasks: BackgroundTasks,
     username: str = Form(""),
     password: str = Form(""),
 ):
     try:
-        summary = workflow.check_abs_today(username, password)
+        started = _queue_abs_batch(background_tasks, username, password)
     except WorkflowValidationError as exc:
         return RedirectResponse(
-            "/?tab=responses&response_view=prepare&error="
+            "/?tab=responses&response_view=prepare&abs_login=1&error="
             + quote(str(exc)),
             status_code=303,
         )
-    if summary["requires_login"]:
-        return RedirectResponse(
-            (
-                "/?tab=responses&response_view=prepare&abs_login=1&error="
-                + quote(summary["error_message"])
-            ),
-            status_code=303,
-        )
+    message = (
+        "Проверка всей очереди АБС запущена в фоне."
+        if started
+        else "Проверка всей очереди АБС уже выполняется."
+    )
     return RedirectResponse(
-        (
-            "/?tab=responses&response_view=prepare&message="
-            + quote(
-                "Пакетная проверка завершена. Обращений: "
-                f"{summary['case_count']}."
-            )
-        ),
+        "/?tab=responses&response_view=prepare&message=" + quote(message),
         status_code=303,
     )
+
+
+@app.get("/api/abs/batch-status")
+def abs_batch_status():
+    return _abs_batch_snapshot()
 
 
 @app.post("/cases/{case_id}/abs-account/taxpayer")
@@ -2659,32 +2910,26 @@ def correct_taxpayer(
 @app.post("/cases/{case_id}/abs")
 def abs_check(
     case_id: str,
+    background_tasks: BackgroundTasks,
     username: str = Form(""),
     password: str = Form(""),
 ):
     try:
-        result = workflow.check_abs(case_id, username, password)
-        message = result.message
-        if result.is_fake:
-            message += " Используется тестовая АБС."
-        if result.status in {
-            AbsStatus.AUTH_ERROR,
-            AbsStatus.UNAVAILABLE,
-            AbsStatus.TECHNICAL_ERROR,
-        }:
-            return RedirectResponse(
-                f"/cases/{case_id}?abs_login=1&error={quote(message)}",
-                status_code=303,
-            )
-        return RedirectResponse(
-            f"/cases/{case_id}?message={quote(message)}",
-            status_code=303,
-        )
+        started = _queue_abs_batch(background_tasks, username, password)
     except WorkflowValidationError as exc:
         return RedirectResponse(
-            f"/cases/{case_id}?error={quote(str(exc))}",
+            f"/cases/{case_id}?abs_login=1&error={quote(str(exc))}",
             status_code=303,
         )
+    message = (
+        "Проверка всей очереди АБС запущена в фоне."
+        if started
+        else "Проверка всей очереди АБС уже выполняется."
+    )
+    return RedirectResponse(
+        f"/cases/{case_id}?message={quote(message)}",
+        status_code=303,
+    )
 
 
 @app.post("/cases/{case_id}/registry/accept")

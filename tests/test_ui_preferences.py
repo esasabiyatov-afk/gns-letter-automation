@@ -1,5 +1,7 @@
 from dataclasses import replace
 
+from fastapi import BackgroundTasks
+
 from gns_app.text_cleanup import clean_taxpayer_name
 
 
@@ -81,6 +83,37 @@ def test_abs_login_dialog_auto_opens_after_session_error(workflow, monkeypatch):
     assert 'id="today-abs-dialog" class="modal"' in response.text
     assert "data-auto-open" in response.text
     assert "Войдите один раз" in response.text
+
+
+def test_abs_batch_is_queued_without_running_in_request(workflow, monkeypatch):
+    from gns_app import main
+
+    called = False
+
+    def unexpected_run(*_args, **_kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(main, "workflow", workflow)
+    monkeypatch.setattr(main, "_run_abs_batch", unexpected_run)
+    monkeypatch.setattr(
+        main,
+        "_abs_queue_counts",
+        lambda: {"ready": 2, "checking": 0},
+    )
+    monkeypatch.setattr(main, "_abs_batch_active", False)
+    monkeypatch.setattr(
+        main,
+        "_abs_batch_status",
+        {"state": "idle", "message": ""},
+    )
+    background_tasks = BackgroundTasks()
+
+    assert main._queue_abs_batch(background_tasks, "employee", "secret")
+    assert len(background_tasks.tasks) == 1
+    assert not called
+
+    main._finish_abs_batch(state="completed")
 
 
 def test_outlook_test_mode_is_shown_without_certificate_warning(workflow, monkeypatch):
@@ -253,6 +286,45 @@ def test_office_directory_is_editable_from_settings(workflow, monkeypatch):
     assert all(
         item["id"] != office["id"] for item in workflow.list_gns_offices()
     )
+
+
+def test_portable_autostart_is_controlled_from_settings(workflow, monkeypatch):
+    from starlette.testclient import TestClient
+
+    from gns_app import main
+
+    class FakeAutostart:
+        enabled = False
+
+        @classmethod
+        def status(cls):
+            return {
+                "supported": True,
+                "enabled": cls.enabled,
+                "needs_update": False,
+                "error": "",
+            }
+
+        @classmethod
+        def set_enabled(cls, enabled):
+            cls.enabled = enabled
+            return cls.status()
+
+    monkeypatch.setattr(main, "workflow", workflow)
+    monkeypatch.setattr(main, "autostart", FakeAutostart())
+    client = TestClient(main.app)
+
+    page = client.get("/settings#service")
+    assert page.status_code == 200
+    assert "Запускать вместе с Windows" in page.text
+
+    saved = client.post(
+        "/settings/autostart",
+        data={"enabled": "true"},
+        follow_redirects=False,
+    )
+    assert saved.status_code == 303
+    assert FakeAutostart.enabled
 
 
 def test_registry_priority_defaults_to_osoo(workflow):

@@ -23,6 +23,17 @@ WIA_FORMAT_PNG = "{B96B3CAF-0728-11D3-9D7B-0000F81EF32E}"
 WIA_IPS_CUR_INTENT = 6146
 WIA_IPS_XRES = 6147
 WIA_IPS_YRES = 6148
+WIA_IPS_XPOS = 6149
+WIA_IPS_YPOS = 6150
+WIA_IPS_XEXTENT = 6151
+WIA_IPS_YEXTENT = 6152
+
+# A4 in inches.  WIA extent properties are expressed in pixels at the
+# selected resolution.  The driver may expose a smaller maximum; in that case
+# we use its full available bed instead of silently keeping an old crop.
+A4_WIDTH_INCHES = 8.27
+A4_HEIGHT_INCHES = 11.69
+MIN_A4_CAPTURE_RATIO = 0.70
 
 DEFAULT_SCANNER_DPI = 150
 SCANNER_DPI_CHOICES = (150, 200, 300)
@@ -208,7 +219,58 @@ def _set_wia_property(item, property_id: int, value: int, label: str) -> None:
         ) from exc
 
 
-def _apply_wia_profile(item, dpi: int, color_mode: str) -> None:
+def _property_number(prop, *names: str) -> int | None:
+    for name in names:
+        try:
+            value = getattr(prop, name)
+            if value is not None:
+                return int(value)
+        except (AttributeError, TypeError, ValueError):
+            continue
+    return None
+
+
+def _fit_wia_property(prop, requested: int) -> int:
+    """Clamp and align a WIA value to the range advertised by the driver."""
+
+    minimum = _property_number(prop, "SubTypeMin", "SubTypeMinValue")
+    maximum = _property_number(prop, "SubTypeMax", "SubTypeMaxValue")
+    step = _property_number(prop, "SubTypeStep", "SubTypeStepValue")
+    value = max(0, int(requested))
+    if minimum is not None:
+        value = max(value, minimum)
+    if maximum is not None:
+        value = min(value, maximum)
+    if step and step > 1 and minimum is not None:
+        value = minimum + ((value - minimum) // step) * step
+    return value
+
+
+def _set_fitted_wia_property(
+    item,
+    property_id: int,
+    requested: int,
+    label: str,
+) -> int:
+    prop = _wia_property(item, property_id)
+    if prop is None:
+        raise ScannerError(
+            f"WIA-драйвер не поддерживает настройку «{label}». "
+            "Загрузите готовый файл."
+        )
+    value = _fit_wia_property(prop, requested)
+    try:
+        prop.Value = value
+        actual = int(prop.Value)
+    except Exception as exc:
+        raise ScannerError(
+            f"WIA-драйвер не поддерживает выбранное значение «{label}». "
+            "Загрузите готовый файл."
+        ) from exc
+    return actual
+
+
+def _apply_wia_profile(item, dpi: int, color_mode: str) -> dict[str, int]:
     # Сначала задаём тип изображения: некоторые драйверы при этом обновляют
     # доступный диапазон разрешений. DPI устанавливается после режима.
     intent = SCANNER_COLOR_INTENTS[color_mode] | WIA_MINIMIZE_SIZE
@@ -220,6 +282,54 @@ def _apply_wia_profile(item, dpi: int, color_mode: str) -> None:
     )
     _set_wia_property(item, WIA_IPS_XRES, dpi, "разрешение по горизонтали")
     _set_wia_property(item, WIA_IPS_YRES, dpi, "разрешение по вертикали")
+    # Some Windows 8.1 WIA drivers retain the small crop from a previous
+    # application unless all four scan-bed properties are explicitly reset.
+    x_pos = _set_fitted_wia_property(item, WIA_IPS_XPOS, 0, "начало области X")
+    y_pos = _set_fitted_wia_property(item, WIA_IPS_YPOS, 0, "начало области Y")
+    x_extent = _set_fitted_wia_property(
+        item,
+        WIA_IPS_XEXTENT,
+        round(A4_WIDTH_INCHES * dpi),
+        "ширина области",
+    )
+    y_extent = _set_fitted_wia_property(
+        item,
+        WIA_IPS_YEXTENT,
+        round(A4_HEIGHT_INCHES * dpi),
+        "высота области",
+    )
+    expected_width = round(A4_WIDTH_INCHES * dpi)
+    expected_height = round(A4_HEIGHT_INCHES * dpi)
+    if (
+        x_extent < expected_width * MIN_A4_CAPTURE_RATIO
+        or y_extent < expected_height * MIN_A4_CAPTURE_RATIO
+    ):
+        raise ScannerError(
+            "WIA-драйвер вернул слишком маленькую область сканирования. "
+            "Лист не сохранён; загрузите готовый файл или проверьте драйвер МФУ."
+        )
+    return {
+        "x_pos": x_pos,
+        "y_pos": y_pos,
+        "x_extent": x_extent,
+        "y_extent": y_extent,
+    }
+
+
+def _verify_image_extent(image, *, dpi: int, profile: dict[str, int]) -> None:
+    """Reject a driver result that is materially smaller than requested."""
+
+    width = _property_number(image, "Width", "width")
+    height = _property_number(image, "Height", "height")
+    if width is None or height is None:
+        return
+    min_width = round(A4_WIDTH_INCHES * dpi * MIN_A4_CAPTURE_RATIO)
+    min_height = round(A4_HEIGHT_INCHES * dpi * MIN_A4_CAPTURE_RATIO)
+    if width < min_width or height < min_height:
+        raise ScannerError(
+            "Сканер вернул неполный лист. Лист не сохранён; "
+            "проверьте область сканирования в драйвере МФУ."
+        )
 
 
 def _wia_worker(
@@ -251,11 +361,12 @@ def _wia_worker(
             print(json.dumps({"message": "Сканирование отменено"}))
             return 2
         item = _first_wia_item(device)
-        _apply_wia_profile(item, dpi, color_mode)
+        profile = _apply_wia_profile(item, dpi, color_mode)
         image = dialog.ShowTransfer(item, WIA_FORMAT_PNG, False)
         if image is None:
             print(json.dumps({"message": "Сканирование отменено"}))
             return 2
+        _verify_image_extent(image, dpi=dpi, profile=profile)
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.unlink(missing_ok=True)
         image.SaveFile(str(destination))

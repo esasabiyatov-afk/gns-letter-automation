@@ -102,6 +102,27 @@ def _insert_ready_case(
     return case_id
 
 
+def _insert_case_taxpayer(workflow, case_id: str, inn: str, name: str) -> str:
+    taxpayer_id = uuid4().hex
+    now = utc_now()
+    next_order = workflow.db.fetch_one(
+        "SELECT COALESCE(MAX(display_order), 0) + 1 AS value "
+        "FROM taxpayers WHERE case_id = ?",
+        (case_id,),
+    )["value"]
+    workflow.db.execute(
+        """
+        INSERT INTO taxpayers(
+            id, case_id, display_order, name, inn,
+            name_source, inn_source, manually_confirmed,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 'manual', 'manual', 1, ?, ?)
+        """,
+        (taxpayer_id, case_id, next_order, name, inn, now, now),
+    )
+    return taxpayer_id
+
+
 def test_today_batch_checks_and_groups_by_recipient(workflow):
     first = _insert_ready_case(
         workflow, "12345678901234", 'ОсОО "Первый"'
@@ -828,6 +849,176 @@ def test_abs_error_clears_session_and_requires_login(
     assert result.status == expected_status
     assert not workflow.abs_session_active()
     assert workflow.abs_login_required()
+
+
+def test_abs_preserves_first_person_when_second_person_fails(workflow):
+    case_id = _insert_ready_case(
+        workflow, "12345678901234", 'ОсОО "Первый"'
+    )
+    _insert_case_taxpayer(
+        workflow, case_id, "23456789012345", 'ОсОО "Второй"'
+    )
+
+    class FailingSecondPersonGateway:
+        is_fake = False
+        supports_session = True
+
+        @staticmethod
+        def check(username, password, taxpayers):
+            if taxpayers[0]["inn"] == "23456789012345":
+                return AbsCheckResult(
+                    status=AbsStatus.UNAVAILABLE,
+                    taxpayers=[],
+                    message="АБС недоступна.",
+                    is_fake=False,
+                )
+            return AbsCheckResult(
+                status=AbsStatus.NOT_FOUND,
+                taxpayers=[
+                    {
+                        "inn": taxpayers[0]["inn"],
+                        "name": taxpayers[0]["name"],
+                        "result": AbsStatus.NOT_FOUND,
+                    }
+                ],
+                message="Не найдено.",
+                is_fake=False,
+            )
+
+    workflow.abs = FailingSecondPersonGateway()
+
+    result = workflow.check_abs(case_id, "employee", "secret")
+
+    assert result.status == AbsStatus.UNAVAILABLE
+    assert workflow.get_case(case_id)["status"] == CaseStatus.READY_FOR_ABS
+    assert workflow.get_case(case_id)["abs_status"] == AbsStatus.UNAVAILABLE
+    taxpayers = workflow.get_taxpayers(case_id)
+    assert taxpayers[0]["abs_result"] == AbsStatus.NOT_FOUND
+    assert taxpayers[1]["abs_result"] is None
+    assert not workflow.abs_session_active()
+
+
+def test_abs_retry_checks_only_unfinished_people(workflow):
+    case_id = _insert_ready_case(workflow, "12345678901234", 'ОсОО "Первый"')
+    _insert_case_taxpayer(workflow, case_id, "23456789012345", 'ОсОО "Второй"')
+
+    class Gateway:
+        is_fake = False
+        supports_session = True
+
+        def __init__(self):
+            self.calls = []
+            self.fail_second = True
+
+        def check(self, username, password, taxpayers):
+            inn = taxpayers[0]["inn"]
+            self.calls.append(inn)
+            if self.fail_second and inn == "23456789012345":
+                return AbsCheckResult(
+                    status=AbsStatus.UNAVAILABLE,
+                    taxpayers=[],
+                    message="АБС недоступна.",
+                    is_fake=False,
+                )
+            return AbsCheckResult(
+                status=AbsStatus.NOT_FOUND,
+                taxpayers=[{
+                    "inn": inn,
+                    "name": taxpayers[0]["name"],
+                    "result": AbsStatus.NOT_FOUND,
+                }],
+                message="Не найдено.",
+                is_fake=False,
+            )
+
+    gateway = Gateway()
+    workflow.abs = gateway
+    failed = workflow.check_abs(case_id, "employee", "secret")
+    assert failed.status == AbsStatus.UNAVAILABLE
+    gateway.fail_second = False
+    completed = workflow.check_abs(case_id, "employee", "secret")
+
+    assert completed.status == AbsStatus.NOT_FOUND
+    assert gateway.calls == ["12345678901234", "23456789012345", "23456789012345"]
+    assert all(
+        taxpayer["abs_result"] == AbsStatus.NOT_FOUND
+        for taxpayer in workflow.get_taxpayers(case_id)
+    )
+
+
+def test_abs_batch_stops_on_error_and_leaves_remaining_cases_untouched(workflow):
+    first = _insert_ready_case(workflow, "12345678901234", "Первый")
+    second = _insert_ready_case(workflow, "23456789012345", "Второй")
+    third = _insert_ready_case(workflow, "34567890123456", "Третий")
+    for index, case_id in enumerate((first, second, third), 1):
+        workflow.db.execute(
+            "UPDATE cases SET created_at = ? WHERE id = ?",
+            (f"2026-01-01T00:00:0{index}+00:00", case_id),
+        )
+
+    class FailingSecondGateway:
+        is_fake = False
+        supports_session = True
+
+        @staticmethod
+        def check(username, password, taxpayers):
+            if taxpayers[0]["inn"] == "23456789012345":
+                return AbsCheckResult(
+                    status=AbsStatus.UNAVAILABLE,
+                    taxpayers=[],
+                    message="АБС недоступна.",
+                    is_fake=False,
+                )
+            return AbsCheckResult(
+                status=AbsStatus.NOT_FOUND,
+                taxpayers=[
+                    {
+                        "inn": item["inn"],
+                        "name": item["name"],
+                        "result": AbsStatus.NOT_FOUND,
+                    }
+                    for item in taxpayers
+                ],
+                message="Не найдено.",
+                is_fake=False,
+            )
+
+    workflow.abs = FailingSecondGateway()
+
+    summary = workflow.check_abs_today("employee", "secret")
+
+    assert summary["requires_login"]
+    assert summary["case_count"] == 2
+    assert workflow.get_case(first)["status"] == CaseStatus.READY_FOR_RESPONSE
+    assert workflow.get_taxpayers(first)[0]["abs_result"] == AbsStatus.NOT_FOUND
+    for case_id in (second, third):
+        assert workflow.get_case(case_id)["status"] == CaseStatus.READY_FOR_ABS
+        assert workflow.get_taxpayers(case_id)[0]["abs_result"] is None
+
+
+def test_interrupted_abs_check_preserves_completed_taxpayer_checkpoint(workflow):
+    case_id = _insert_ready_case(workflow, "12345678901234", "Клиент")
+    workflow.db.execute(
+        "UPDATE cases SET status = 'abs_checking', abs_status = 'checking' "
+        "WHERE id = ?",
+        (case_id,),
+    )
+    workflow.db.execute(
+        "UPDATE taxpayers SET abs_result = 'found', "
+        "abs_account_result = 'found', abs_active_account_count = 1 "
+        "WHERE case_id = ?",
+        (case_id,),
+    )
+
+    assert workflow.recover_interrupted_abs_checks() == 1
+
+    case = workflow.get_case(case_id)
+    taxpayer = workflow.get_taxpayers(case_id)[0]
+    assert case["status"] == CaseStatus.READY_FOR_ABS
+    assert case["abs_status"] == AbsStatus.TECHNICAL_ERROR
+    assert taxpayer["abs_result"] == AbsStatus.FOUND
+    assert taxpayer["abs_account_result"] == AbsStatus.FOUND
+    assert taxpayer["abs_active_account_count"] == 1
 
 
 def test_real_abs_credentials_are_not_reused_between_checks(workflow):
@@ -1631,6 +1822,7 @@ def test_restart_manual_review_supersedes_only_unsent_response_group(workflow):
         (group_id,),
     )
     assert letter is not None
+    workflow.set_outgoing_number(letter["id"], "9544")
     scan = workflow.register_signed_response_scan(
         letter["id"], "signed.png", _png_scan()
     )
@@ -1641,6 +1833,14 @@ def test_restart_manual_review_supersedes_only_unsent_response_group(workflow):
     assert workflow.get_case(case_id)["status"] == "needs_review"
     assert workflow.get_response_group(group_id)["status"] == "superseded"
     assert workflow.get_signed_response_scan(scan["id"])["status"] == "superseded"
+    released = workflow.get_response_letter(letter["id"])
+    assert released["outgoing_number"] is None
+    audit = workflow.db.fetch_one(
+        "SELECT event_type FROM audit_events WHERE entity_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (letter["id"],),
+    )
+    assert audit == {"event_type": "outgoing_number_released"}
     assert not workflow.today_overview()["generated_groups"]
 
 
@@ -2440,7 +2640,8 @@ def test_found_abs_questionnaire_with_account_stays_manual(workflow):
         (case_id,),
     )
     workflow.db.execute(
-        "UPDATE cases SET status = 'needs_review' WHERE id = ?",
+        "UPDATE cases SET status = 'needs_review', abs_status = 'found' "
+        "WHERE id = ?",
         (case_id,),
     )
 

@@ -41,6 +41,10 @@ def test_wia_worker_applies_saved_profile_and_prefers_smaller_transfer(
         scanner_service.WIA_IPS_CUR_INTENT: Property(),
         scanner_service.WIA_IPS_XRES: Property(),
         scanner_service.WIA_IPS_YRES: Property(),
+        scanner_service.WIA_IPS_XPOS: Property(),
+        scanner_service.WIA_IPS_YPOS: Property(),
+        scanner_service.WIA_IPS_XEXTENT: Property(),
+        scanner_service.WIA_IPS_YEXTENT: Property(),
     }
 
     class Properties:
@@ -81,6 +85,14 @@ def test_wia_worker_applies_saved_profile_and_prefers_smaller_transfer(
     )
     assert properties[scanner_service.WIA_IPS_XRES].Value == 200
     assert properties[scanner_service.WIA_IPS_YRES].Value == 200
+    assert properties[scanner_service.WIA_IPS_XPOS].Value == 0
+    assert properties[scanner_service.WIA_IPS_YPOS].Value == 0
+    assert properties[scanner_service.WIA_IPS_XEXTENT].Value == round(
+        scanner_service.A4_WIDTH_INCHES * 200
+    )
+    assert properties[scanner_service.WIA_IPS_YEXTENT].Value == round(
+        scanner_service.A4_HEIGHT_INCHES * 200
+    )
     assert calls == [
         (
             "select",
@@ -136,6 +148,34 @@ def test_wia_worker_reports_unsupported_profile_property(
     message = json.loads(capsys.readouterr().out)["message"]
     assert "разрешение по вертикали" in message
     assert "загрузите готовый файл" in message
+
+
+def test_wia_profile_rejects_retained_small_crop():
+    class Property:
+        def __init__(self, maximum=None):
+            self.Value = None
+            self.SubTypeMin = 0
+            self.SubTypeMax = maximum
+
+    properties = {
+        scanner_service.WIA_IPS_CUR_INTENT: Property(),
+        scanner_service.WIA_IPS_XRES: Property(),
+        scanner_service.WIA_IPS_YRES: Property(),
+        scanner_service.WIA_IPS_XPOS: Property(),
+        scanner_service.WIA_IPS_YPOS: Property(),
+        scanner_service.WIA_IPS_XEXTENT: Property(300),
+        scanner_service.WIA_IPS_YEXTENT: Property(300),
+    }
+    item = SimpleNamespace(
+        Properties=SimpleNamespace(Item=lambda key: properties[int(key)])
+    )
+
+    try:
+        scanner_service._apply_wia_profile(item, 150, "grayscale")
+    except scanner_service.ScannerError as exc:
+        assert "слишком маленькую область" in str(exc)
+    else:
+        raise AssertionError("small WIA crop must not be accepted")
 
 
 def test_scanner_service_passes_profile_to_worker(monkeypatch, tmp_path):

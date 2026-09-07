@@ -118,7 +118,7 @@ def _open_application_when_ready(process: subprocess.Popen[object]) -> None:
                     record_event("launcher", "browser_open", "success")
                     return
         except (OSError, TimeoutError):
-            time.sleep(0.5)
+            time.sleep(0.2)
     record_event("launcher", "browser_open", "server_not_ready")
 
 
@@ -157,7 +157,7 @@ def main(arguments: list[str] | None = None) -> int:
         return _run_worker(arguments[1], arguments[2:])
 
     command = _server_command()
-    browser_pending = True
+    browser_pending = "--background" not in arguments
     record_event(
         "launcher",
         "application_start",

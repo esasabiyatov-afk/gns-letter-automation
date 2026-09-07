@@ -8,7 +8,8 @@
         href="{{ url_for('static', path='/styles.css') }}?v={{ asset_version }}">
   {% block head %}{% endblock %}
 </head>
-<body class="{% block body_class %}{% endblock %}">
+<body class="{% block body_class %}{% endblock %}"
+      data-abs-batch-active="{{ 'true' if abs_batch_status.active else 'false' }}">
   <header class="app-header">
     <a class="brand" href="/">
       <span class="brand-mark">ГНС</span>
@@ -43,6 +44,11 @@
           Исходящие письма работают в тестовом режиме: все получатели заменены
           на {{ outlook_test_email }}.
         {% endif %}
+      </div>
+    {% endif %}
+    {% if abs_batch_status.active %}
+      <div class="alert alert-success" data-abs-batch-monitor aria-live="polite">
+        <span data-abs-batch-message>{{ abs_batch_status.message }}</span>
       </div>
     {% endif %}
     {% block content %}{% endblock %}

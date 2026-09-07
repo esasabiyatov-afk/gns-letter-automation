@@ -364,6 +364,51 @@
   };
   bindIncomingWorkspace(document.querySelector(incomingWorkspaceSelector));
 
+  let absBatchPoll = null;
+  const pollAbsBatch = async () => {
+    try {
+      const response = await fetch("/api/abs/batch-status", {
+        headers: { Accept: "application/json" },
+      });
+      if (!response.ok) throw new Error("abs_batch_status_failed");
+      const payload = await response.json();
+      const monitor = document.querySelector("[data-abs-batch-monitor]");
+      const message = monitor?.querySelector("[data-abs-batch-message]");
+      if (payload.active) {
+        if (message) {
+          const processed = Number(payload.processed_taxpayers || 0);
+          const ready = Number(payload.ready || 0);
+          message.textContent = `АБС: лиц проверено ${processed}, обращений осталось ${ready}.`;
+        }
+        absBatchPoll = window.setTimeout(pollAbsBatch, 1000);
+        return;
+      }
+      absBatchPoll = null;
+      const url = new URL(window.location.href);
+      url.searchParams.delete("message");
+      url.searchParams.delete("error");
+      url.searchParams.delete("abs_login");
+      if (payload.state === "error") {
+        url.searchParams.set(
+          "error",
+          payload.message || "Проверка АБС прервана. Запустите её заново.",
+        );
+        if (payload.requires_login) url.searchParams.set("abs_login", "1");
+      } else {
+        url.searchParams.set(
+          "message",
+          payload.message || "Проверка АБС завершена.",
+        );
+      }
+      window.location.replace(url);
+    } catch (_error) {
+      absBatchPoll = window.setTimeout(pollAbsBatch, 2000);
+    }
+  };
+  if (document.body.dataset.absBatchActive === "true") {
+    absBatchPoll = window.setTimeout(pollAbsBatch, 250);
+  }
+
   document.querySelectorAll("[data-open-dialog]").forEach((button) => {
     button.addEventListener("click", () => {
       document.getElementById(button.dataset.openDialog)?.showModal();
