@@ -1829,6 +1829,58 @@ def test_outlook_staging_uses_short_ascii_path_for_cyrillic_directory(
     assert str(staging.worker_dir).isascii()
 
 
+def test_worker_attachment_path_preserves_validated_83_spelling(
+    monkeypatch,
+    tmp_path,
+):
+    from gns_app.services import outlook_service
+
+    canonical_dir = tmp_path / "long-unicode-path"
+    canonical_dir.mkdir()
+    worker_dir = Path("C:/GNSO~1/OUT-123")
+    staging = outlook_service.OutlookStagingDirectory(
+        canonical_root=canonical_dir.parent,
+        canonical_dir=canonical_dir,
+        worker_dir=worker_dir,
+    )
+    validated = []
+
+    def fake_ensure_within(path, root):
+        validated.append((path, root))
+        return canonical_dir / path.name
+
+    monkeypatch.setattr(outlook_service, "ensure_within", fake_ensure_within)
+
+    result = outlook_service._worker_attachment_path(
+        staging,
+        "attachment.pdf",
+    )
+
+    assert result == worker_dir / "attachment.pdf"
+    assert validated == [(worker_dir / "attachment.pdf", worker_dir)]
+
+
+def test_worker_attachment_reports_access_error_without_path(
+    monkeypatch,
+):
+    from gns_app.services import outlook_service
+
+    class BlockedPath:
+        def stat(self):
+            raise PermissionError("blocked")
+
+    source = BlockedPath()
+    monkeypatch.setattr(outlook_service.time, "sleep", lambda _delay: None)
+
+    with pytest.raises(
+        OutlookConnectionError,
+        match="временно заблокирован",
+    ) as error:
+        outlook_service._require_readable_outlook_attachment(source)
+
+    assert "private" not in str(error.value)
+
+
 def test_outlook_staging_uses_next_root_when_cyrillic_path_has_no_83_alias(
     monkeypatch,
     tmp_path,

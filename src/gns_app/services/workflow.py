@@ -114,7 +114,7 @@ class WorkflowService:
             while chunk := source.read(1024 * 1024):
                 digest.update(chunk)
         return digest.hexdigest()
-    OFFICIAL_PARSER_VERSION = 4
+    OFFICIAL_PARSER_VERSION = 5
     BUSINESS_TIMEZONE = timezone(timedelta(hours=6), "Asia/Bishkek")
     DEFAULT_GNS_OFFICES_PATH = (
         Path(__file__).resolve().parents[1]
@@ -3612,11 +3612,47 @@ class WorkflowService:
             self.auto_check_abs(case_id)
         return complete
 
-    @staticmethod
-    def _official_text(path: Path) -> str:
+    def _official_text(self, path: Path) -> str:
         if path.suffix.casefold() == ".pdf":
             reader = PdfReader(str(path))
-            return "\n".join(page.extract_text() or "" for page in reader.pages)
+            page_texts = [page.extract_text() or "" for page in reader.pages]
+            if len(page_texts) <= 1:
+                return page_texts[0] if page_texts else ""
+
+            analyzed = [
+                (text, self.extractor.extract_official_letter(text))
+                for text in page_texts
+            ]
+            complete = [
+                text
+                for text, fields in analyzed
+                if fields.confidence >= 0.95
+            ]
+            if len(complete) == 1:
+                return complete[0]
+            if len(complete) > 1:
+                # Несколько самостоятельных писем нельзя объединять или
+                # выбирать по порядку страниц: сотрудник должен разобрать их.
+                return ""
+
+            def field_score(item: tuple[str, Any]) -> int:
+                fields = item[1]
+                return sum(
+                    (
+                        bool(fields.district_place),
+                        bool(fields.recipient_position),
+                        bool(fields.recipient_full_name),
+                        bool(fields.period_start),
+                        bool(fields.period_end),
+                        bool(fields.taxpayers),
+                    )
+                )
+
+            scores = [field_score(item) for item in analyzed]
+            best_score = max(scores, default=0)
+            if best_score and scores.count(best_score) == 1:
+                return analyzed[scores.index(best_score)][0]
+            return ""
         if path.suffix.casefold() == ".docx":
             document = Document(str(path))
             parts = [paragraph.text for paragraph in document.paragraphs]
@@ -5571,7 +5607,7 @@ class WorkflowService:
         }
 
     def _manual_review_history(self, limit: int = 100) -> list[dict[str, Any]]:
-        """Return ABS accounts found and all completed period-based ODB checks."""
+        """Return found ABS profiles and all completed period-based ODB checks."""
         safe_limit = max(1, min(int(limit), 200))
         events = self.db.fetch_all(
             """
@@ -5674,7 +5710,11 @@ class WorkflowService:
             data = payload(event)
             if event["event_type"] == "abs_account_manually_checked":
                 context = abs_context.get(event["entity_id"])
-                if not context or data.get("result") != "found":
+                account_found = data.get("result") == "found"
+                if not context or data.get("result") not in {
+                    "found",
+                    "not_found",
+                }:
                     continue
                 history.append(
                     history_item(
@@ -5684,8 +5724,8 @@ class WorkflowService:
                         name=context["name"],
                         inn=context["inn"],
                         district_place=context.get("district_place") or "",
-                        result="Счёт есть",
-                        result_tone="found",
+                        result=("Счёт есть" if account_found else "Счёта нет"),
+                        result_tone=("found" if account_found else "not-found"),
                     )
                 )
             elif event["event_type"] == "odb_checked":

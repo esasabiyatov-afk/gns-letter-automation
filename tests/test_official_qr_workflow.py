@@ -1,5 +1,6 @@
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +15,55 @@ from gns_app.domain import (
 )
 from gns_app.services.workflow import WorkflowService
 from gns_app.services.workflow import WorkflowValidationError
+
+
+def test_official_pdf_uses_complete_letter_page_not_later_header(
+    workflow,
+    tmp_path,
+    monkeypatch,
+):
+    from gns_app.services import workflow as workflow_module
+
+    page_texts = ["decision", "header-before", "letter", "header-after"]
+    monkeypatch.setattr(
+        workflow_module,
+        "PdfReader",
+        lambda _path: SimpleNamespace(
+            pages=[
+                SimpleNamespace(extract_text=lambda value=text: value)
+                for text in page_texts
+            ]
+        ),
+    )
+
+    def extract(text):
+        if text == "letter":
+            return ExtractedFields(
+                district_place="по тестовому району",
+                recipient_position="Начальник",
+                recipient_full_name="Тестов Тест Тестович",
+                period_start="2024-01-01",
+                period_end="2026-01-01",
+                taxpayers=[
+                    ExtractedTaxpayer(
+                        name="Тестовый налогоплательщик",
+                        inn="11111111111111",
+                        confidence=0.96,
+                    )
+                ],
+                confidence=0.96,
+            )
+        if text.startswith("header"):
+            return ExtractedFields(
+                recipient_position="Государственная налоговая",
+                recipient_full_name="Служба при кабинете",
+                confidence=0.0,
+            )
+        return ExtractedFields(confidence=0.0)
+
+    monkeypatch.setattr(workflow.extractor, "extract_official_letter", extract)
+
+    assert workflow._official_text(tmp_path / "official.pdf") == "letter"
 
 
 def test_complete_official_qr_needs_no_manual_confirmation(

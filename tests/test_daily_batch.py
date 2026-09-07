@@ -2523,15 +2523,16 @@ def test_manual_review_history_lists_only_completed_abs_and_odb(
     assert {item["kind"] for item in history} == {"abs", "odb"}
     assert {item["name"] for item in history} == {
         'ОсОО "Проверка АБС"',
+        'ОсОО "Счёта нет"',
         'ОсОО "Проверка ОДБ"',
         'ОсОО "Найдена в ОДБ"',
     }
     assert {item["result"] for item in history} == {
         "Счёт есть",
+        "Счёта нет",
         "Не найден",
         "Найден",
     }
-    assert 'ОсОО "Счёта нет"' not in {item["name"] for item in history}
 
     monkeypatch.setattr(main, "workflow", workflow)
     page = TestClient(main.app).get("/?tab=review")
@@ -2543,6 +2544,7 @@ def test_manual_review_history_lists_only_completed_abs_and_odb(
     assert 'data-history-kind="abs"' in page.text
     assert 'data-history-kind="odb"' in page.text
     assert "Счёт есть" in page.text
+    assert "Счёта нет" in page.text
     assert "Не найден" in page.text
 
 

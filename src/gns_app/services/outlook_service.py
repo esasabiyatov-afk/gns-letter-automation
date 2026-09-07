@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -193,6 +194,57 @@ def _worker_staging_path(canonical_dir: Path) -> Path | None:
         ):
             return candidate
     return None
+
+
+def _worker_attachment_path(
+    staging: OutlookStagingDirectory,
+    filename: str,
+) -> Path:
+    """Validate containment without expanding the worker's 8.3 spelling."""
+
+    candidate = staging.worker_dir / filename
+    # ``ensure_within`` resolves both paths.  Use it only for validation:
+    # returning its result here would expand a short ASCII 8.3 path back to
+    # the long Unicode profile path before it reaches GNS-Worker.exe.
+    ensure_within(candidate, staging.worker_dir)
+    return candidate
+
+
+def _require_readable_outlook_attachment(source: Path) -> None:
+    """Prove the worker can stat and open an attachment without logging paths."""
+
+    last_error: OSError | None = None
+    for attempt in range(3):
+        try:
+            file_info = source.stat()
+            if not stat.S_ISREG(file_info.st_mode):
+                raise OutlookConnectionError(
+                    "Путь вложения Outlook не является файлом."
+                )
+            if file_info.st_size <= 0:
+                raise OutlookConnectionError("Файл вложения Outlook пустой.")
+            with source.open("rb") as attachment:
+                if not attachment.read(1):
+                    raise OutlookConnectionError("Файл вложения Outlook пустой.")
+            return
+        except OutlookConnectionError:
+            raise
+        except OSError as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(0.2)
+
+    if isinstance(last_error, FileNotFoundError):
+        raise OutlookConnectionError(
+            "Файл для вложения Outlook не найден."
+        ) from last_error
+    if isinstance(last_error, PermissionError):
+        raise OutlookConnectionError(
+            "Файл вложения Outlook временно заблокирован. Повторите действие."
+        ) from last_error
+    raise OutlookConnectionError(
+        "Файл вложения Outlook недоступен. Повторите действие."
+    ) from last_error
 
 
 def _create_outlook_staging_directory(
@@ -915,8 +967,7 @@ class PyWin32OutlookGateway:
         # expand it back to a Cyrillic/long profile path on Windows 8.1, after
         # which the Outlook COM worker cannot reopen an otherwise valid file.
         source = attachment_path
-        if not source.is_file():
-            raise OutlookConnectionError("Файл для вложения Outlook не найден.")
+        _require_readable_outlook_attachment(source)
         try:
             import pythoncom  # type: ignore[import-not-found]
             from win32com import client  # type: ignore[import-not-found]
@@ -2450,9 +2501,9 @@ class OutlookOutgoingService:
             staging.canonical_dir / "attachment.pdf",
             staging.canonical_dir,
         )
-        worker_attachment = ensure_within(
-            staging.worker_dir / "attachment.pdf",
-            staging.worker_dir,
+        worker_attachment = _worker_attachment_path(
+            staging,
+            "attachment.pdf",
         )
         try:
             shutil.copy2(source, canonical_attachment)
