@@ -2361,13 +2361,20 @@ pre { white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow
 .created-letter-line {
   min-height: 40px;
   display: grid;
-  grid-template-columns: auto minmax(145px, .7fr) minmax(150px, .9fr) auto 30px;
+  grid-template-columns: 22px auto minmax(145px, .7fr) minmax(150px, .9fr) auto 30px;
   align-items: center;
   gap: 7px;
   padding: 4px 5px;
   border-radius: 8px;
   background: #f7f9f7;
 }
+.signed-copy-select {
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+.signed-copy-select input { width: 16px; height: 16px; margin: 0; }
+.signed-copy-select-placeholder { width: 16px; }
 .letter-order { color: var(--muted); font-size: 10px; font-weight: 750; }
 .inline-number-form {
   display: flex;
@@ -2574,11 +2581,13 @@ pre { white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow
     width: 100%;
     grid-template-columns: 1fr auto;
   }
-  .created-letter-line { grid-template-columns: 1fr auto; }
+  .created-letter-line { grid-template-columns: 22px 1fr auto; }
+  .created-letter-line > .signed-copy-select,
+  .created-letter-line > .signed-copy-select-placeholder { grid-column: 1; }
   .created-letter-line > .inline-number-form,
-  .created-letter-line > .letter-progress { grid-column: 1; }
+  .created-letter-line > .letter-progress { grid-column: 2; }
   .created-letter-line > .letter-primary-action,
-  .created-letter-line > .action-menu { grid-column: 2; }
+  .created-letter-line > .action-menu { grid-column: 3; }
   .scan-sheet-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .history-search { width: 100%; }
   .history-search input { width: 100%; min-width: 0; }

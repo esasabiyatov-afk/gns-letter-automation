@@ -1042,17 +1042,20 @@ class PyWin32OutlookGateway:
                 stage = "save_draft"
                 mail.Save()
             else:
-                # Drafts created by an older app version had an empty body.
-                # Fill only missing required fields and preserve user edits.
-                stage = "complete_existing_draft"
+                # The tracked app draft must follow the current recipient and
+                # subject settings. Clearing Body also repairs mojibake left by
+                # older worker transports without touching the PDF attachment.
+                stage = "refresh_existing_draft"
                 changed = False
-                if not _safe_text(_safe_attribute(mail, "To")).strip():
+                if _safe_text(_safe_attribute(mail, "To")).casefold() != (
+                    recipient_email.strip().casefold()
+                ):
                     mail.To = recipient_email.strip().casefold()
                     changed = True
-                if not _safe_text(_safe_attribute(mail, "Subject")).strip():
+                if _safe_text(_safe_attribute(mail, "Subject")) != subject.strip():
                     mail.Subject = subject.strip()
                     changed = True
-                if not _safe_text(_safe_attribute(mail, "Body")).strip():
+                if str(_safe_attribute(mail, "Body", "")) != body:
                     mail.Body = body
                     changed = True
                 if changed:
@@ -2334,10 +2337,7 @@ class OutlookService:
 class OutlookOutgoingService:
     SUBJECT_TEMPLATE_SETTING = "outlook_outgoing_subject_template"
     DEFAULT_SUBJECT_TEMPLATE = "Ответ на запрос ГНС"
-    DEFAULT_BODY = (
-        "Здравствуйте!\r\n\r\n"
-        "Направляем ответ ГНС. Документ приложен к письму."
-    )
+    DEFAULT_BODY = ""
     # Исходящий номер принадлежит самому Word/PDF. Его нельзя передавать в
     # Outlook: ни в тему, ни в текст, ни в имя вложения.
     SUBJECT_FIELDS = frozenset({"office_name", "recipient_name", "date"})
@@ -3349,6 +3349,106 @@ class OutlookOutgoingService:
                 "rejected": scan.rejected_mail_count,
                 "ambiguous": scan.ambiguous_candidate_count,
             }
+
+    def mark_sent_manually(
+        self,
+        workflow: OutlookWorkflow,
+        letter_id: str,
+    ) -> dict[str, Any]:
+        """Record an externally sent signed response without opening Outlook."""
+
+        with self._draft_lock:
+            letter = workflow.get_response_letter(letter_id)
+            if not letter:
+                raise OutlookIntegrationError("Готовое письмо не найдено.")
+            scan = workflow.get_confirmed_signed_response_scan(letter_id)
+            if not scan:
+                raise OutlookIntegrationError(
+                    "Сначала загрузите подписанный ответ."
+                )
+
+            existing = self.db.fetch_one(
+                "SELECT * FROM outlook_outgoing_messages "
+                "WHERE signed_scan_id = ?",
+                (scan["id"],),
+            )
+            if existing and existing.get("status") == "sent":
+                existing["already_sent"] = True
+                return existing
+
+            office = workflow.match_gns_office(
+                str(letter.get("district_place") or "")
+            )
+            recipient_email = (
+                str(existing.get("recipient_email") or "")
+                if existing
+                else workflow.office_delivery_email(office)
+            )
+            subject = (
+                str(existing.get("subject") or "")
+                if existing
+                else self.render_subject(letter, office or {})
+            )
+            message_id = str(existing["id"]) if existing else uuid4().hex
+            sent_at = utc_now()
+            actor = workflow.get_active_employee() or "Сотрудник"
+            attachment_sha256 = str(scan.get("sha256") or "")
+            if not attachment_sha256:
+                raise OutlookIntegrationError(
+                    "У подписанного ответа отсутствует контрольная сумма."
+                )
+
+            with self.db.connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO outlook_outgoing_messages(
+                        id, response_letter_id, signed_scan_id, status,
+                        recipient_email, subject, attachment_name,
+                        attachment_sha256, draft_key, outlook_entry_id,
+                        sent_at, error_message, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'sent', ?, ?, 'Ответ_ГНС.pdf', ?, ?,
+                              NULL, ?, NULL, ?, ?)
+                    ON CONFLICT(signed_scan_id) DO UPDATE SET
+                        status = 'sent', outlook_entry_id = NULL,
+                        sent_at = excluded.sent_at, error_message = NULL,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        message_id,
+                        letter_id,
+                        scan["id"],
+                        recipient_email,
+                        subject,
+                        attachment_sha256,
+                        f"gns-manual-scan-{scan['id']}",
+                        sent_at,
+                        sent_at,
+                        sent_at,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO audit_events(
+                        entity_type, entity_id, event_type, actor,
+                        payload_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "outlook_outgoing_message",
+                        message_id,
+                        "outlook_sent_marked_manually",
+                        actor,
+                        json.dumps(
+                            {"signed_scan_id": scan["id"]},
+                            ensure_ascii=False,
+                        ),
+                        sent_at,
+                    ),
+                )
+            return self.db.fetch_one(
+                "SELECT * FROM outlook_outgoing_messages WHERE id = ?",
+                (message_id,),
+            ) or {}
 
 
 class OutlookInboxImporter:

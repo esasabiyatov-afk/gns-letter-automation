@@ -132,6 +132,14 @@
     {% endfor %}
     {% set pending_created_groups = created_split.pending %}
     {% set sent_created_groups = created_split.sent %}
+    {% set printable = namespace(count=0) %}
+    {% for created_group in overview.generated_groups %}
+      {% for created_letter in created_group.letters %}
+        {% if created_letter.signed_scan and created_letter.signed_scan.status == 'confirmed' %}
+          {% set printable.count = printable.count + 1 %}
+        {% endif %}
+      {% endfor %}
+    {% endfor %}
     <div class="work-section-toolbar response-toolbar"
          data-tour-anchor="created">
       <div>
@@ -139,6 +147,14 @@
         <p>Сначала откройте письмо в Word, проверьте и распечатайте его. Затем отсканируйте подписанный ответ.</p>
       </div>
       <div class="work-toolbar-actions created-toolbar-actions">
+        {% if printable.count %}
+          <form id="signed-copy-print-form" method="post" target="_blank"
+                action="/signed-response-scans/print-selected">
+            <button class="button button-secondary button-compact" type="submit">
+              Печать выбранных
+            </button>
+          </form>
+        {% endif %}
         {% if overview.unnumbered_letters %}
           <form class="outgoing-sequence-form" method="post"
                 action="/today/outgoing-numbers/assign">
@@ -194,6 +210,15 @@
           <div class="created-letter-list">
             {% for letter in group.letters %}
               <div class="created-letter-line" id="letter-{{ letter.id }}">
+                {% if letter.signed_scan and letter.signed_scan.status == 'confirmed' %}
+                  <label class="signed-copy-select" title="Выбрать подписанный ответ для печати">
+                    <input type="checkbox" name="letter_ids" value="{{ letter.id }}"
+                           form="signed-copy-print-form"
+                           aria-label="Выбрать ответ {{ group.recipient_display_name }} для печати">
+                  </label>
+                {% else %}
+                  <span class="signed-copy-select-placeholder" aria-hidden="true"></span>
+                {% endif %}
                 {% if group.letters|length > 1 %}
                   <span class="letter-order">Письмо {{ letter.letter_order }}</span>
                 {% endif %}
@@ -226,6 +251,9 @@
                     <span class="status status-completed">Отправлено</span>
                     {% if letter.outlook_message.sent_at %}
                       <small>{{ letter.outlook_message.sent_at[:16].replace('T', ' ') }}</small>
+                    {% endif %}
+                    {% if not letter.outlook_message.outlook_entry_id %}
+                      <small>Отмечено вручную</small>
                     {% endif %}
                   {% elif letter.outlook_message and letter.outlook_message.status == 'draft_created' %}
                     <span class="status status-ready">Письмо подготовлено</span>
@@ -334,6 +362,16 @@
                         <button type="submit">
                           {% if letter.outlook_message and letter.outlook_message.status == 'draft_created' %}Открыть черновик Outlook{% else %}Подготовить черновик Outlook{% endif %}
                         </button>
+                      </form>
+                    {% endif %}
+                    {% if letter.signed_scan
+                          and letter.signed_scan.status == 'confirmed'
+                          and (not letter.outlook_message or letter.outlook_message.status != 'sent') %}
+                      <form method="post"
+                            action="/response-letters/{{ letter.id }}/mark-sent"
+                            onsubmit="return confirm('Отметить письмо отправленным вне приложения?');">
+                        <input type="hidden" name="group_id" value="{{ group.id }}">
+                        <button type="submit">Отметить отправленным</button>
                       </form>
                     {% endif %}
                   </div>

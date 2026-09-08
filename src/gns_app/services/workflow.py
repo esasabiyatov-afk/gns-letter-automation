@@ -7,6 +7,7 @@ import re
 import shutil
 import sqlite3
 import time as monotonic_time
+from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 from datetime import UTC, date, datetime, time, timedelta, timezone
@@ -17,7 +18,7 @@ from uuid import uuid4
 
 from docx import Document
 from PIL import Image, ImageSequence, UnidentifiedImageError
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 
 from gns_app.config import Settings
 from gns_app.database import Database, utc_now
@@ -7412,6 +7413,60 @@ class WorkflowService:
             """,
             (letter_id,),
         )
+
+    def build_signed_response_print_bundle(
+        self,
+        letter_ids: list[str],
+    ) -> bytes:
+        """Combine selected confirmed scans without changing their originals."""
+
+        selected_ids = list(dict.fromkeys(
+            str(letter_id).strip()
+            for letter_id in letter_ids
+            if str(letter_id).strip()
+        ))
+        if not selected_ids:
+            raise WorkflowValidationError("Выберите хотя бы один ответ")
+
+        writer = PdfWriter()
+        page_count = 0
+        for letter_id in selected_ids:
+            scan = self.get_confirmed_signed_response_scan(letter_id)
+            if not scan:
+                raise WorkflowValidationError(
+                    "У одного из выбранных ответов нет готового скана"
+                )
+            try:
+                source = ensure_within(
+                    Path(str(scan["pdf_path"])),
+                    self.settings.runtime_dir / "signed_scans",
+                )
+                if not source.is_file() or source.stat().st_size <= 0:
+                    raise OSError("signed scan is missing")
+                reader = PdfReader(str(source))
+                if not reader.pages:
+                    raise OSError("signed scan has no pages")
+                for page in reader.pages:
+                    writer.add_page(page)
+                    page_count += 1
+            except Exception as exc:
+                raise WorkflowValidationError(
+                    "Не удалось открыть один из выбранных сканов"
+                ) from exc
+
+        output = BytesIO()
+        writer.write(output)
+        self.db.audit(
+            "signed_response_scan",
+            f"print-batch-{uuid4().hex}",
+            "signed_response_print_bundle_created",
+            {
+                "letter_count": len(selected_ids),
+                "page_count": page_count,
+            },
+            actor=self.get_active_employee() or "Сотрудник",
+        )
+        return output.getvalue()
 
     def get_signed_scan_session(
         self, session_id: str

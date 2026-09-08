@@ -2287,6 +2287,60 @@ def test_outlook_sent_reconciliation_updates_status_once(workflow, monkeypatch):
     assert "2026-09-04 10:30" in history.text
 
 
+def test_external_send_can_be_marked_once_without_outlook(workflow, monkeypatch):
+    workflow.initialize_gns_offices()
+    workflow.initialize_gns_office_emails()
+    group_id, letter = _ready_response_letter(workflow)
+    workflow.set_outgoing_number(letter["id"], "9547")
+    scan = workflow.register_signed_response_scan(
+        letter["id"], "scan.png", _png_scan()
+    )
+    outgoing = OutlookOutgoingService(
+        workflow.db,
+        workflow.settings,
+        OutlookService(object()),
+    )
+
+    first = outgoing.mark_sent_manually(workflow, letter["id"])
+    second = outgoing.mark_sent_manually(workflow, letter["id"])
+    audit_count = workflow.db.fetch_one(
+        "SELECT COUNT(*) AS count FROM audit_events "
+        "WHERE entity_id = ? "
+        "AND event_type = 'outlook_sent_marked_manually'",
+        (first["id"],),
+    )["count"]
+
+    assert first["status"] == "sent"
+    assert first["signed_scan_id"] == scan["id"]
+    assert first["outlook_entry_id"] is None
+    assert second["already_sent"]
+    assert audit_count == 1
+    assert workflow.today_overview(view="created")[
+        "sent_generated_groups"
+    ][0]["id"] == group_id
+
+    from starlette.testclient import TestClient
+
+    from gns_app import main
+
+    monkeypatch.setattr(main, "workflow", workflow)
+    page = TestClient(main.app).get(
+        "/?tab=responses&response_view=created"
+    )
+    assert page.status_code == 200
+    assert "Отмечено вручную" in page.text
+    assert 'form="signed-copy-print-form"' in page.text
+
+    printed = TestClient(main.app).post(
+        "/signed-response-scans/print-selected",
+        data={"letter_ids": letter["id"]},
+    )
+    assert printed.status_code == 200
+    assert printed.headers["content-type"] == "application/pdf"
+    assert printed.headers["content-disposition"].startswith("inline;")
+    assert len(PdfReader(BytesIO(printed.content)).pages) == 1
+
+
 def test_repeat_draft_reuses_exact_confirmed_scan_and_is_confirmed(workflow):
     workflow.initialize_gns_offices()
     workflow.initialize_gns_office_emails()

@@ -685,6 +685,8 @@ def test_com_gateway_creates_and_reopens_same_outlook_draft(
         attachment_name=attachment.name,
         sending_account="employee@bank.kg",
     )
+    items.values[0].Subject = "РћС‚РІРµС‚"
+    items.values[0].Body = "РќР°РїСЂР°РІР»СЏРµРј"
     second = gateway.create_draft(
         draft_key="gns-scan-one",
         recipient_email="recipient@example.test",
@@ -701,6 +703,8 @@ def test_com_gateway_creates_and_reopens_same_outlook_draft(
     assert len(items.values) == 1
     assert len(items.values[0].Attachments.added) == 1
     assert items.values[0].SendUsingAccount is sending_account
+    assert items.values[0].Subject == "Ответ № 9544"
+    assert items.values[0].Body == ""
     assert items.values[0].display_count == 1
     assert items.values[0].GetInspector.WindowState == 2
     assert items.values[0].GetInspector.activate_count == 1
@@ -1378,7 +1382,7 @@ def test_test_mode_sends_once_only_to_fixed_address(workflow):
         "gns-test-scan-test-mail-scan"
     )
     assert gateway.draft_requests[0]["display"] is False
-    assert "Направляем ответ ГНС" in gateway.draft_requests[0]["body"]
+    assert gateway.draft_requests[0]["body"] == ""
     assert "9544" not in gateway.draft_requests[0]["body"]
     assert repeated["already_sent"]
     assert len(gateway.send_requests) == 1

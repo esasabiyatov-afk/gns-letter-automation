@@ -24,6 +24,7 @@ from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
     RedirectResponse,
+    Response,
 )
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -671,6 +672,7 @@ EVENT_LABELS = {
     "outlook_test_send_failed": "Ошибка тестовой отправки Outlook",
     "outlook_test_batch_send_completed": "Завершена пакетная тестовая отправка Outlook",
     "outlook_sent_confirmed": "Отправка подтверждена папкой Outlook",
+    "outlook_sent_marked_manually": "Отправка отмечена сотрудником",
     "outlook_resend_draft_created": "Создан повторный черновик Outlook",
     "outlook_resend_confirmed": "Повторная отправка подтверждена Outlook",
     "gns_offices_replaced": "Обновлён справочник налоговых органов",
@@ -706,6 +708,7 @@ EVENT_LABELS = {
     "abs_account_manually_checked": "Вручную проверено наличие счёта в АБС",
     "signed_response_scan_registered": "Зарегистрирован подписанный скан",
     "signed_response_scan_confirmed": "Подписанный скан проверен",
+    "signed_response_print_bundle_created": "Подготовлены выбранные сканы к печати",
     "district_place_edge_noise_removed": (
         "Удалены лишние краевые символы в реквизите ГНС"
     ),
@@ -1300,6 +1303,29 @@ def create_response_letter_outlook_draft(
         "Существующий черновик Outlook открыт."
         if result.get("existing_outlook_draft")
         else "Черновик Outlook создан и открыт для проверки."
+    )
+    return RedirectResponse(
+        f"/today?message={quote(message)}#group-{quote(group_id)}",
+        status_code=303,
+    )
+
+
+@app.post("/response-letters/{letter_id}/mark-sent")
+def mark_response_letter_sent(
+    letter_id: str,
+    group_id: str = Form(""),
+):
+    try:
+        result = outlook_outgoing.mark_sent_manually(workflow, letter_id)
+    except OutlookIntegrationError as exc:
+        return RedirectResponse(
+            f"/today?error={quote(str(exc))}#group-{quote(group_id)}",
+            status_code=303,
+        )
+    message = (
+        "Письмо уже отмечено отправленным."
+        if result.get("already_sent")
+        else "Письмо отмечено отправленным вручную."
     )
     return RedirectResponse(
         f"/today?message={quote(message)}#group-{quote(group_id)}",
@@ -2029,6 +2055,24 @@ def upload_response_letter_scan(
         + quote("Скан сохранён и готов для подготовки письма в Outlook.")
         + f"#group-{quote(group_id)}",
         status_code=303,
+    )
+
+
+@app.post("/signed-response-scans/print-selected")
+def print_selected_signed_response_scans(
+    letter_ids: list[str] = Form(default=[]),
+):
+    try:
+        pdf = workflow.build_signed_response_print_bundle(letter_ids)
+    except WorkflowValidationError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": 'inline; filename="signed-responses.pdf"',
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
