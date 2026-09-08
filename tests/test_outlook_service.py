@@ -300,6 +300,45 @@ def test_subprocess_gateway_reads_structured_probe(monkeypatch):
     assert probe.accounts[0].smtp_address == "employee@example.test"
 
 
+def test_subprocess_gateway_transports_cyrillic_as_ascii_json(monkeypatch):
+    subject = "Ответ налоговой службе"
+    body = "Направляем подписанный ответ."
+
+    class FakeProcess:
+        def communicate(self, *, input=None, timeout=None):
+            assert input.isascii()
+            request = json.loads(input)
+            assert request["subject"] == subject
+            assert request["body"] == body
+            payload = {
+                "ok": True,
+                "draft": {
+                    "entry_id": "draft-1",
+                    "recipient_email": "recipient@example.test",
+                    "subject": subject,
+                    "attachment_name": "Ответ_ГНС.pdf",
+                    "existing": False,
+                },
+            }
+            response = json.dumps(payload, ensure_ascii=True)
+            assert response.isascii()
+            return response, ""
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+
+    result = SubprocessOutlookGateway().create_draft(
+        draft_key="gns-scan-one",
+        recipient_email="recipient@example.test",
+        subject=subject,
+        body=body,
+        attachment_path=Path("C:/GNSO/attachment.pdf"),
+        attachment_name="Ответ_ГНС.pdf",
+    )
+
+    assert result.subject == subject
+    assert result.attachment_name == "Ответ_ГНС.pdf"
+
+
 def test_subprocess_gateway_terminates_worker_after_timeout(monkeypatch):
     class TimedOutProcess:
         def communicate(self, *, input=None, timeout=None):

@@ -2040,7 +2040,10 @@ class SubprocessOutlookGateway:
         timeout = timeout_seconds or self.timeout_seconds
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         input_text = (
-            json.dumps(input_payload, ensure_ascii=False)
+            # Keep the pipe ASCII-only.  Frozen workers on Windows 8.1 can
+            # inherit an OEM code page even when the parent requests UTF-8;
+            # JSON escapes restore the exact Unicode values after json.loads.
+            json.dumps(input_payload, ensure_ascii=True)
             if input_payload is not None
             else None
         )
@@ -2052,7 +2055,7 @@ class SubprocessOutlookGateway:
                 stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
-                errors="replace",
+                errors="strict",
                 creationflags=creation_flags,
                 cwd=Path.cwd(),
                 env={**os.environ, "PYTHONIOENCODING": "utf-8"},
@@ -4189,8 +4192,10 @@ def _bridge_payload(
 
 
 def main() -> int:
+    if hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(encoding="utf-8", errors="strict")
     if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stdout.reconfigure(encoding="utf-8", errors="strict")
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
         "--bridge-action",
@@ -4215,7 +4220,7 @@ def main() -> int:
     print(
         json.dumps(
             _bridge_payload(arguments.bridge_action, input_payload),
-            ensure_ascii=False,
+            ensure_ascii=True,
         )
     )
     return 0
