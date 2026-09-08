@@ -98,4 +98,25 @@
 {% else %}
   {% include "_work_responses.html" %}
 {% endif %}
+
+{% if active_employee and abs_session_supported and not abs_session_active and (abs_dialog_ready_count or abs_login_required) %}
+<dialog id="today-abs-dialog" class="modal"
+        {% if abs_login_required %}data-auto-open{% endif %}>
+  <form method="post" action="/today/abs" autocomplete="off">
+    <div class="modal-heading">
+      <div>
+        <p class="eyebrow">{% if abs_is_fake %}ТЕСТОВАЯ АБС{% else %}АБС TOLUBAY{% endif %}</p>
+        <h2>Вход в АБС</h2>
+      </div>
+      <button type="button" class="modal-close" data-close-dialog>×</button>
+    </div>
+    <p class="warning-note">Войдите один раз — очередь продолжит проверяться в фоне.</p>
+    <label class="field"><span>Логин</span><input name="username" autocomplete="off" required></label>
+    <label class="field"><span>Пароль</span><input name="password" type="password" autocomplete="new-password" required></label>
+    <button class="button button-primary button-block" type="submit">
+      Войти и проверить все · {{ abs_dialog_ready_count }}
+    </button>
+  </form>
+</dialog>
+{% endif %}
 {% endblock %}

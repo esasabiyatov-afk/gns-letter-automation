@@ -76,6 +76,8 @@ outlook_outgoing = OutlookOutgoingService(db, settings, outlook)
 autostart = WindowsAutostartService()
 _outlook_import_activity_lock = Lock()
 _outlook_import_active = False
+_outlook_send_activity_lock = Lock()
+_outlook_send_active = False
 _abs_batch_activity_lock = Lock()
 _abs_batch_active = False
 _abs_batch_status: dict[str, object] = {
@@ -108,6 +110,51 @@ def _release_outlook_import() -> None:
 def _outlook_import_is_active() -> bool:
     with _outlook_import_activity_lock:
         return _outlook_import_active
+
+
+def _claim_outlook_send() -> bool:
+    global _outlook_send_active
+    with _outlook_send_activity_lock:
+        if _outlook_send_active:
+            return False
+        _outlook_send_active = True
+        return True
+
+
+def _release_outlook_send() -> None:
+    global _outlook_send_active
+    with _outlook_send_activity_lock:
+        _outlook_send_active = False
+
+
+def _outlook_send_is_active() -> bool:
+    with _outlook_send_activity_lock:
+        return _outlook_send_active
+
+
+def _run_outlook_batch_send() -> None:
+    try:
+        outlook_outgoing.send_all_ready_messages(workflow)
+    except Exception as exc:
+        record_exception(
+            "outlook",
+            "batch_send",
+            exc,
+            runtime_dir=settings.runtime_dir,
+        )
+    finally:
+        _release_outlook_send()
+
+
+def _queue_outlook_batch_send(background_tasks: BackgroundTasks) -> bool:
+    if not _claim_outlook_send():
+        return False
+    try:
+        background_tasks.add_task(_run_outlook_batch_send)
+    except Exception:
+        _release_outlook_send()
+        raise
+    return True
 
 
 def _abs_queue_counts() -> dict[str, int]:
@@ -673,6 +720,9 @@ EVENT_LABELS = {
     "outlook_test_batch_send_completed": "Завершена пакетная тестовая отправка Outlook",
     "outlook_sent_confirmed": "Отправка подтверждена папкой Outlook",
     "outlook_sent_marked_manually": "Отправка отмечена сотрудником",
+    "outlook_send_requested": "Письмо передано Outlook для отправки",
+    "outlook_send_failed": "Ошибка отправки письма Outlook",
+    "outlook_batch_send_completed": "Завершена массовая отправка Outlook",
     "outlook_resend_draft_created": "Создан повторный черновик Outlook",
     "outlook_resend_confirmed": "Повторная отправка подтверждена Outlook",
     "gns_offices_replaced": "Обновлён справочник налоговых органов",
@@ -869,13 +919,22 @@ def index(
     if incoming_sort not in {"newest", "oldest"}:
         incoming_sort = "newest"
 
+    work_counts = workflow.work_counts()
+    active_employee = workflow.get_active_employee()
     values: dict[str, object] = {
         "work_tab": tab,
-        "work_counts": workflow.work_counts(),
+        "work_counts": work_counts,
         "response_view": response_view,
         "undo_page_id": undo_page_id,
         "message": message,
         "error": error,
+        "abs_dialog_ready_count": work_counts["ready_abs"],
+        "abs_login_required": bool(
+            active_employee
+            and workflow.abs_session_supported()
+            and not workflow.abs_session_active()
+            and work_counts["ready_abs"]
+        ),
     }
     if tab == "incoming":
         values.update(_incoming_workspace_values(incoming_sort, incoming_page))
@@ -920,6 +979,7 @@ def index(
             }
         else:
             overview = workflow.today_overview(view=response_view)
+        values["abs_dialog_ready_count"] = int(overview.get("ready_abs") or 0)
         active_letter = None
         active_group = None
         if response_view == "created" and focus_letter:
@@ -940,10 +1000,22 @@ def index(
                 if response_view == "created"
                 else 0
             ),
+            outlook_ready_send_count=(
+                outlook_outgoing.ready_send_count()
+                if response_view == "created"
+                else 0
+            ),
+            outlook_batch_send_active=_outlook_send_is_active(),
             active_letter=active_letter,
             active_group=active_group,
             abs_login_required=(
-                abs_login or workflow.abs_login_required()
+                abs_login
+                or bool(
+                    active_employee
+                    and workflow.abs_session_supported()
+                    and not workflow.abs_session_active()
+                    and work_counts["ready_abs"]
+                )
             ),
         )
     return templates.TemplateResponse(
@@ -1379,6 +1451,25 @@ def send_all_ready_outlook_test_messages():
         message = (
             f"Все готовые тестовые письма отправлены: {sent_count}."
         )
+    return RedirectResponse(
+        f"/today?message={quote(message)}",
+        status_code=303,
+    )
+
+
+@app.post("/today/outlook-send-all")
+def send_all_ready_outlook_messages(background_tasks: BackgroundTasks):
+    if outlook_outgoing.ready_send_count() < 1:
+        return RedirectResponse(
+            "/today?message=" + quote("Готовых писем для отправки пока нет."),
+            status_code=303,
+        )
+    started = _queue_outlook_batch_send(background_tasks)
+    message = (
+        "Отправка всех готовых писем запущена в фоне."
+        if started
+        else "Отправка писем уже выполняется."
+    )
     return RedirectResponse(
         f"/today?message={quote(message)}",
         status_code=303,

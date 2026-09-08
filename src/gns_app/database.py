@@ -297,6 +297,8 @@ CREATE TABLE IF NOT EXISTS response_letters (
     taxpayer_count INTEGER NOT NULL,
     outgoing_number TEXT,
     assigned_at TEXT,
+    manually_sent_at TEXT,
+    manually_sent_by TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(response_group_id, letter_order)
@@ -460,6 +462,7 @@ class Database:
             self._ensure_page_columns(connection)
             self._ensure_case_columns(connection)
             self._ensure_response_group_columns(connection)
+            self._ensure_response_letter_columns(connection)
             self._ensure_gns_office_columns(connection)
             self._ensure_outlook_message_columns(connection)
             self._ensure_outlook_outgoing_columns(connection)
@@ -695,6 +698,22 @@ class Database:
                 start_order += count
 
     @staticmethod
+    def _ensure_response_letter_columns(
+        connection: sqlite3.Connection,
+    ) -> None:
+        existing = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(response_letters)"
+            ).fetchall()
+        }
+        for column in ("manually_sent_at", "manually_sent_by"):
+            if column not in existing:
+                connection.execute(
+                    f"ALTER TABLE response_letters ADD COLUMN {column} TEXT"
+                )
+
+    @staticmethod
     def _ensure_outlook_outgoing_columns(
         connection: sqlite3.Connection,
     ) -> None:
@@ -754,6 +773,7 @@ class Database:
             JOIN response_groups
               ON response_groups.id = response_letters.response_group_id
             WHERE response_groups.status = 'superseded'
+              AND response_letters.manually_sent_at IS NULL
               AND TRIM(COALESCE(response_letters.outgoing_number, '')) != ''
               AND NOT EXISTS (
                   SELECT 1 FROM outlook_outgoing_messages

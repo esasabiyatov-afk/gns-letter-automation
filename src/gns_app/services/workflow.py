@@ -5372,6 +5372,16 @@ class WorkflowService:
             if group is not None:
                 office = self.match_gns_office(group["district_place"])
                 letter["gns_email"] = self.office_delivery_email(office)
+                if (
+                    not letter.get("outlook_message")
+                    and letter.get("manually_sent_at")
+                ):
+                    letter["outlook_message"] = {
+                        "status": "sent",
+                        "sent_at": letter["manually_sent_at"],
+                        "recipient_email": letter["gns_email"],
+                        "outlook_entry_id": None,
+                    }
                 group["letters"].append(letter)
         for group in generated:
             group["letter_count"] = len(group["letters"])
@@ -7096,6 +7106,10 @@ class WorkflowService:
                 "Нельзя изменить исходящий номер: для письма уже создан "
                 "черновик Outlook или подтверждена отправка."
             )
+        if any(row.get("manually_sent_at") for row in changed_rows):
+            raise WorkflowValidationError(
+                "Нельзя изменить исходящий номер: письмо отмечено отправленным."
+            )
 
         group_ids = sorted(
             {row["response_group_id"] for row in changed_rows}
@@ -7155,6 +7169,20 @@ class WorkflowService:
                     raise WorkflowValidationError(
                         "Нельзя изменить исходящий номер: для письма уже создан "
                         "черновик Outlook или подтверждена отправка."
+                    )
+                manually_sent = connection.execute(
+                    f"""
+                    SELECT id FROM response_letters
+                    WHERE id IN ({changed_placeholders})
+                      AND manually_sent_at IS NOT NULL
+                    LIMIT 1
+                    """,
+                    changed_letter_ids,
+                ).fetchone()
+                if manually_sent:
+                    raise WorkflowValidationError(
+                        "Нельзя изменить исходящий номер: письмо отмечено "
+                        "отправленным."
                     )
                 if requested_numbers:
                     number_placeholders = ",".join(
@@ -9474,6 +9502,24 @@ class WorkflowService:
                 "Исходный лист уже связан с другим обращением"
             )
 
+        manually_sent = self.db.fetch_one(
+            """
+            SELECT response_letters.id
+            FROM response_group_cases
+            JOIN response_letters
+              ON response_letters.response_group_id =
+                 response_group_cases.response_group_id
+            WHERE response_group_cases.case_id = ?
+              AND response_letters.manually_sent_at IS NOT NULL
+            LIMIT 1
+            """,
+            (case_id,),
+        )
+        if manually_sent:
+            raise WorkflowValidationError(
+                "Письмо отмечено отправленным; его нельзя вернуть в обработку"
+            )
+
         outbound = self.db.fetch_one(
             """
             SELECT outlook_outgoing_messages.status,
@@ -9487,7 +9533,9 @@ class WorkflowService:
                  response_letters.id
             WHERE response_group_cases.case_id = ?
               AND (
-                   outlook_outgoing_messages.status IN ('sent', 'draft_created')
+                   outlook_outgoing_messages.status IN (
+                       'sent', 'send_requested', 'draft_created'
+                   )
                    OR outlook_outgoing_messages.resend_status IN (
                        'sent', 'draft_created'
                    )
@@ -9497,9 +9545,11 @@ class WorkflowService:
             (case_id,),
         )
         if outbound:
-            if outbound["status"] == "sent" or outbound["resend_status"] == "sent":
+            if outbound["status"] in {"sent", "send_requested"} or (
+                outbound["resend_status"] == "sent"
+            ):
                 raise WorkflowValidationError(
-                    "Письмо уже отправлено через Outlook; его нельзя вернуть "
+                    "Письмо уже отправлено или передано Outlook; его нельзя вернуть "
                     "в обработку"
                 )
             raise WorkflowValidationError(
@@ -10204,7 +10254,7 @@ class WorkflowService:
                      WHERE response_group_cases.case_id = cases.id
                      ORDER BY outlook_outgoing_messages.created_at DESC
                      LIMIT 1) AS outlook_message_id,
-                    (SELECT outlook_outgoing_messages.status
+                    COALESCE((SELECT outlook_outgoing_messages.status
                      FROM response_group_cases
                      JOIN response_letters
                        ON response_letters.response_group_id =
@@ -10214,7 +10264,16 @@ class WorkflowService:
                           response_letters.id
                      WHERE response_group_cases.case_id = cases.id
                      ORDER BY outlook_outgoing_messages.created_at DESC
-                     LIMIT 1) AS mail_status,
+                     LIMIT 1),
+                     CASE WHEN EXISTS (
+                         SELECT 1
+                         FROM response_group_cases
+                         JOIN response_letters
+                           ON response_letters.response_group_id =
+                              response_group_cases.response_group_id
+                         WHERE response_group_cases.case_id = cases.id
+                           AND response_letters.manually_sent_at IS NOT NULL
+                     ) THEN 'sent' END) AS mail_status,
                     (SELECT outlook_outgoing_messages.recipient_email
                      FROM response_group_cases
                      JOIN response_letters
@@ -10226,7 +10285,7 @@ class WorkflowService:
                      WHERE response_group_cases.case_id = cases.id
                      ORDER BY outlook_outgoing_messages.created_at DESC
                      LIMIT 1) AS recipient_email,
-                    (SELECT outlook_outgoing_messages.sent_at
+                    COALESCE((SELECT outlook_outgoing_messages.sent_at
                      FROM response_group_cases
                      JOIN response_letters
                        ON response_letters.response_group_id =
@@ -10236,7 +10295,13 @@ class WorkflowService:
                           response_letters.id
                      WHERE response_group_cases.case_id = cases.id
                      ORDER BY outlook_outgoing_messages.created_at DESC
-                     LIMIT 1) AS sent_at,
+                     LIMIT 1),
+                     (SELECT MAX(response_letters.manually_sent_at)
+                      FROM response_group_cases
+                      JOIN response_letters
+                        ON response_letters.response_group_id =
+                           response_group_cases.response_group_id
+                      WHERE response_group_cases.case_id = cases.id)) AS sent_at,
                     (SELECT outlook_outgoing_messages.resend_status
                      FROM response_group_cases
                      JOIN response_letters

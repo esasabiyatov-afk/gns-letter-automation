@@ -836,18 +836,13 @@ def test_com_gateway_sends_only_existing_pdf_draft_to_exact_account(
     assert mail.SendUsingAccount is account
     assert mail.sent == 1
 
-    try:
-        PyWin32OutlookGateway().send_draft(
-            draft_key="gns-test-scan-one",
-            recipient_email="real.person@example.com",
-            sending_account="",
-        )
-    except OutlookConnectionError as exc:
-        assert "esensabiyatov@gmail.com" in str(exc)
-    else:
-        raise AssertionError("Отправка не на тестовый адрес должна быть запрещена")
-
-    assert mail.sent == 1
+    real = PyWin32OutlookGateway().send_draft(
+        draft_key="gns-test-scan-one",
+        recipient_email="real.person@example.com",
+        sending_account="",
+    )
+    assert real.recipient_email == "real.person@example.com"
+    assert mail.sent == 2
 
 
 def test_com_gateway_confirms_only_exact_sent_item(monkeypatch, tmp_path):
@@ -2132,6 +2127,35 @@ def test_outlook_test_batch_send_route_reports_partial_result(monkeypatch):
     assert "Отправлено: 1" in location
     assert "С ошибкой: 1" in location
     assert "PDF пустой" in location
+
+
+def test_production_batch_send_route_queues_background_work(monkeypatch):
+    from fastapi import BackgroundTasks
+
+    from gns_app import main
+
+    class FakeOutgoing:
+        @staticmethod
+        def ready_send_count():
+            return 2
+
+    called = False
+
+    def unexpected_run():
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(main, "outlook_outgoing", FakeOutgoing())
+    monkeypatch.setattr(main, "_run_outlook_batch_send", unexpected_run)
+    monkeypatch.setattr(main, "_outlook_send_active", False)
+    background_tasks = BackgroundTasks()
+
+    response = main.send_all_ready_outlook_messages(background_tasks)
+
+    assert response.status_code == 303
+    assert len(background_tasks.tasks) == 1
+    assert not called
+    main._release_outlook_send()
 
 
 def test_outlook_import_route_queues_only_new_uploads(monkeypatch):

@@ -28,6 +28,7 @@ from gns_app.services.outlook_service import (
     OutlookDraftResult,
     OutlookIntegrationError,
     OutlookOutgoingService,
+    OutlookSendResult,
     OutlookSentMatch,
     OutlookSentScan,
     OutlookService,
@@ -2307,7 +2308,7 @@ def test_external_send_can_be_marked_once_without_outlook(workflow, monkeypatch)
         "SELECT COUNT(*) AS count FROM audit_events "
         "WHERE entity_id = ? "
         "AND event_type = 'outlook_sent_marked_manually'",
-        (first["id"],),
+        (letter["id"],),
     )["count"]
 
     assert first["status"] == "sent"
@@ -2339,6 +2340,94 @@ def test_external_send_can_be_marked_once_without_outlook(workflow, monkeypatch)
     assert printed.headers["content-type"] == "application/pdf"
     assert printed.headers["content-disposition"].startswith("inline;")
     assert len(PdfReader(BytesIO(printed.content)).pages) == 1
+
+
+def test_external_send_without_scan_is_recorded_and_locked(workflow):
+    group_id, letter = _ready_response_letter(workflow)
+    outgoing = OutlookOutgoingService(
+        workflow.db,
+        workflow.settings,
+        OutlookService(object()),
+    )
+
+    result = outgoing.mark_sent_manually(workflow, letter["id"])
+
+    assert result["status"] == "sent"
+    assert workflow.db.fetch_one(
+        "SELECT manually_sent_at FROM response_letters WHERE id = ?",
+        (letter["id"],),
+    )["manually_sent_at"]
+    assert workflow.db.fetch_one(
+        "SELECT COUNT(*) AS count FROM outlook_outgoing_messages"
+    )["count"] == 0
+    assert workflow.today_overview(view="created")[
+        "sent_generated_groups"
+    ][0]["id"] == group_id
+    with pytest.raises(WorkflowValidationError, match="отмечено отправленным"):
+        workflow.set_outgoing_number(letter["id"], "9551")
+
+
+def test_production_batch_sends_all_complete_responses_in_background_ready_state(
+    workflow,
+    monkeypatch,
+):
+    workflow.initialize_gns_offices()
+    workflow.initialize_gns_office_emails()
+    _, letter = _ready_response_letter(workflow)
+    workflow.set_outgoing_number(letter["id"], "9548")
+    workflow.register_signed_response_scan(
+        letter["id"], "scan.png", _png_scan()
+    )
+
+    class Gateway:
+        def __init__(self):
+            self.drafts = []
+            self.sent = []
+
+        def create_draft(self, **request):
+            self.drafts.append(request)
+            return OutlookDraftResult(
+                entry_id="draft-entry",
+                recipient_email=request["recipient_email"],
+                subject=request["subject"],
+                attachment_name=request["attachment_name"],
+            )
+
+        def send_draft(self, **request):
+            self.sent.append(request)
+            return OutlookSendResult(
+                entry_id="draft-entry",
+                recipient_email=request["recipient_email"],
+            )
+
+    gateway = Gateway()
+    outgoing = OutlookOutgoingService(
+        workflow.db,
+        workflow.settings,
+        OutlookService(gateway),
+    )
+    from starlette.testclient import TestClient
+
+    from gns_app import main
+
+    monkeypatch.setattr(main, "workflow", workflow)
+    monkeypatch.setattr(main, "outlook_outgoing", outgoing)
+    page = TestClient(main.app).get(
+        "/?tab=responses&response_view=created"
+    )
+    assert "Отправить все готовые · 1" in page.text
+
+    result = outgoing.send_all_ready_messages(workflow)
+    stored = workflow.db.fetch_one(
+        "SELECT status FROM outlook_outgoing_messages"
+    )
+
+    assert result["sent"] == [letter["id"]]
+    assert result["errors"] == []
+    assert stored["status"] == "send_requested"
+    assert outgoing.ready_send_count() == 0
+    assert gateway.drafts[0]["body"] == ""
+    assert gateway.sent[0]["recipient_email"] == "002lenin@sti.gov.kg"
 
 
 def test_repeat_draft_reuses_exact_confirmed_scan_and_is_confirmed(workflow):

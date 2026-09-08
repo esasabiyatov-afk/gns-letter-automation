@@ -1104,19 +1104,20 @@ class PyWin32OutlookGateway:
         recipient_email: str,
         sending_account: str,
     ) -> OutlookSendResult:
-        """Send one existing app draft to one exact test address."""
+        """Send one existing app draft to its exact validated recipient."""
         if sys.platform != "win32":
             raise OutlookUnsupportedPlatformError(
                 "Интеграция Outlook доступна только в Windows."
             )
         recipient = recipient_email.strip().casefold()
-        account_email = sending_account.strip().casefold()
-        if recipient != OUTLOOK_TEST_SEND_RECIPIENT:
-            raise OutlookConnectionError(
-                "Тестовая отправка Outlook разрешена только на согласованный "
-                f"адрес {OUTLOOK_TEST_SEND_RECIPIENT}."
-            )
-        if account_email and not EMAIL_RE.fullmatch(account_email):
+        account_identifier = sending_account.strip().casefold()
+        if not EMAIL_RE.fullmatch(recipient):
+            raise OutlookConnectionError("Получатель Outlook указан неверно.")
+        if (
+            len(account_identifier) > 255
+            or "\n" in account_identifier
+            or "\r" in account_identifier
+        ):
             raise OutlookConnectionError(
                 "Учётная запись отправителя Outlook указана неверно."
             )
@@ -1141,7 +1142,7 @@ class PyWin32OutlookGateway:
             mail = self._find_existing_draft(namespace, draft_key)
             if mail is None:
                 raise OutlookConnectionError(
-                    "Тестовый черновик Outlook не найден. Создайте его заново."
+                    "Черновик Outlook не найден. Создайте его заново."
                 )
 
             stage = "validate_attachment"
@@ -1151,7 +1152,7 @@ class PyWin32OutlookGateway:
             )
             if attachment_count != 1:
                 raise OutlookConnectionError(
-                    "Тестовый черновик должен содержать ровно один PDF."
+                    "Черновик должен содержать ровно один PDF."
                 )
             attachment = attachments.Item(1)
             attachment_name = _safe_text(
@@ -1159,19 +1160,15 @@ class PyWin32OutlookGateway:
             )
             if not attachment_name.casefold().endswith(".pdf"):
                 raise OutlookConnectionError(
-                    "Вложение тестового черновика должно быть PDF."
+                    "Вложение черновика должно быть PDF."
                 )
             if int(_safe_attribute(attachment, "Size", 0) or 0) <= 0:
                 raise OutlookConnectionError(
-                    "PDF-вложение тестового черновика пустое."
+                    "PDF-вложение черновика пустое."
                 )
             if not _safe_text(_safe_attribute(mail, "Subject")).strip():
                 raise OutlookConnectionError(
-                    "Тема тестового черновика не заполнена."
-                )
-            if not _safe_text(_safe_attribute(mail, "Body")).strip():
-                raise OutlookConnectionError(
-                    "Текст тестового черновика не заполнен."
+                    "Тема черновика не заполнена."
                 )
 
             stage = "select_account"
@@ -1185,9 +1182,16 @@ class PyWin32OutlookGateway:
                 smtp = _safe_text(
                     _safe_attribute(account, "SmtpAddress")
                 ).casefold()
-                if account_email and smtp == account_email:
+                delivery_store = _safe_attribute(account, "DeliveryStore", None)
+                store_name = _safe_text(
+                    _safe_attribute(delivery_store, "DisplayName")
+                ).casefold()
+                if account_identifier and account_identifier in {
+                    smtp,
+                    store_name,
+                }:
                     matches.append(account)
-            if not account_email and len(available_accounts) == 1:
+            if not account_identifier and len(available_accounts) == 1:
                 matches = available_accounts
             if len(matches) != 1:
                 raise OutlookConnectionError(
@@ -1226,12 +1230,12 @@ class PyWin32OutlookGateway:
         except Exception as exc:
             record_exception(
                 "outlook_worker",
-                "send_test_message",
+                "send_message",
                 exc,
                 details={"stage": stage},
             )
             raise OutlookConnectionError(
-                "Outlook не смог отправить тестовое письмо. "
+                "Outlook не смог отправить письмо. "
                 f"Этап: {stage}."
             ) from exc
         finally:
@@ -2988,6 +2992,163 @@ class OutlookOutgoingService:
             )
             return summary
 
+    def ready_send_count(self) -> int:
+        """Count complete production responses not already being sent."""
+
+        if self.test_mode_enabled():
+            return self.ready_test_send_count()
+        row = self.db.fetch_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM response_letters
+            JOIN response_groups
+              ON response_groups.id = response_letters.response_group_id
+            WHERE response_groups.status = 'created'
+              AND TRIM(COALESCE(response_letters.outgoing_number, '')) != ''
+              AND EXISTS (
+                  SELECT 1 FROM signed_response_scans
+                  WHERE signed_response_scans.response_letter_id =
+                        response_letters.id
+                    AND signed_response_scans.status = 'confirmed'
+                    AND signed_response_scans.size_bytes > 0
+                    AND signed_response_scans.page_count > 0
+              )
+              AND response_letters.taxpayer_count > 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM outlook_outgoing_messages
+                  WHERE outlook_outgoing_messages.response_letter_id =
+                        response_letters.id
+                    AND outlook_outgoing_messages.status IN (
+                        'sent', 'send_requested'
+                    )
+              )
+            """
+        ) or {"count": 0}
+        return int(row.get("count") or 0)
+
+    def _send_production_message_locked(
+        self,
+        workflow: OutlookWorkflow,
+        letter_id: str,
+    ) -> dict[str, Any]:
+        row = self._create_draft_locked(
+            workflow,
+            letter_id,
+            display=False,
+        )
+        if row.get("status") == "sent":
+            row["already_sent"] = True
+            return row
+        if row.get("status") != "draft_created":
+            raise OutlookIntegrationError("Черновик Outlook ещё не готов.")
+        try:
+            result = self.outlook.send_draft(
+                draft_key=str(row.get("draft_key") or ""),
+                recipient_email=str(row.get("recipient_email") or ""),
+                sending_account=self.get_mailbox(),
+            )
+        except OutlookIntegrationError as exc:
+            self.db.execute(
+                "UPDATE outlook_outgoing_messages SET status = 'technical_error', "
+                "error_message = ?, updated_at = ? WHERE id = ?",
+                (str(exc)[:500], utc_now(), row["id"]),
+            )
+            self.db.audit(
+                "outlook_outgoing_message",
+                str(row["id"]),
+                "outlook_send_failed",
+                {},
+                actor=workflow.get_active_employee() or "Сотрудник",
+            )
+            raise
+
+        now = utc_now()
+        self.db.execute(
+            """
+            UPDATE outlook_outgoing_messages
+            SET status = 'send_requested', outlook_entry_id = ?,
+                error_message = NULL, updated_at = ?
+            WHERE id = ? AND status = 'draft_created'
+            """,
+            (result.entry_id, now, row["id"]),
+        )
+        self.db.audit(
+            "outlook_outgoing_message",
+            str(row["id"]),
+            "outlook_send_requested",
+            {},
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+        updated = self.db.fetch_one(
+            "SELECT * FROM outlook_outgoing_messages WHERE id = ?",
+            (row["id"],),
+        ) or {}
+        updated["already_sent"] = False
+        return updated
+
+    def send_all_ready_messages(
+        self,
+        workflow: OutlookWorkflow,
+    ) -> dict[str, Any]:
+        """Send every complete production response; isolate per-letter errors."""
+
+        if self.test_mode_enabled():
+            raise OutlookIntegrationError(
+                "Для тестового режима используется отдельная отправка."
+            )
+        with self._draft_lock:
+            letters = self.db.fetch_all(
+                """
+                SELECT response_letters.id
+                FROM response_letters
+                JOIN response_groups
+                  ON response_groups.id = response_letters.response_group_id
+                WHERE response_groups.status = 'created'
+                  AND TRIM(COALESCE(response_letters.outgoing_number, '')) != ''
+                  AND EXISTS (
+                      SELECT 1 FROM signed_response_scans
+                      WHERE signed_response_scans.response_letter_id =
+                            response_letters.id
+                        AND signed_response_scans.status = 'confirmed'
+                        AND signed_response_scans.size_bytes > 0
+                        AND signed_response_scans.page_count > 0
+                  )
+                  AND response_letters.taxpayer_count > 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM outlook_outgoing_messages
+                      WHERE outlook_outgoing_messages.response_letter_id =
+                            response_letters.id
+                        AND outlook_outgoing_messages.status IN (
+                            'sent', 'send_requested'
+                        )
+                  )
+                ORDER BY response_groups.created_at, response_groups.rowid,
+                         CAST(response_letters.outgoing_number AS INTEGER),
+                         response_letters.letter_order
+                """
+            )
+            sent: list[str] = []
+            errors: list[dict[str, str]] = []
+            for letter in letters:
+                letter_id = str(letter["id"])
+                try:
+                    self._send_production_message_locked(workflow, letter_id)
+                    sent.append(letter_id)
+                except OutlookIntegrationError as exc:
+                    errors.append({"letter_id": letter_id, "message": str(exc)})
+            self.db.audit(
+                "outlook",
+                "production_batch_send",
+                "outlook_batch_send_completed",
+                {
+                    "ready_count": len(letters),
+                    "send_requested_count": len(sent),
+                    "error_count": len(errors),
+                },
+                actor=workflow.get_active_employee() or "Сотрудник",
+            )
+            return {"ready": len(letters), "sent": sent, "errors": errors}
+
     def create_resend_draft(
         self,
         workflow: OutlookWorkflow,
@@ -3147,7 +3308,7 @@ class OutlookOutgoingService:
                 """
                 SELECT *
                 FROM outlook_outgoing_messages
-                WHERE status = 'draft_created'
+                WHERE status IN ('draft_created', 'send_requested')
                    OR (status = 'sent' AND resend_status = 'draft_created')
                 ORDER BY created_at, id
                 """
@@ -3297,7 +3458,8 @@ class OutlookOutgoingService:
                             UPDATE outlook_outgoing_messages
                             SET status = 'sent', outlook_entry_id = ?, sent_at = ?,
                                 error_message = NULL, updated_at = ?
-                            WHERE id = ? AND status = 'draft_created'
+                            WHERE id = ?
+                              AND status IN ('draft_created', 'send_requested')
                             """,
                             (match.entry_id, match.sent_at, now, row["id"]),
                         )
@@ -3362,19 +3524,21 @@ class OutlookOutgoingService:
             if not letter:
                 raise OutlookIntegrationError("Готовое письмо не найдено.")
             scan = workflow.get_confirmed_signed_response_scan(letter_id)
-            if not scan:
-                raise OutlookIntegrationError(
-                    "Сначала загрузите подписанный ответ."
+            existing = None
+            if scan:
+                existing = self.db.fetch_one(
+                    "SELECT * FROM outlook_outgoing_messages "
+                    "WHERE signed_scan_id = ?",
+                    (scan["id"],),
                 )
-
-            existing = self.db.fetch_one(
-                "SELECT * FROM outlook_outgoing_messages "
-                "WHERE signed_scan_id = ?",
-                (scan["id"],),
-            )
-            if existing and existing.get("status") == "sent":
-                existing["already_sent"] = True
-                return existing
+            if letter.get("manually_sent_at") or (
+                existing and existing.get("status") == "sent"
+            ):
+                return {
+                    **(existing or {}),
+                    "status": "sent",
+                    "already_sent": True,
+                }
 
             office = workflow.match_gns_office(
                 str(letter.get("district_place") or "")
@@ -3392,40 +3556,46 @@ class OutlookOutgoingService:
             message_id = str(existing["id"]) if existing else uuid4().hex
             sent_at = utc_now()
             actor = workflow.get_active_employee() or "Сотрудник"
-            attachment_sha256 = str(scan.get("sha256") or "")
-            if not attachment_sha256:
-                raise OutlookIntegrationError(
-                    "У подписанного ответа отсутствует контрольная сумма."
-                )
+            attachment_sha256 = str(scan.get("sha256") or "") if scan else ""
 
             with self.db.connect() as connection:
                 connection.execute(
-                    """
-                    INSERT INTO outlook_outgoing_messages(
-                        id, response_letter_id, signed_scan_id, status,
-                        recipient_email, subject, attachment_name,
-                        attachment_sha256, draft_key, outlook_entry_id,
-                        sent_at, error_message, created_at, updated_at
-                    ) VALUES (?, ?, ?, 'sent', ?, ?, 'Ответ_ГНС.pdf', ?, ?,
-                              NULL, ?, NULL, ?, ?)
-                    ON CONFLICT(signed_scan_id) DO UPDATE SET
-                        status = 'sent', outlook_entry_id = NULL,
-                        sent_at = excluded.sent_at, error_message = NULL,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        message_id,
-                        letter_id,
-                        scan["id"],
-                        recipient_email,
-                        subject,
-                        attachment_sha256,
-                        f"gns-manual-scan-{scan['id']}",
-                        sent_at,
-                        sent_at,
-                        sent_at,
-                    ),
+                    "UPDATE response_letters SET manually_sent_at = ?, "
+                    "manually_sent_by = ?, updated_at = ? WHERE id = ?",
+                    (sent_at, actor, sent_at, letter_id),
                 )
+                if scan:
+                    if not attachment_sha256:
+                        raise OutlookIntegrationError(
+                            "У подписанного ответа отсутствует контрольная сумма."
+                        )
+                    connection.execute(
+                        """
+                        INSERT INTO outlook_outgoing_messages(
+                            id, response_letter_id, signed_scan_id, status,
+                            recipient_email, subject, attachment_name,
+                            attachment_sha256, draft_key, outlook_entry_id,
+                            sent_at, error_message, created_at, updated_at
+                        ) VALUES (?, ?, ?, 'sent', ?, ?, 'Ответ_ГНС.pdf', ?, ?,
+                                  NULL, ?, NULL, ?, ?)
+                        ON CONFLICT(signed_scan_id) DO UPDATE SET
+                            status = 'sent', outlook_entry_id = NULL,
+                            sent_at = excluded.sent_at, error_message = NULL,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            message_id,
+                            letter_id,
+                            scan["id"],
+                            recipient_email,
+                            subject,
+                            attachment_sha256,
+                            f"gns-manual-scan-{scan['id']}",
+                            sent_at,
+                            sent_at,
+                            sent_at,
+                        ),
+                    )
                 connection.execute(
                     """
                     INSERT INTO audit_events(
@@ -3434,21 +3604,27 @@ class OutlookOutgoingService:
                     ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        "outlook_outgoing_message",
-                        message_id,
+                        "response_letter",
+                        letter_id,
                         "outlook_sent_marked_manually",
                         actor,
                         json.dumps(
-                            {"signed_scan_id": scan["id"]},
+                            {"signed_scan_id": scan["id"] if scan else None},
                             ensure_ascii=False,
                         ),
                         sent_at,
                     ),
                 )
-            return self.db.fetch_one(
-                "SELECT * FROM outlook_outgoing_messages WHERE id = ?",
-                (message_id,),
-            ) or {}
+            result = (
+                self.db.fetch_one(
+                    "SELECT * FROM outlook_outgoing_messages WHERE id = ?",
+                    (message_id,),
+                )
+                if scan
+                else None
+            ) or {"status": "sent", "sent_at": sent_at}
+            result["already_sent"] = False
+            return result
 
 
 class OutlookInboxImporter:

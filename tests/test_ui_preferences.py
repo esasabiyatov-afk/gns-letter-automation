@@ -85,6 +85,35 @@ def test_abs_login_dialog_auto_opens_after_session_error(workflow, monkeypatch):
     assert "Войдите один раз" in response.text
 
 
+def test_abs_login_dialog_auto_opens_on_initial_work_page(workflow, monkeypatch):
+    from starlette.testclient import TestClient
+
+    from gns_app import main
+
+    monkeypatch.setattr(workflow, "abs_session_supported", lambda: True)
+    monkeypatch.setattr(workflow, "abs_session_active", lambda: False)
+    monkeypatch.setattr(workflow, "get_active_employee", lambda: "Сотрудник")
+    monkeypatch.setattr(
+        workflow,
+        "work_counts",
+        lambda: {
+            "incoming": 0,
+            "review": 0,
+            "ready_responses": 0,
+            "ready_abs": 2,
+            "processing": 0,
+        },
+    )
+    monkeypatch.setattr(main, "workflow", workflow)
+
+    response = TestClient(main.app).get("/")
+
+    assert response.status_code == 200
+    assert 'id="today-abs-dialog" class="modal"' in response.text
+    assert "data-auto-open" in response.text
+    assert "Войти и проверить все · 2" in response.text
+
+
 def test_abs_batch_is_queued_without_running_in_request(workflow, monkeypatch):
     from gns_app import main
 

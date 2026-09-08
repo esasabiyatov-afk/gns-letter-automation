@@ -79,6 +79,9 @@
           {% elif item.mail_status == 'draft_created' %}
             <span class="status status-ready">Письмо Outlook подготовлено</span>
             <small>{{ item.recipient_email }}</small>
+          {% elif item.mail_status == 'send_requested' %}
+            <span class="status status-processing">Отправляется</span>
+            <small>{{ item.recipient_email }}</small>
           {% elif item.signed_scan_id %}
             <span class="status status-response_created">Есть подписанный скан</span>
           {% elif item.response_group_id %}

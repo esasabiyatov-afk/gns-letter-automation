@@ -176,6 +176,16 @@
             </button>
             <small>Только с темой, получателем и непустым PDF-ответом.</small>
           </form>
+        {% elif not outlook_test_mode %}
+          <form class="send-ready-form" method="post"
+                action="/today/outlook-send-all"
+                onsubmit="return confirm('Отправить все готовые ответы через Outlook?');">
+            <button class="button button-primary" type="submit"
+                    {% if not outlook_ready_send_count or outlook_batch_send_active %}disabled{% endif %}>
+              {% if outlook_batch_send_active %}Отправляются…{% else %}Отправить все готовые · {{ outlook_ready_send_count }}{% endif %}
+            </button>
+            <small>Только ответы с номером и готовым PDF.</small>
+          </form>
         {% endif %}
       </div>
     </div>
@@ -255,6 +265,8 @@
                     {% if not letter.outlook_message.outlook_entry_id %}
                       <small>Отмечено вручную</small>
                     {% endif %}
+                  {% elif letter.outlook_message and letter.outlook_message.status == 'send_requested' %}
+                    <span class="status status-processing">Отправляется</span>
                   {% elif letter.outlook_message and letter.outlook_message.status == 'draft_created' %}
                     <span class="status status-ready">Письмо подготовлено</span>
                   {% elif letter.signed_scan and letter.signed_scan.status == 'confirmed' %}
@@ -279,6 +291,8 @@
                 <div class="letter-primary-action">
                   {% if letter.outlook_message and letter.outlook_message.status == 'sent' %}
                     <span class="sent-confirmed-note">Подтверждено Outlook</span>
+                  {% elif letter.outlook_message and letter.outlook_message.status == 'send_requested' %}
+                    <span class="sent-confirmed-note">Ожидается подтверждение Outlook</span>
                   {% elif letter.scan_session %}
                     <a class="button button-primary button-compact"
                        href="/?tab=responses&amp;response_view=created&amp;focus_letter={{ letter.id }}#letter-workflow">
@@ -364,9 +378,8 @@
                         </button>
                       </form>
                     {% endif %}
-                    {% if letter.signed_scan
-                          and letter.signed_scan.status == 'confirmed'
-                          and (not letter.outlook_message or letter.outlook_message.status != 'sent') %}
+                    {% if not letter.outlook_message
+                          or letter.outlook_message.status not in ('sent', 'send_requested') %}
                       <form method="post"
                             action="/response-letters/{{ letter.id }}/mark-sent"
                             onsubmit="return confirm('Отметить письмо отправленным вне приложения?');">
@@ -487,27 +500,3 @@
     </div>
   {% endif %}
 </section>
-
-{% if response_view == 'prepare' and overview.ready_abs and not abs_session_active %}
-<dialog id="today-abs-dialog" class="modal"
-        {% if abs_login_required %}data-auto-open{% endif %}>
-  <form method="post" action="/today/abs" autocomplete="off">
-    <div class="modal-heading">
-      <div>
-        <p class="eyebrow">{% if abs_is_fake %}ТЕСТОВАЯ АБС{% else %}АБС TOLUBAY{% endif %}</p>
-        <h2>Проверка АБС</h2>
-      </div>
-      <button type="button" class="modal-close" data-close-dialog>×</button>
-    </div>
-    <p class="warning-note">
-      Войдите один раз. Все следующие готовые письма проверяются автоматически.
-      После ошибки АБС приложение попросит войти снова.
-    </p>
-    <label class="field"><span>Логин</span><input name="username" autocomplete="off" required></label>
-    <label class="field"><span>Пароль</span><input name="password" type="password" autocomplete="new-password" required></label>
-    <button class="button button-primary button-block" type="submit">
-      Проверить {{ overview.ready_abs }}
-    </button>
-  </form>
-</dialog>
-{% endif %}
