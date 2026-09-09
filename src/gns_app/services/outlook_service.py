@@ -504,6 +504,7 @@ class OutlookDraftResult:
     subject: str
     attachment_name: str
     existing: bool = False
+    send_requested: bool = False
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "OutlookDraftResult":
@@ -513,6 +514,7 @@ class OutlookDraftResult:
             subject=str(payload.get("subject") or ""),
             attachment_name=str(payload.get("attachment_name") or ""),
             existing=bool(payload.get("existing", False)),
+            send_requested=bool(payload.get("send_requested", False)),
         )
 
 
@@ -612,6 +614,7 @@ class OutlookGateway(Protocol):
         sending_account: str = "",
         create_if_missing: bool = True,
         display: bool = True,
+        send_immediately: bool = False,
     ) -> OutlookDraftResult: ...
 
     def send_draft(
@@ -943,6 +946,7 @@ class PyWin32OutlookGateway:
         sending_account: str = "",
         create_if_missing: bool = True,
         display: bool = True,
+        send_immediately: bool = False,
     ) -> OutlookDraftResult:
         if sys.platform != "win32":
             raise OutlookUnsupportedPlatformError(
@@ -1060,6 +1064,77 @@ class PyWin32OutlookGateway:
                     changed = True
                 if changed:
                     mail.Save()
+            send_requested = False
+            if send_immediately:
+                stage = "validate_send"
+                attachments = _safe_attribute(mail, "Attachments", None)
+                if int(_safe_attribute(attachments, "Count", 0) or 0) != 1:
+                    raise OutlookConnectionError(
+                        "Черновик должен содержать ровно один PDF."
+                    )
+                attachment = attachments.Item(1)
+                if not _safe_text(
+                    _safe_attribute(attachment, "FileName")
+                ).casefold().endswith(".pdf"):
+                    raise OutlookConnectionError(
+                        "Вложение черновика должно быть PDF."
+                    )
+                if int(_safe_attribute(attachment, "Size", 0) or 0) <= 0:
+                    raise OutlookConnectionError(
+                        "PDF-вложение черновика пустое."
+                    )
+                if not _safe_text(_safe_attribute(mail, "Subject")).strip():
+                    raise OutlookConnectionError(
+                        "Тема черновика не заполнена."
+                    )
+
+                stage = "select_account"
+                accounts = _safe_attribute(namespace, "Accounts", None)
+                account_count = int(_safe_attribute(accounts, "Count", 0) or 0)
+                available_accounts: list[Any] = []
+                matches: list[Any] = []
+                for index in range(1, account_count + 1):
+                    account = accounts.Item(index)
+                    available_accounts.append(account)
+                    smtp = _safe_text(
+                        _safe_attribute(account, "SmtpAddress")
+                    ).casefold()
+                    delivery_store = _safe_attribute(
+                        account, "DeliveryStore", None
+                    )
+                    store_name = _safe_text(
+                        _safe_attribute(delivery_store, "DisplayName")
+                    ).casefold()
+                    if account_identifier and account_identifier in {
+                        smtp,
+                        store_name,
+                    }:
+                        matches.append(account)
+                if not account_identifier and len(available_accounts) == 1:
+                    matches = available_accounts
+                if len(matches) != 1:
+                    raise OutlookConnectionError(
+                        "Учётная запись отправителя не выбрана однозначно. "
+                        "Укажите точный почтовый ящик в настройках Outlook."
+                    )
+
+                stage = "send"
+                mail.To = recipient_email.strip().casefold()
+                mail.CC = ""
+                mail.BCC = ""
+                mail.SendUsingAccount = matches[0]
+                mail.Save()
+                certificate_watcher = (
+                    start_outlook_certificate_dialog_watcher()
+                    if self.allow_insecure_certificate
+                    else None
+                )
+                try:
+                    mail.Send()
+                finally:
+                    if certificate_watcher is not None:
+                        certificate_watcher.finish()
+                send_requested = True
             if display:
                 stage = "display_draft"
                 mail.Display()
@@ -1080,6 +1155,7 @@ class PyWin32OutlookGateway:
                 subject=_safe_text(_safe_attribute(mail, "Subject")),
                 attachment_name=attachment_name,
                 existing=existing,
+                send_requested=send_requested,
             )
         except OutlookIntegrationError:
             raise
@@ -1946,6 +2022,7 @@ class SubprocessOutlookGateway:
         sending_account: str = "",
         create_if_missing: bool = True,
         display: bool = True,
+        send_immediately: bool = False,
     ) -> OutlookDraftResult:
         payload = self._call_bridge(
             "draft",
@@ -1960,6 +2037,7 @@ class SubprocessOutlookGateway:
                 "sending_account": sending_account,
                 "create_if_missing": create_if_missing,
                 "display": display,
+                "send_immediately": send_immediately,
             },
             timeout_seconds=max(120, self.timeout_seconds),
         )
@@ -2201,6 +2279,7 @@ class OutlookService:
         sending_account: str = "",
         create_if_missing: bool = True,
         display: bool = True,
+        send_immediately: bool = False,
     ) -> OutlookDraftResult:
         creator = getattr(self.gateway, "create_draft", None)
         if creator is None:
@@ -2218,6 +2297,7 @@ class OutlookService:
                 sending_account=sending_account,
                 create_if_missing=create_if_missing,
                 display=display,
+                send_immediately=send_immediately,
             )
 
     def send_draft(
@@ -2565,6 +2645,7 @@ class OutlookOutgoingService:
         letter_id: str,
         *,
         display: bool,
+        send_immediately: bool = False,
     ) -> dict[str, Any]:
         letter = workflow.get_response_letter(letter_id)
         if not letter:
@@ -2681,9 +2762,10 @@ class OutlookOutgoingService:
                 sending_account=self.get_mailbox(),
                 create_if_missing=not reopening_existing,
                 display=display,
+                send_immediately=send_immediately,
             )
         except OutlookIntegrationError as exc:
-            if not reopening_existing:
+            if not reopening_existing or send_immediately:
                 self.db.execute(
                     """
                     UPDATE outlook_outgoing_messages
@@ -2695,7 +2777,11 @@ class OutlookOutgoingService:
             self.db.audit(
                 "outlook_outgoing_message",
                 message_id,
-                "outlook_draft_failed",
+                (
+                    "outlook_send_failed"
+                    if send_immediately
+                    else "outlook_draft_failed"
+                ),
                 {"signed_scan_id": scan["id"]},
                 actor=workflow.get_active_employee(),
             )
@@ -2716,19 +2802,26 @@ class OutlookOutgoingService:
             if staging is not None and staging.canonical_dir.exists():
                 shutil.rmtree(staging.canonical_dir, ignore_errors=True)
 
+        final_status = (
+            "send_requested" if result.send_requested else "draft_created"
+        )
         self.db.execute(
             """
             UPDATE outlook_outgoing_messages
-            SET status = 'draft_created', outlook_entry_id = ?,
+            SET status = ?, outlook_entry_id = ?,
                 error_message = NULL, updated_at = ?
             WHERE id = ?
             """,
-            (result.entry_id, utc_now(), message_id),
+            (final_status, result.entry_id, utc_now(), message_id),
         )
         self.db.audit(
             "outlook_outgoing_message",
             message_id,
-            "outlook_draft_created",
+            (
+                "outlook_send_requested"
+                if result.send_requested
+                else "outlook_draft_created"
+            ),
             {
                 "signed_scan_id": scan["id"],
                 "existing_outlook_draft": result.existing,
@@ -3035,56 +3128,17 @@ class OutlookOutgoingService:
             workflow,
             letter_id,
             display=False,
+            send_immediately=True,
         )
         if row.get("status") == "sent":
             row["already_sent"] = True
             return row
-        if row.get("status") != "draft_created":
-            raise OutlookIntegrationError("Черновик Outlook ещё не готов.")
-        try:
-            result = self.outlook.send_draft(
-                draft_key=str(row.get("draft_key") or ""),
-                recipient_email=str(row.get("recipient_email") or ""),
-                sending_account=self.get_mailbox(),
+        if row.get("status") != "send_requested":
+            raise OutlookIntegrationError(
+                "Outlook не подтвердил команду отправки."
             )
-        except OutlookIntegrationError as exc:
-            self.db.execute(
-                "UPDATE outlook_outgoing_messages SET status = 'technical_error', "
-                "error_message = ?, updated_at = ? WHERE id = ?",
-                (str(exc)[:500], utc_now(), row["id"]),
-            )
-            self.db.audit(
-                "outlook_outgoing_message",
-                str(row["id"]),
-                "outlook_send_failed",
-                {},
-                actor=workflow.get_active_employee() or "Сотрудник",
-            )
-            raise
-
-        now = utc_now()
-        self.db.execute(
-            """
-            UPDATE outlook_outgoing_messages
-            SET status = 'send_requested', outlook_entry_id = ?,
-                error_message = NULL, updated_at = ?
-            WHERE id = ? AND status = 'draft_created'
-            """,
-            (result.entry_id, now, row["id"]),
-        )
-        self.db.audit(
-            "outlook_outgoing_message",
-            str(row["id"]),
-            "outlook_send_requested",
-            {},
-            actor=workflow.get_active_employee() or "Сотрудник",
-        )
-        updated = self.db.fetch_one(
-            "SELECT * FROM outlook_outgoing_messages WHERE id = ?",
-            (row["id"],),
-        ) or {}
-        updated["already_sent"] = False
-        return updated
+        row["already_sent"] = False
+        return row
 
     def send_all_ready_messages(
         self,
@@ -4370,6 +4424,7 @@ def _bridge_payload(
                     payload.get("create_if_missing", True)
                 ),
                 display=bool(payload.get("display", True)),
+                send_immediately=bool(payload.get("send_immediately", False)),
             )
             return {"ok": True, "draft": asdict(draft)}
         if action == "send":

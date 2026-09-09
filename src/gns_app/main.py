@@ -6,7 +6,7 @@ import sys
 from contextlib import asynccontextmanager, suppress
 from datetime import date
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from urllib.parse import quote
 
 import uvicorn
@@ -146,11 +146,15 @@ def _run_outlook_batch_send() -> None:
         _release_outlook_send()
 
 
-def _queue_outlook_batch_send(background_tasks: BackgroundTasks) -> bool:
+def _queue_outlook_batch_send() -> bool:
     if not _claim_outlook_send():
         return False
     try:
-        background_tasks.add_task(_run_outlook_batch_send)
+        Thread(
+            target=_run_outlook_batch_send,
+            name="gns-outlook-batch-send",
+            daemon=True,
+        ).start()
     except Exception:
         _release_outlook_send()
         raise
@@ -1458,13 +1462,13 @@ def send_all_ready_outlook_test_messages():
 
 
 @app.post("/today/outlook-send-all")
-def send_all_ready_outlook_messages(background_tasks: BackgroundTasks):
+def send_all_ready_outlook_messages():
     if outlook_outgoing.ready_send_count() < 1:
         return RedirectResponse(
             "/today?message=" + quote("Готовых писем для отправки пока нет."),
             status_code=303,
         )
-    started = _queue_outlook_batch_send(background_tasks)
+    started = _queue_outlook_batch_send()
     message = (
         "Отправка всех готовых писем запущена в фоне."
         if started

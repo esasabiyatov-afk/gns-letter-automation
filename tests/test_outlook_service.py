@@ -615,6 +615,17 @@ def test_com_gateway_creates_and_reopens_same_outlook_draft(
                 (source, attachment_type, position, display_name)
             )
 
+        @property
+        def Count(self):
+            return len(self.added)
+
+        def Item(self, index):
+            added = self.added[index - 1]
+            return SimpleNamespace(
+                FileName=added[3],
+                Size=attachment.stat().st_size,
+            )
+
     class Items:
         def __init__(self):
             self.values = []
@@ -646,6 +657,7 @@ def test_com_gateway_creates_and_reopens_same_outlook_draft(
             self.UserProperties = UserProperties()
             self.Attachments = Attachments()
             self.display_count = 0
+            self.send_count = 0
             self.GetInspector = Inspector()
 
         def Save(self):
@@ -654,6 +666,9 @@ def test_com_gateway_creates_and_reopens_same_outlook_draft(
 
         def Display(self):
             self.display_count += 1
+
+        def Send(self):
+            self.send_count += 1
 
     sending_account = SimpleNamespace(SmtpAddress="employee@bank.kg")
     namespace = SimpleNamespace(
@@ -697,9 +712,21 @@ def test_com_gateway_creates_and_reopens_same_outlook_draft(
         sending_account="employee@bank.kg",
         display=False,
     )
+    sent = gateway.create_draft(
+        draft_key="gns-scan-one",
+        recipient_email="recipient@example.test",
+        subject="Ответ № 9544",
+        body="",
+        attachment_path=attachment,
+        attachment_name=attachment.name,
+        sending_account="employee@bank.kg",
+        display=False,
+        send_immediately=True,
+    )
 
     assert not first.existing
     assert second.existing
+    assert sent.send_requested
     assert len(items.values) == 1
     assert len(items.values[0].Attachments.added) == 1
     assert items.values[0].SendUsingAccount is sending_account
@@ -708,6 +735,7 @@ def test_com_gateway_creates_and_reopens_same_outlook_draft(
     assert items.values[0].display_count == 1
     assert items.values[0].GetInspector.WindowState == 2
     assert items.values[0].GetInspector.activate_count == 1
+    assert items.values[0].send_count == 1
 
     items.values.clear()
     with pytest.raises(OutlookConnectionError, match="дождитесь обновления"):
@@ -2130,8 +2158,6 @@ def test_outlook_test_batch_send_route_reports_partial_result(monkeypatch):
 
 
 def test_production_batch_send_route_queues_background_work(monkeypatch):
-    from fastapi import BackgroundTasks
-
     from gns_app import main
 
     class FakeOutgoing:
@@ -2139,22 +2165,25 @@ def test_production_batch_send_route_queues_background_work(monkeypatch):
         def ready_send_count():
             return 2
 
-    called = False
+    started = []
 
-    def unexpected_run():
-        nonlocal called
-        called = True
+    class FakeThread:
+        def __init__(self, *, target, name, daemon):
+            started.append((target, name, daemon))
+
+        def start(self):
+            return None
 
     monkeypatch.setattr(main, "outlook_outgoing", FakeOutgoing())
-    monkeypatch.setattr(main, "_run_outlook_batch_send", unexpected_run)
+    monkeypatch.setattr(main, "Thread", FakeThread)
     monkeypatch.setattr(main, "_outlook_send_active", False)
-    background_tasks = BackgroundTasks()
 
-    response = main.send_all_ready_outlook_messages(background_tasks)
+    response = main.send_all_ready_outlook_messages()
 
     assert response.status_code == 303
-    assert len(background_tasks.tasks) == 1
-    assert not called
+    assert len(started) == 1
+    assert started[0][0] is main._run_outlook_batch_send
+    assert started[0][1:] == ("gns-outlook-batch-send", True)
     main._release_outlook_send()
 
 

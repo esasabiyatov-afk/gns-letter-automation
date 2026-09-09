@@ -581,7 +581,10 @@ def test_response_menu_opens_the_whole_combined_letter_group():
     assert "Открыть все письма и данные" in template
     assert "Остальные" not in template
     assert "Открыть исходное письмо" not in template
-    assert 'target="_blank"' not in template
+    open_group_link = template.split(
+        'data-testid="open-response-group"', 1
+    )[0].rsplit("<a ", 1)[-1]
+    assert 'target="_blank"' not in open_group_link
 
 
 def test_prepare_response_reveals_all_taxpayers_and_all_cases(

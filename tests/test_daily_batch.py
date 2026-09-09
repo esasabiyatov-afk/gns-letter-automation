@@ -2062,7 +2062,7 @@ def test_signed_scan_upload_route_marks_scan_ready(workflow, monkeypatch):
         '#page=1&amp;zoom=page-fit"' in drawer.text
     )
     assert "Открыть PDF" not in drawer.text
-    assert 'type="checkbox"' not in drawer.text
+    assert "Проверить скан" not in drawer.text
 
     assert workflow.get_signed_response_scan(scan["id"])["status"] == "confirmed"
 
@@ -2382,7 +2382,6 @@ def test_production_batch_sends_all_complete_responses_in_background_ready_state
     class Gateway:
         def __init__(self):
             self.drafts = []
-            self.sent = []
 
         def create_draft(self, **request):
             self.drafts.append(request)
@@ -2391,13 +2390,7 @@ def test_production_batch_sends_all_complete_responses_in_background_ready_state
                 recipient_email=request["recipient_email"],
                 subject=request["subject"],
                 attachment_name=request["attachment_name"],
-            )
-
-        def send_draft(self, **request):
-            self.sent.append(request)
-            return OutlookSendResult(
-                entry_id="draft-entry",
-                recipient_email=request["recipient_email"],
+                send_requested=request["send_immediately"],
             )
 
     gateway = Gateway()
@@ -2427,7 +2420,8 @@ def test_production_batch_sends_all_complete_responses_in_background_ready_state
     assert stored["status"] == "send_requested"
     assert outgoing.ready_send_count() == 0
     assert gateway.drafts[0]["body"] == ""
-    assert gateway.sent[0]["recipient_email"] == "002lenin@sti.gov.kg"
+    assert gateway.drafts[0]["recipient_email"] == "002lenin@sti.gov.kg"
+    assert gateway.drafts[0]["send_immediately"] is True
 
 
 def test_repeat_draft_reuses_exact_confirmed_scan_and_is_confirmed(workflow):
