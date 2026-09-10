@@ -219,6 +219,80 @@ def test_employee_can_add_update_and_delete_office_email(workflow):
     assert stored == {"active": 0, "user_modified": 1}
 
 
+def test_salyk_backup_toggle_is_persisted_and_derived_from_current_primary(
+    workflow,
+):
+    office_id = workflow.save_gns_office(
+        "по Тестовому району Нарынской области",
+        "office@sti.gov.kg",
+        "manual@example.kg",
+        salyk_backup_enabled=True,
+    )
+
+    office = next(
+        item for item in workflow.list_gns_offices() if item["id"] == office_id
+    )
+    stored = workflow.db.fetch_one(
+        "SELECT backup_emails_json, salyk_backup_enabled "
+        "FROM gns_offices WHERE id = ?",
+        (office_id,),
+    )
+
+    assert stored == {
+        "backup_emails_json": '["manual@example.kg"]',
+        "salyk_backup_enabled": 1,
+    }
+    assert office["backup_emails"] == ["manual@example.kg"]
+    assert office["salyk_backup_email"] == "office@salyk.kg"
+    assert office["delivery_emails"] == [
+        "office@sti.gov.kg",
+        "manual@example.kg",
+        "office@salyk.kg",
+    ]
+    assert workflow.office_delivery_recipients(office) == (
+        "office@sti.gov.kg; manual@example.kg; office@salyk.kg"
+    )
+
+    workflow.save_gns_office(
+        office["district_place"],
+        "changed@sti.gov.kg",
+        office["backup_emails"],
+        office["aliases"],
+        salyk_backup_enabled=True,
+        office_id=office_id,
+    )
+    updated = next(
+        item for item in workflow.list_gns_offices() if item["id"] == office_id
+    )
+
+    assert updated["backup_emails"] == ["manual@example.kg"]
+    assert updated["delivery_emails"] == [
+        "changed@sti.gov.kg",
+        "manual@example.kg",
+        "changed@salyk.kg",
+    ]
+    assert "office@salyk.kg" not in updated["delivery_emails"]
+
+
+def test_salyk_backup_requires_sti_primary_and_counts_towards_backup_limit(
+    workflow,
+):
+    with pytest.raises(WorkflowValidationError, match="только для основной"):
+        workflow.save_gns_office(
+            "по Району без STI",
+            "office@example.kg",
+            salyk_backup_enabled=True,
+        )
+
+    with pytest.raises(WorkflowValidationError, match="до пяти резервных"):
+        workflow.save_gns_office(
+            "по Району с лишними резервами",
+            "office@sti.gov.kg",
+            ",".join(f"reserve{index}@example.kg" for index in range(5)),
+            salyk_backup_enabled=True,
+        )
+
+
 def test_office_settings_reject_duplicate_or_invalid_email(workflow):
     workflow.save_gns_office(
         "по Первому тестовому району",
@@ -254,9 +328,10 @@ def test_user_office_changes_survive_default_directory_refresh(workflow):
     office = workflow.list_gns_offices()[0]
     workflow.save_gns_office(
         office["district_place"],
-        "changed@example.kg",
+        "changed@sti.gov.kg",
         "reserve@example.kg",
         "Ручной алиас",
+        salyk_backup_enabled=True,
         office_id=office["id"],
     )
     workflow.db.execute(
@@ -275,8 +350,14 @@ def test_user_office_changes_survive_default_directory_refresh(workflow):
         for item in workflow.list_gns_offices()
         if item["office_key"] == office["office_key"]
     )
-    assert refreshed["email_address"] == "changed@example.kg"
+    assert refreshed["email_address"] == "changed@sti.gov.kg"
     assert refreshed["backup_emails"] == ["reserve@example.kg"]
+    assert refreshed["salyk_backup_enabled"]
+    assert refreshed["delivery_emails"] == [
+        "changed@sti.gov.kg",
+        "reserve@example.kg",
+        "changed@salyk.kg",
+    ]
     assert refreshed["aliases"] == ["Ручной алиас"]
 
 

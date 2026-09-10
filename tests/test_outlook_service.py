@@ -624,6 +624,7 @@ def test_com_gateway_creates_and_reopens_same_outlook_draft(
             return SimpleNamespace(
                 FileName=added[3],
                 Size=attachment.stat().st_size,
+                Delete=lambda: self.added.pop(index - 1),
             )
 
     class Items:
@@ -712,6 +713,17 @@ def test_com_gateway_creates_and_reopens_same_outlook_draft(
         sending_account="employee@bank.kg",
         display=False,
     )
+    replaced = gateway.create_draft(
+        draft_key="gns-scan-one",
+        recipient_email="recipient@example.test",
+        subject="Ответ № 9544",
+        body="",
+        attachment_path=attachment,
+        attachment_name=attachment.name,
+        sending_account="employee@bank.kg",
+        replace_existing=True,
+        display=False,
+    )
     sent = gateway.create_draft(
         draft_key="gns-scan-one",
         recipient_email="recipient@example.test",
@@ -726,6 +738,7 @@ def test_com_gateway_creates_and_reopens_same_outlook_draft(
 
     assert not first.existing
     assert second.existing
+    assert replaced.existing
     assert sent.send_requested
     assert len(items.values) == 1
     assert len(items.values[0].Attachments.added) == 1
@@ -887,18 +900,21 @@ def test_com_gateway_confirms_only_exact_sent_item(monkeypatch, tmp_path):
 
     class Recipient:
         Type = 1
-        Address = "recipient@example.test"
-        PropertyAccessor = SimpleNamespace(
-            GetProperty=lambda _schema: "recipient@example.test"
-        )
+
+        def __init__(self, address):
+            self.Address = address
+            self.PropertyAccessor = SimpleNamespace(
+                GetProperty=lambda _schema: address
+            )
 
     class Recipients:
-        Count = 1
+        Count = 2
 
         @staticmethod
         def Item(index):
-            assert index == 1
-            return Recipient()
+            return Recipient(
+                {1: "backup@example.test", 2: "recipient@example.test"}[index]
+            )
 
     class Attachment:
         FileName = source_pdf.name
@@ -970,7 +986,9 @@ def test_com_gateway_confirms_only_exact_sent_item(monkeypatch, tmp_path):
         candidates=(
             OutlookSentCandidate(
                 draft_key="gns-scan-confirmed",
-                recipient_email="recipient@example.test",
+                recipient_email=(
+                    "recipient@example.test; backup@example.test"
+                ),
                 subject="Ответ № 9544",
                 attachment_name=source_pdf.name,
                 attachment_sha256=expected_sha256,
@@ -998,7 +1016,9 @@ def test_com_gateway_confirms_only_exact_sent_item(monkeypatch, tmp_path):
         candidates=(
             OutlookSentCandidate(
                 draft_key="gns-scan-confirmed",
-                recipient_email="recipient@example.test",
+                recipient_email=(
+                    "backup@example.test; recipient@example.test"
+                ),
                 subject="Ответ № 9544",
                 attachment_name=source_pdf.name,
                 attachment_sha256=expected_sha256,
@@ -1112,6 +1132,105 @@ def test_com_gateway_rejects_sent_item_with_different_recipient(
     assert wrong_hash.matches == ()
     assert wrong_hash.rejected_mail_count == 1
 
+    recipient.Type = 2
+    copied_recipient = PyWin32OutlookGateway().scan_sent_items(
+        candidates=(
+            OutlookSentCandidate(
+                draft_key="gns-scan-rejected",
+                recipient_email="recipient@example.test",
+                subject="Ответ",
+                attachment_name=source_pdf.name,
+                attachment_sha256=expected_sha256,
+            ),
+        ),
+        sent_since=date(2026, 9, 3),
+        staging_dir=staging_dir,
+        max_attachment_bytes=10 * 1024 * 1024,
+    )
+    assert copied_recipient.matches == ()
+
+
+def test_com_gateway_recovers_missing_draft_key_only_for_unique_pdf_recipient(
+    monkeypatch,
+    tmp_path,
+):
+    source_pdf = write_test_pdf(tmp_path / "sent.pdf")
+    digest = hashlib.sha256(source_pdf.read_bytes()).hexdigest()
+    recipient = SimpleNamespace(
+        Type=1,
+        Address="recipient@example.test",
+        PropertyAccessor=SimpleNamespace(
+            GetProperty=lambda _schema: "recipient@example.test"
+        ),
+    )
+    attachment = SimpleNamespace(
+        FileName="renamed.pdf",
+        Size=source_pdf.stat().st_size,
+        SaveAsFile=lambda destination: shutil.copyfile(source_pdf, destination),
+    )
+    mail = SimpleNamespace(
+        Class=43,
+        EntryID="sent-without-key",
+        SentOn=datetime(2026, 9, 4, 10, 30),
+        Subject="Изменённая тема",
+        UserProperties=SimpleNamespace(Find=lambda _name: None),
+        Recipients=SimpleNamespace(Count=1, Item=lambda _index: recipient),
+        Attachments=SimpleNamespace(Count=1, Item=lambda _index: attachment),
+    )
+    items = SimpleNamespace(
+        Count=1,
+        Sort=lambda _field, _descending: None,
+        Item=lambda _index: mail,
+    )
+    application = SimpleNamespace(
+        GetNamespace=lambda _name: SimpleNamespace(
+            GetDefaultFolder=lambda _folder_id: SimpleNamespace(Items=items)
+        )
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "pythoncom",
+        SimpleNamespace(CoInitialize=lambda: None, CoUninitialize=lambda: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "win32com",
+        SimpleNamespace(client=SimpleNamespace(Dispatch=lambda _name: application)),
+    )
+    from gns_app.services import outlook_service
+
+    staging_dir = outlook_service._prepare_outlook_staging_dir(
+        tmp_path / "fallback-staging"
+    )
+
+    def candidate(key):
+        return OutlookSentCandidate(
+            draft_key=key,
+            recipient_email="recipient@example.test",
+            subject="Ответ",
+            attachment_name="Ответ_ГНС.pdf",
+            attachment_sha256=digest,
+            created_after="2026-09-04T10:00:00",
+        )
+
+    gateway = PyWin32OutlookGateway()
+    unique = gateway.scan_sent_items(
+        candidates=(candidate("gns-one"),),
+        sent_since=date(2026, 9, 3),
+        staging_dir=staging_dir,
+        max_attachment_bytes=10 * 1024 * 1024,
+    )
+    ambiguous = gateway.scan_sent_items(
+        candidates=(candidate("gns-one"), candidate("gns-two")),
+        sent_since=date(2026, 9, 3),
+        staging_dir=staging_dir,
+        max_attachment_bytes=10 * 1024 * 1024,
+    )
+
+    assert [match.draft_key for match in unique.matches] == ["gns-one"]
+    assert ambiguous.matches == ()
+    assert ambiguous.ambiguous_candidate_count == 2
+
 
 def test_subprocess_gateway_serializes_sent_scan(monkeypatch, tmp_path):
     from gns_app.services import outlook_service
@@ -1171,9 +1290,10 @@ def test_subprocess_gateway_serializes_sent_scan(monkeypatch, tmp_path):
             "draft_key": "gns-scan-one",
             "recipient_email": "recipient@example.test",
             "subject": "Ответ",
-            "attachment_name": "Ответ.pdf",
-            "attachment_sha256": "a" * 64,
-        }
+                "attachment_name": "Ответ.pdf",
+                "attachment_sha256": "a" * 64,
+                "created_after": "",
+            }
     ]
     assert captured["input_payload"]["mailbox"] == "mailbox@example.test"
     assert captured["input_payload"]["allow_insecure_certificate"] is True
@@ -2082,6 +2202,11 @@ def test_outlook_draft_route_reports_created_and_existing(monkeypatch):
             assert letter_id == "letter-1"
             return {"existing_outlook_draft": cls.existing}
 
+        @classmethod
+        def recreate_draft(cls, workflow, letter_id):
+            assert letter_id == "letter-1"
+            return {"existing_outlook_draft": True}
+
     monkeypatch.setattr(main, "outlook_outgoing", FakeOutgoing())
 
     created = main.create_response_letter_outlook_draft(
@@ -2091,11 +2216,47 @@ def test_outlook_draft_route_reports_created_and_existing(monkeypatch):
     reopened = main.create_response_letter_outlook_draft(
         "letter-1", "group-1"
     )
+    recreated = main.recreate_response_letter_outlook_draft(
+        "letter-1", "group-1"
+    )
 
     assert created.status_code == 303
     assert "message=" in created.headers["location"]
     assert reopened.status_code == 303
     assert "message=" in reopened.headers["location"]
+    assert recreated.status_code == 303
+    assert "group-group-1" in recreated.headers["location"]
+
+
+def test_resend_draft_route_can_return_to_created_responses(monkeypatch):
+    from gns_app import main
+
+    class FakeOutgoing:
+        @staticmethod
+        def create_resend_draft(workflow, message_id):
+            assert message_id == "message-1"
+            return {"existing_outlook_draft": False}
+
+    monkeypatch.setattr(main, "outlook_outgoing", FakeOutgoing())
+
+    response = main.create_outlook_resend_draft(
+        "message-1",
+        return_to="created",
+        group_id="group-1",
+        query="",
+        sort_order="date_desc",
+        delivery_status="all",
+        outgoing_number="",
+        date_from="",
+        date_to="",
+        district_place="",
+        recipient_full_name="",
+        page=1,
+    )
+
+    assert response.status_code == 303
+    assert "tab=responses" in response.headers["location"]
+    assert "#group-group-1" in response.headers["location"]
 
 
 def test_outlook_test_send_route_reports_sent_and_idempotent(monkeypatch):

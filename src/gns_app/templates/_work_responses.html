@@ -141,18 +141,24 @@
       {% endfor %}
     {% endfor %}
     <div class="work-section-toolbar response-toolbar"
-         data-tour-anchor="created">
+         data-tour-anchor="created" data-created-outlook-monitor>
       <div>
         <h2>Созданные ответы</h2>
         <p>Сначала откройте письмо в Word, проверьте и распечатайте его. Затем отсканируйте подписанный ответ.</p>
       </div>
       <div class="work-toolbar-actions created-toolbar-actions">
         {% if printable.count %}
-          <form id="signed-copy-print-form" method="post" target="_blank"
+          <form id="signed-copy-print-form" class="signed-copy-actions"
+                method="post" target="_blank"
                 action="/signed-response-scans/print-selected">
-            <button class="button button-secondary button-compact" type="submit">
+            <button class="button button-secondary button-compact" type="submit"
+                    data-signed-copy-print disabled>
               Печать выбранных
             </button>
+            <button class="button button-quiet button-compact" type="button"
+                    data-signed-copy-select-all>Выбрать все</button>
+            <button class="button button-quiet button-compact" type="button"
+                    data-signed-copy-clear disabled>Снять выбор</button>
           </form>
         {% endif %}
         {% if overview.unnumbered_letters %}
@@ -219,7 +225,9 @@
           {% endif %}
           <div class="created-letter-list">
             {% for letter in group.letters %}
-              <div class="created-letter-line" id="letter-{{ letter.id }}">
+              <div class="created-letter-line" id="letter-{{ letter.id }}"
+                   data-created-outlook-row="{{ letter.id }}"
+                   data-outlook-state="{% if letter.outlook_message %}{{ letter.outlook_message.id or '' }}|{{ letter.outlook_message.status or '' }}|{{ letter.outlook_message.updated_at or '' }}|{{ letter.outlook_message.resend_status or '' }}|{{ letter.outlook_message.resent_at or '' }}{% else %}none{% endif %}">
                 {% if letter.signed_scan and letter.signed_scan.status == 'confirmed' %}
                   <label class="signed-copy-select" title="Выбрать подписанный ответ для печати">
                     <input type="checkbox" name="letter_ids" value="{{ letter.id }}"
@@ -290,7 +298,19 @@
 
                 <div class="letter-primary-action">
                   {% if letter.outlook_message and letter.outlook_message.status == 'sent' %}
-                    <span class="sent-confirmed-note">Подтверждено Outlook</span>
+                    {% if letter.signed_scan and letter.signed_scan.status == 'confirmed' %}
+                      <form method="post"
+                            action="/outlook-messages/{{ letter.outlook_message.id }}/resend-draft"
+                            onsubmit="return confirm('Подготовить повторный черновик с этим же подписанным PDF?');">
+                        <input type="hidden" name="return_to" value="created">
+                        <input type="hidden" name="group_id" value="{{ group.id }}">
+                        <button class="button button-secondary button-compact" type="submit">
+                          {% if letter.outlook_message.resend_status == 'draft_created' %}Открыть повторный{% else %}Повторный черновик{% endif %}
+                        </button>
+                      </form>
+                    {% else %}
+                      <span class="sent-confirmed-note">Подтверждено Outlook</span>
+                    {% endif %}
                   {% elif letter.outlook_message and letter.outlook_message.status == 'send_requested' %}
                     <span class="sent-confirmed-note">Ожидается подтверждение Outlook</span>
                   {% elif letter.scan_session %}
@@ -385,6 +405,17 @@
                             onsubmit="return confirm('Отметить письмо отправленным вне приложения?');">
                         <input type="hidden" name="group_id" value="{{ group.id }}">
                         <button type="submit">Отметить отправленным</button>
+                      </form>
+                    {% endif %}
+                    {% if letter.outlook_message
+                          and letter.outlook_message.status in ('draft_created', 'technical_error')
+                          and letter.signed_scan
+                          and letter.signed_scan.status == 'confirmed' %}
+                      <form method="post"
+                            action="/response-letters/{{ letter.id }}/outlook-draft/recreate"
+                            onsubmit="return confirm('Пересоздать черновик с этим же подписанным PDF?');">
+                        <input type="hidden" name="group_id" value="{{ group.id }}">
+                        <button type="submit">Пересоздать черновик</button>
                       </form>
                     {% endif %}
                   </div>

@@ -210,10 +210,16 @@
           <span>Основная почта</span>
           <input type="email" name="email_address" placeholder="office@sti.gov.kg">
         </label>
-        <label class="field">
-          <span>Резервные почты</span>
-          <input name="backup_emails" placeholder="reserve@sti.gov.kg">
-        </label>
+        <div class="office-email-stack">
+          <label class="field">
+            <span>Резервные почты</span>
+            <input name="backup_emails" placeholder="reserve@sti.gov.kg">
+          </label>
+          <label class="office-domain-toggle">
+            <input type="checkbox" name="salyk_backup_enabled" value="true">
+            <span>Добавлять адрес с тем же логином @salyk.kg</span>
+          </label>
+        </div>
         <label class="field office-alias-field">
           <span>Алиасы</span>
           <input name="aliases" placeholder="Старое название, сокращение">
@@ -231,7 +237,7 @@
       <div class="office-settings-list" data-office-list>
         {% for office in gns_offices %}
           <div class="office-settings-row" data-office-row
-               data-office-search="{{ office.district_place|lower }} {{ office.email_address or '' }} {{ office.backup_emails|join(' ') }} {{ office.aliases|join(' ')|lower }}">
+               data-office-search="{{ office.district_place|lower }} {{ office.delivery_emails|join(' ') }} {{ office.aliases|join(' ')|lower }}">
             <form method="post" action="/settings/offices/save"
                   class="office-settings-form" data-settings-form>
               <input type="hidden" name="office_id" value="{{ office.id }}">
@@ -245,11 +251,24 @@
                 <input type="email" name="email_address"
                        value="{{ office.email_address or '' }}">
               </label>
-              <label class="field">
-                <span>Резервные почты</span>
-                <input name="backup_emails"
-                       value="{{ office.backup_emails|join(', ') }}">
-              </label>
+              <div class="office-email-stack">
+                <label class="field">
+                  <span>Резервные почты</span>
+                  <input name="backup_emails"
+                         value="{{ office.backup_emails|join(', ') }}">
+                </label>
+                <label class="office-domain-toggle">
+                  <input type="checkbox" name="salyk_backup_enabled" value="true"
+                         {% if office.salyk_backup_enabled %}checked{% endif %}>
+                  <span>
+                    {% if office.salyk_backup_available %}
+                      Добавлять {{ office.salyk_backup_email }}
+                    {% else %}
+                      Доступно для основной почты @sti.gov.kg
+                    {% endif %}
+                  </span>
+                </label>
+              </div>
               <label class="field office-alias-field">
                 <span>Алиасы</span>
                 <input name="aliases"

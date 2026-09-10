@@ -750,15 +750,17 @@ class WorkflowService:
                     INSERT INTO gns_offices(
                         office_key, office_name, district_place,
                         postal_address, email_address, backup_emails_json,
-                        aliases_json, active, user_modified, is_custom,
+                        salyk_backup_enabled, aliases_json, active,
+                        user_modified, is_custom,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                     ON CONFLICT(office_key) DO UPDATE SET
                         office_name = excluded.office_name,
                         district_place = excluded.district_place,
                         postal_address = excluded.postal_address,
                         email_address = excluded.email_address,
                         backup_emails_json = excluded.backup_emails_json,
+                        salyk_backup_enabled = excluded.salyk_backup_enabled,
                         aliases_json = excluded.aliases_json,
                         active = excluded.active,
                         user_modified = 1,
@@ -773,6 +775,7 @@ class WorkflowService:
                             office.get("postal_address"),
                             office.get("email_address"),
                             office.get("backup_emails_json") or "[]",
+                            int(office.get("salyk_backup_enabled") or 0),
                             office.get("aliases_json") or "[]",
                             int(office.get("active", 1)),
                             int(office.get("is_custom", 0)),
@@ -896,10 +899,16 @@ class WorkflowService:
                 ]
             except (json.JSONDecodeError, TypeError):
                 row["backup_emails"] = []
-            row["delivery_email"] = (
-                str(row.get("email_address") or "").strip().casefold()
-                or next(iter(row["backup_emails"]), "")
+            salyk_backup = self._salyk_backup_email(
+                str(row.get("email_address") or "")
             )
+            row["salyk_backup_available"] = bool(salyk_backup)
+            row["salyk_backup_enabled"] = bool(
+                int(row.get("salyk_backup_enabled") or 0)
+            )
+            row["salyk_backup_email"] = salyk_backup
+            row["delivery_emails"] = self.office_delivery_emails(row)
+            row["delivery_email"] = next(iter(row["delivery_emails"]), "")
         self._gns_offices_cache = rows
         return self._gns_offices_cache
 
@@ -934,6 +943,43 @@ class WorkflowService:
         backups = office.get("backup_emails") or []
         return str(backups[0]).strip().casefold() if backups else ""
 
+    @classmethod
+    def office_delivery_emails(
+        cls,
+        office: dict[str, Any] | None,
+    ) -> list[str]:
+        if not office:
+            return []
+        values = [
+            str(office.get("email_address") or ""),
+            *(office.get("backup_emails") or []),
+        ]
+        if office.get("salyk_backup_enabled"):
+            values.append(
+                cls._salyk_backup_email(str(office.get("email_address") or ""))
+            )
+        result: list[str] = []
+        for email in values:
+            normalized = str(email or "").strip().casefold()
+            if cls.EMAIL_RE.fullmatch(normalized) and normalized not in result:
+                result.append(normalized)
+        return result
+
+    @classmethod
+    def office_delivery_recipients(
+        cls,
+        office: dict[str, Any] | None,
+    ) -> str:
+        return "; ".join(cls.office_delivery_emails(office))
+
+    @classmethod
+    def _salyk_backup_email(cls, primary_email: str) -> str:
+        primary = str(primary_email or "").strip().casefold()
+        local, separator, domain = primary.partition("@")
+        if separator and local and domain == "sti.gov.kg":
+            return f"{local}@salyk.kg"
+        return ""
+
     def save_gns_office(
         self,
         district_place: str,
@@ -941,6 +987,7 @@ class WorkflowService:
         backup_emails: str | list[str] = "",
         aliases: str | list[str] = "",
         *,
+        salyk_backup_enabled: bool = False,
         office_id: int | None = None,
         actor: str = "Сотрудник",
     ) -> int:
@@ -958,7 +1005,16 @@ class WorkflowService:
             for email in self._normalize_office_emails(backup_emails)
             if email != primary
         ]
-        if len(reserves) > 5:
+        salyk_backup = self._salyk_backup_email(primary)
+        if salyk_backup_enabled:
+            if not salyk_backup:
+                raise WorkflowValidationError(
+                    "Резерв @salyk.kg доступен только для основной почты @sti.gov.kg"
+                )
+        effective_reserves = [*reserves]
+        if salyk_backup_enabled and salyk_backup not in effective_reserves:
+            effective_reserves.append(salyk_backup)
+        if len(effective_reserves) > 5:
             raise WorkflowValidationError("Можно указать до пяти резервных почт")
         raw_aliases = (
             re.split(r"[,;\n]+", aliases)
@@ -996,7 +1052,7 @@ class WorkflowService:
             and self._normalize_office_text(current["district_place"])
             == normalized_district
         )
-        supplied_emails = {primary, *reserves} - {""}
+        supplied_emails = {primary, *effective_reserves} - {""}
         for office in self.list_gns_offices():
             if current and office["id"] == current["id"]:
                 continue
@@ -1006,10 +1062,7 @@ class WorkflowService:
                 == normalized_district
             ):
                 raise WorkflowValidationError("Такой район уже есть")
-            office_emails = {
-                str(office.get("email_address") or "").strip().casefold(),
-                *(office.get("backup_emails") or []),
-            } - {""}
+            office_emails = set(self.office_delivery_emails(office))
             if supplied_emails & office_emails:
                 raise WorkflowValidationError(
                     "Эта почта уже указана у другого района"
@@ -1055,14 +1108,15 @@ class WorkflowService:
                 """
                 UPDATE gns_offices
                 SET district_place = ?, email_address = ?,
-                    backup_emails_json = ?, aliases_json = ?, user_modified = 1,
-                    updated_at = ?
+                    backup_emails_json = ?, salyk_backup_enabled = ?,
+                    aliases_json = ?, user_modified = 1, updated_at = ?
                 WHERE id = ? AND active = 1
                 """,
                 (
                     district,
                     primary or None,
                     json.dumps(reserves, ensure_ascii=False),
+                    int(bool(salyk_backup_enabled)),
                     json.dumps(saved_aliases, ensure_ascii=False),
                     now,
                     current["id"],
@@ -1085,9 +1139,9 @@ class WorkflowService:
                     INSERT INTO gns_offices(
                         office_key, office_name, district_place,
                         postal_address, email_address, backup_emails_json,
-                        aliases_json, active, user_modified, is_custom,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, '', ?, ?, ?, 1, 1, 1, ?, ?)
+                        salyk_backup_enabled, aliases_json, active,
+                        user_modified, is_custom, created_at, updated_at
+                    ) VALUES (?, ?, ?, '', ?, ?, ?, ?, 1, 1, 1, ?, ?)
                     """,
                     (
                         office_key,
@@ -1095,6 +1149,7 @@ class WorkflowService:
                         district,
                         primary or None,
                         json.dumps(reserves, ensure_ascii=False),
+                        int(bool(salyk_backup_enabled)),
                         json.dumps(saved_aliases, ensure_ascii=False),
                         now,
                         now,
@@ -1111,6 +1166,7 @@ class WorkflowService:
             {
                 "primary_email_configured": bool(primary),
                 "backup_email_count": len(reserves),
+                "salyk_backup_enabled": bool(salyk_backup_enabled),
                 "alias_count": len(saved_aliases),
             },
             actor=actor,
@@ -5371,7 +5427,7 @@ class WorkflowService:
             group = generated_by_id.get(letter["response_group_id"])
             if group is not None:
                 office = self.match_gns_office(group["district_place"])
-                letter["gns_email"] = self.office_delivery_email(office)
+                letter["gns_email"] = self.office_delivery_recipients(office)
                 if (
                     not letter.get("outlook_message")
                     and letter.get("manually_sent_at")
@@ -5900,7 +5956,7 @@ class WorkflowService:
                     "abs_bucket": str(abs_bucket),
                     "district_place": district,
                     "gns_office_key": office["office_key"] if office else "",
-                    "gns_email": self.office_delivery_email(office),
+                    "gns_email": self.office_delivery_recipients(office),
                     "recipient_position": row.get("recipient_position") or "",
                     "recipient_full_name": recipient,
                     "recipient_display_name": (
@@ -10140,15 +10196,42 @@ class WorkflowService:
         page: int = 1,
         page_size: int = 40,
         sort_order: str = "date_desc",
+        delivery_status: str = "all",
+        outgoing_number: str = "",
+        date_from: str = "",
+        date_to: str = "",
+        district_place: str = "",
+        recipient_full_name: str = "",
     ) -> dict[str, Any]:
         search = " ".join(str(query or "").split())[:160]
+        outgoing_filter = str(outgoing_number or "").strip()[:32]
+        district_filter = " ".join(str(district_place or "").split())[:255]
+        recipient_filter = " ".join(
+            str(recipient_full_name or "").split()
+        )[:255]
+
+        def normalized_date(value: str) -> str:
+            raw = str(value or "").strip()
+            try:
+                return date.fromisoformat(raw).isoformat()
+            except ValueError:
+                return ""
+
+        from_filter = normalized_date(date_from)
+        to_filter = normalized_date(date_to)
         page_size = max(10, min(int(page_size), 100))
         requested_page = max(int(page), 1)
+        if delivery_status not in {"all", "sent", "not_sent"}:
+            delivery_status = "all"
         if sort_order not in {
             "date_desc",
             "date_asc",
             "district_asc",
             "district_desc",
+            "outgoing_asc",
+            "outgoing_desc",
+            "recipient_asc",
+            "recipient_desc",
         }:
             sort_order = "date_desc"
         history_cte = """
@@ -10159,6 +10242,7 @@ class WorkflowService:
                     cases.status,
                     cases.created_at,
                     cases.district_place,
+                    cases.recipient_full_name,
                     cases.recipient_display_name,
                     uploads.original_filename,
                     uploads.page_count,
@@ -10231,6 +10315,15 @@ class WorkflowService:
                        AND response_letters.outgoing_number IS NOT NULL
                        AND response_letters.outgoing_number != '')
                         AS outgoing_numbers,
+                    (SELECT MIN(CAST(response_letters.outgoing_number AS INTEGER))
+                     FROM response_group_cases
+                     JOIN response_letters
+                       ON response_letters.response_group_id =
+                          response_group_cases.response_group_id
+                     WHERE response_group_cases.case_id = cases.id
+                       AND response_letters.outgoing_number IS NOT NULL
+                       AND response_letters.outgoing_number != '')
+                        AS first_outgoing_number,
                     (SELECT signed_response_scans.id
                      FROM response_group_cases
                      JOIN response_letters
@@ -10328,13 +10421,14 @@ class WorkflowService:
                 JOIN uploads ON uploads.id = cases.upload_id
             )
         """
-        where = ""
-        search_parameters: tuple[Any, ...] = ()
+        conditions: list[str] = []
+        parameters: list[Any] = []
         if search:
-            where = """
-                WHERE gns_fuzzy_match(
+            conditions.append(
+                """gns_fuzzy_match(
                     COALESCE(original_filename, '') || ' ' ||
                     COALESCE(district_place, '') || ' ' ||
+                    COALESCE(recipient_full_name, '') || ' ' ||
                     COALESCE(recipient_display_name, '') || ' ' ||
                     COALESCE(taxpayer_names, '') || ' ' ||
                     COALESCE(taxpayer_inns, '') || ' ' ||
@@ -10343,9 +10437,46 @@ class WorkflowService:
                     COALESCE(outgoing_numbers, '') || ' ' ||
                     COALESCE(status, ''),
                     ?
-                ) = 1
-            """
-            search_parameters = (search,)
+                ) = 1"""
+            )
+            parameters.append(search)
+        if delivery_status == "sent":
+            conditions.append("mail_status = 'sent'")
+        elif delivery_status == "not_sent":
+            conditions.append("COALESCE(mail_status, '') != 'sent'")
+        if outgoing_filter:
+            conditions.append(
+                """EXISTS (
+                    SELECT 1
+                    FROM response_group_cases AS history_group_cases
+                    JOIN response_letters AS history_letters
+                      ON history_letters.response_group_id =
+                         history_group_cases.response_group_id
+                    WHERE history_group_cases.case_id = letter_history.id
+                      AND history_letters.outgoing_number = ?
+                )"""
+            )
+            parameters.append(outgoing_filter)
+        if from_filter:
+            conditions.append(
+                "substr(COALESCE(received_at, uploaded_at), 1, 10) >= ?"
+            )
+            parameters.append(from_filter)
+        if to_filter:
+            conditions.append(
+                "substr(COALESCE(received_at, uploaded_at), 1, 10) <= ?"
+            )
+            parameters.append(to_filter)
+        if district_filter:
+            conditions.append("district_place = ?")
+            parameters.append(district_filter)
+        if recipient_filter:
+            conditions.append(
+                "COALESCE(NULLIF(recipient_full_name, ''), "
+                "recipient_display_name, '') = ?"
+            )
+            parameters.append(recipient_filter)
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
         order_by = {
             "date_desc": (
                 "COALESCE(received_at, uploaded_at) DESC, uploaded_at DESC"
@@ -10361,11 +10492,31 @@ class WorkflowService:
                 "gns_search_normalize(COALESCE(district_place, '')) DESC, "
                 "COALESCE(received_at, uploaded_at) DESC"
             ),
+            "outgoing_asc": (
+                "CASE WHEN first_outgoing_number IS NULL THEN 1 ELSE 0 END, "
+                "first_outgoing_number ASC, "
+                "COALESCE(received_at, uploaded_at) DESC"
+            ),
+            "outgoing_desc": (
+                "CASE WHEN first_outgoing_number IS NULL THEN 1 ELSE 0 END, "
+                "first_outgoing_number DESC, "
+                "COALESCE(received_at, uploaded_at) DESC"
+            ),
+            "recipient_asc": (
+                "gns_search_normalize(COALESCE(NULLIF(recipient_full_name, ''), "
+                "recipient_display_name, '')) ASC, "
+                "COALESCE(received_at, uploaded_at) DESC"
+            ),
+            "recipient_desc": (
+                "gns_search_normalize(COALESCE(NULLIF(recipient_full_name, ''), "
+                "recipient_display_name, '')) DESC, "
+                "COALESCE(received_at, uploaded_at) DESC"
+            ),
         }[sort_order]
         total_row = self.db.fetch_one(
             history_cte
             + f"SELECT COUNT(*) AS count FROM letter_history {where}",
-            search_parameters,
+            parameters,
         ) or {"count": 0}
         total = int(total_row.get("count") or 0)
         page_count = max(1, (total + page_size - 1) // page_size)
@@ -10382,12 +10533,57 @@ class WorkflowService:
                          id
                 LIMIT ? OFFSET ?
             """,
-            (*search_parameters, page_size, offset),
+            (*parameters, page_size, offset),
+        )
+        district_options = [
+            row["value"]
+            for row in self.db.fetch_all(
+                """
+                SELECT DISTINCT TRIM(district_place) AS value
+                FROM cases
+                WHERE TRIM(COALESCE(district_place, '')) != ''
+                ORDER BY gns_search_normalize(value), value
+                """
+            )
+        ]
+        recipient_options = [
+            row["value"]
+            for row in self.db.fetch_all(
+                """
+                SELECT DISTINCT TRIM(
+                    COALESCE(NULLIF(recipient_full_name, ''),
+                             recipient_display_name)
+                ) AS value
+                FROM cases
+                WHERE TRIM(COALESCE(NULLIF(recipient_full_name, ''),
+                                    recipient_display_name, '')) != ''
+                ORDER BY gns_search_normalize(value), value
+                """
+            )
+        ]
+        filters_active = bool(
+            search
+            or delivery_status != "all"
+            or outgoing_filter
+            or from_filter
+            or to_filter
+            or district_filter
+            or recipient_filter
+            or sort_order != "date_desc"
         )
         return {
             "items": items,
             "query": search,
             "sort_order": sort_order,
+            "delivery_status": delivery_status,
+            "outgoing_number": outgoing_filter,
+            "date_from": from_filter,
+            "date_to": to_filter,
+            "district_place": district_filter,
+            "recipient_full_name": recipient_filter,
+            "district_options": district_options,
+            "recipient_options": recipient_options,
+            "filters_active": filters_active,
             "page": selected_page,
             "page_count": page_count,
             "page_size": page_size,

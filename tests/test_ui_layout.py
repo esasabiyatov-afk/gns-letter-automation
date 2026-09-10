@@ -921,6 +921,11 @@ def test_history_search_combines_incoming_word_number_and_scan(
     assert f'href="/response-groups/{group_id}"' in response.text
     assert f'href="/signed-response-scans/{scan["id"]}"' in response.text
     assert 'name="sort_order"' in response.text
+    assert 'name="delivery_status"' in response.text
+    assert 'name="outgoing_number"' in response.text
+    assert 'name="date_from"' in response.text
+    assert 'name="district_place"' in response.text
+    assert 'name="recipient_full_name"' in response.text
     assert "data-history-search" in response.text
 
 
@@ -959,3 +964,75 @@ def test_history_search_accepts_prefix_typo_and_sorts(workflow):
 
     assert [item["id"] for item in district_items] == [newer_id, older_id]
     assert [item["id"] for item in date_items] == [older_id, newer_id]
+
+
+def test_history_filters_sent_number_date_place_and_recipient(workflow):
+    from test_daily_batch import _insert_ready_case
+
+    first_id = _insert_ready_case(
+        workflow,
+        "12345678901234",
+        'ОсОО "Первый"',
+        district_place="по Ленинскому району города Бишкек",
+        recipient_full_name="Якубов Ян Январевич",
+        recipient_display_name="Якубову Я. Я.",
+    )
+    second_id = _insert_ready_case(
+        workflow,
+        "22345678901234",
+        'ОсОО "Второй"',
+        district_place="по Аламудунскому району Чуйской области",
+        recipient_full_name="Абдыев Азамат Асанович",
+        recipient_display_name="Абдыеву А. А.",
+    )
+    workflow.db.execute(
+        "UPDATE uploads SET created_at = '2026-09-01T08:00:00+00:00' "
+        "WHERE id = (SELECT upload_id FROM cases WHERE id = ?)",
+        (first_id,),
+    )
+    workflow.db.execute(
+        "UPDATE uploads SET created_at = '2026-09-02T08:00:00+00:00' "
+        "WHERE id = (SELECT upload_id FROM cases WHERE id = ?)",
+        (second_id,),
+    )
+    workflow.check_abs_today("batch-user", "one-time-secret")
+    for group in workflow.today_overview()["not_found_groups"]:
+        workflow.generate_daily_response(group["group_key"])
+    letters = workflow.db.fetch_all(
+        """
+        SELECT response_letters.id, response_group_cases.case_id
+        FROM response_letters
+        JOIN response_group_cases
+          ON response_group_cases.response_group_id =
+             response_letters.response_group_id
+        """
+    )
+    by_case = {row["case_id"]: row["id"] for row in letters}
+    workflow.set_outgoing_number(by_case[first_id], "200")
+    workflow.set_outgoing_number(by_case[second_id], "100")
+    workflow.db.execute(
+        "UPDATE response_letters SET manually_sent_at = ? WHERE id = ?",
+        ("2026-09-03T08:00:00+00:00", by_case[first_id]),
+    )
+
+    assert [item["id"] for item in workflow.list_letter_history(
+        delivery_status="sent"
+    )["items"]] == [first_id]
+    assert [item["id"] for item in workflow.list_letter_history(
+        outgoing_number="100"
+    )["items"]] == [second_id]
+    assert [item["id"] for item in workflow.list_letter_history(
+        date_from="2026-09-02", date_to="2026-09-02"
+    )["items"]] == [second_id]
+    assert [item["id"] for item in workflow.list_letter_history(
+        district_place="по Ленинскому району города Бишкек"
+    )["items"]] == [first_id]
+    assert [item["id"] for item in workflow.list_letter_history(
+        recipient_full_name="Абдыев Азамат Асанович"
+    )["items"]] == [second_id]
+    assert [item["id"] for item in workflow.list_letter_history(
+        sort_order="outgoing_asc"
+    )["items"]] == [second_id, first_id]
+    assert [item["id"] for item in workflow.list_letter_history(
+        sort_order="recipient_asc"
+    )["items"]] == [second_id, first_id]

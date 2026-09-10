@@ -83,6 +83,25 @@ OUTLOOK_WORKER_MAX_PATH = 240
 OUTLOOK_WORKER_FILE_PROBE = ("x" * 20) + "_000.pdf.part"
 
 
+def _recipient_emails(value: str) -> tuple[str, ...]:
+    result: list[str] = []
+    for raw in re.split(r"[,;]+", str(value or "")):
+        email = raw.strip().casefold()
+        if not email:
+            continue
+        if not EMAIL_RE.fullmatch(email):
+            raise OutlookConnectionError("Получатель Outlook указан неверно.")
+        if email not in result:
+            result.append(email)
+    if not result or len(result) > 6:
+        raise OutlookConnectionError("Получатель Outlook указан неверно.")
+    return tuple(result)
+
+
+def _recipient_field(value: str) -> str:
+    return "; ".join(_recipient_emails(value))
+
+
 class OutlookIntegrationError(RuntimeError):
     """Безопасная для показа пользователю ошибка интеграции Outlook."""
 
@@ -542,6 +561,7 @@ class OutlookSentCandidate:
     subject: str
     attachment_name: str
     attachment_sha256: str
+    created_after: str = ""
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "OutlookSentCandidate":
@@ -551,6 +571,7 @@ class OutlookSentCandidate:
             subject=str(payload.get("subject") or ""),
             attachment_name=str(payload.get("attachment_name") or ""),
             attachment_sha256=str(payload.get("attachment_sha256") or ""),
+            created_after=str(payload.get("created_after") or ""),
         )
 
 
@@ -613,6 +634,7 @@ class OutlookGateway(Protocol):
         attachment_name: str,
         sending_account: str = "",
         create_if_missing: bool = True,
+        replace_existing: bool = False,
         display: bool = True,
         send_immediately: bool = False,
     ) -> OutlookDraftResult: ...
@@ -656,6 +678,10 @@ class OutlookWorkflow(Protocol):
     def match_gns_office(self, text: str) -> dict[str, Any] | None: ...
 
     def office_delivery_email(self, office: dict[str, Any] | None) -> str: ...
+
+    def office_delivery_recipients(
+        self, office: dict[str, Any] | None
+    ) -> str: ...
 
 
 def _safe_text(value: Any) -> str:
@@ -945,6 +971,7 @@ class PyWin32OutlookGateway:
         attachment_name: str,
         sending_account: str = "",
         create_if_missing: bool = True,
+        replace_existing: bool = False,
         display: bool = True,
         send_immediately: bool = False,
     ) -> OutlookDraftResult:
@@ -952,8 +979,7 @@ class PyWin32OutlookGateway:
             raise OutlookUnsupportedPlatformError(
                 "Интеграция Outlook доступна только в Windows."
             )
-        if not EMAIL_RE.fullmatch(recipient_email.strip().casefold()):
-            raise OutlookConnectionError("Получатель Outlook указан неверно.")
+        recipient_field = _recipient_field(recipient_email)
         if not draft_key.strip() or len(draft_key) > 128:
             raise OutlookConnectionError("Ключ черновика Outlook указан неверно.")
         account_identifier = sending_account.strip().casefold()
@@ -999,7 +1025,7 @@ class PyWin32OutlookGateway:
                 stage = "create_item"
                 mail = application.CreateItem(OL_MAIL_ITEM)
                 stage = "fill_fields"
-                mail.To = recipient_email.strip().casefold()
+                mail.To = recipient_field
                 mail.Subject = subject.strip()
                 mail.Body = body
                 if account_identifier:
@@ -1043,18 +1069,38 @@ class PyWin32OutlookGateway:
                     1,
                     attachment_name,
                 )
+                recipients = _safe_attribute(mail, "Recipients", None)
+                resolve_all = _safe_attribute(recipients, "ResolveAll", None)
+                if callable(resolve_all) and resolve_all() is False:
+                    raise OutlookConnectionError(
+                        "Outlook не смог распознать одного из получателей."
+                    )
                 stage = "save_draft"
                 mail.Save()
             else:
                 # The tracked app draft must follow the current recipient and
                 # subject settings. Clearing Body also repairs mojibake left by
                 # older worker transports without touching the PDF attachment.
-                stage = "refresh_existing_draft"
+                stage = (
+                    "replace_existing_draft"
+                    if replace_existing
+                    else "refresh_existing_draft"
+                )
                 changed = False
-                if _safe_text(_safe_attribute(mail, "To")).casefold() != (
-                    recipient_email.strip().casefold()
+                current_recipients = self._recipient_smtp_set(mail)
+                if not current_recipients:
+                    try:
+                        current_recipients = frozenset(
+                            _recipient_emails(
+                                _safe_text(_safe_attribute(mail, "To"))
+                            )
+                        )
+                    except OutlookConnectionError:
+                        current_recipients = frozenset()
+                if current_recipients != frozenset(
+                    _recipient_emails(recipient_field)
                 ):
-                    mail.To = recipient_email.strip().casefold()
+                    mail.To = recipient_field
                     changed = True
                 if _safe_text(_safe_attribute(mail, "Subject")) != subject.strip():
                     mail.Subject = subject.strip()
@@ -1062,6 +1108,28 @@ class PyWin32OutlookGateway:
                 if str(_safe_attribute(mail, "Body", "")) != body:
                     mail.Body = body
                     changed = True
+                if replace_existing:
+                    mail.CC = ""
+                    mail.BCC = ""
+                    attachments = _safe_attribute(mail, "Attachments", None)
+                    attachment_count = int(
+                        _safe_attribute(attachments, "Count", 0) or 0
+                    )
+                    for index in range(attachment_count, 0, -1):
+                        attachments.Item(index).Delete()
+                    mail.Attachments.Add(
+                        str(source),
+                        OL_BY_VALUE,
+                        1,
+                        attachment_name,
+                    )
+                    changed = True
+                recipients = _safe_attribute(mail, "Recipients", None)
+                resolve_all = _safe_attribute(recipients, "ResolveAll", None)
+                if callable(resolve_all) and resolve_all() is False:
+                    raise OutlookConnectionError(
+                        "Outlook не смог распознать одного из получателей."
+                    )
                 if changed:
                     mail.Save()
             send_requested = False
@@ -1119,9 +1187,15 @@ class PyWin32OutlookGateway:
                     )
 
                 stage = "send"
-                mail.To = recipient_email.strip().casefold()
+                mail.To = recipient_field
                 mail.CC = ""
                 mail.BCC = ""
+                recipients = _safe_attribute(mail, "Recipients", None)
+                resolve_all = _safe_attribute(recipients, "ResolveAll", None)
+                if callable(resolve_all) and resolve_all() is False:
+                    raise OutlookConnectionError(
+                        "Outlook не смог распознать одного из получателей."
+                    )
                 mail.SendUsingAccount = matches[0]
                 mail.Save()
                 certificate_watcher = (
@@ -1151,7 +1225,7 @@ class PyWin32OutlookGateway:
                         pass
             return OutlookDraftResult(
                 entry_id=_safe_text(_safe_attribute(mail, "EntryID")),
-                recipient_email=_safe_text(_safe_attribute(mail, "To")),
+                recipient_email=recipient_field,
                 subject=_safe_text(_safe_attribute(mail, "Subject")),
                 attachment_name=attachment_name,
                 existing=existing,
@@ -1185,10 +1259,8 @@ class PyWin32OutlookGateway:
             raise OutlookUnsupportedPlatformError(
                 "Интеграция Outlook доступна только в Windows."
             )
-        recipient = recipient_email.strip().casefold()
+        recipient = _recipient_field(recipient_email)
         account_identifier = sending_account.strip().casefold()
-        if not EMAIL_RE.fullmatch(recipient):
-            raise OutlookConnectionError("Получатель Outlook указан неверно.")
         if (
             len(account_identifier) > 255
             or "\n" in account_identifier
@@ -1279,6 +1351,12 @@ class PyWin32OutlookGateway:
             mail.To = recipient
             mail.CC = ""
             mail.BCC = ""
+            recipients = _safe_attribute(mail, "Recipients", None)
+            resolve_all = _safe_attribute(recipients, "ResolveAll", None)
+            if callable(resolve_all) and resolve_all() is False:
+                raise OutlookConnectionError(
+                    "Outlook не смог распознать одного из получателей."
+                )
             mail.SendUsingAccount = matches[0]
             mail.Save()
 
@@ -1318,23 +1396,28 @@ class PyWin32OutlookGateway:
             pythoncom.CoUninitialize()
 
     @classmethod
-    def _single_recipient_smtp(cls, mail: Any) -> str:
+    def _recipient_smtp_set(cls, mail: Any) -> frozenset[str]:
         recipients = _safe_attribute(mail, "Recipients", None)
-        if int(_safe_attribute(recipients, "Count", 0) or 0) != 1:
-            return ""
-        try:
-            recipient = recipients.Item(1)
-        except Exception:
-            return ""
-        if int(_safe_attribute(recipient, "Type", 1) or 0) != 1:
-            return ""
-        address = cls._mapi_property(recipient, PR_SMTP_ADDRESS)
-        if not address:
-            address_entry = _safe_attribute(recipient, "AddressEntry", None)
-            address = cls._mapi_property(address_entry, PR_SMTP_ADDRESS)
-        if not address:
-            address = _safe_text(_safe_attribute(recipient, "Address"))
-        return address.casefold()
+        count = int(_safe_attribute(recipients, "Count", 0) or 0)
+        addresses: set[str] = set()
+        for index in range(1, count + 1):
+            try:
+                recipient = recipients.Item(index)
+            except Exception:
+                return frozenset()
+            if int(_safe_attribute(recipient, "Type", 1) or 0) != 1:
+                return frozenset()
+            address = cls._mapi_property(recipient, PR_SMTP_ADDRESS)
+            if not address:
+                address_entry = _safe_attribute(recipient, "AddressEntry", None)
+                address = cls._mapi_property(address_entry, PR_SMTP_ADDRESS)
+            if not address:
+                address = _safe_text(_safe_attribute(recipient, "Address"))
+            normalized = address.strip().casefold()
+            if not EMAIL_RE.fullmatch(normalized):
+                return frozenset()
+            addresses.add(normalized)
+        return frozenset(addresses)
 
     @staticmethod
     def _saved_attachment_sha256(
@@ -1382,15 +1465,29 @@ class PyWin32OutlookGateway:
                 "Интеграция Outlook доступна только в Windows."
             )
         candidate_by_key: dict[str, OutlookSentCandidate] = {}
+        recipient_sets_by_key: dict[str, frozenset[str]] = {}
+        created_after_by_key: dict[str, datetime | None] = {}
+        candidates_by_recipients: dict[frozenset[str], list[str]] = {}
         for candidate in candidates:
             key = candidate.draft_key.strip()
-            recipient = candidate.recipient_email.strip().casefold()
             digest = candidate.attachment_sha256.strip().casefold()
+            try:
+                recipient_emails = frozenset(
+                    _recipient_emails(candidate.recipient_email)
+                )
+                created_after = (
+                    datetime.fromisoformat(candidate.created_after)
+                    if candidate.created_after.strip()
+                    else None
+                )
+            except (OutlookConnectionError, TypeError, ValueError) as exc:
+                raise OutlookConnectionError(
+                    "Данные ожидаемого исходящего письма некорректны."
+                ) from exc
             if (
                 not key
                 or len(key) > 128
                 or key in candidate_by_key
-                or not EMAIL_RE.fullmatch(recipient)
                 or not candidate.subject.strip()
                 or len(candidate.subject) > 255
                 or not candidate.attachment_name.strip()
@@ -1401,11 +1498,15 @@ class PyWin32OutlookGateway:
                 )
             candidate_by_key[key] = OutlookSentCandidate(
                 draft_key=key,
-                recipient_email=recipient,
+                recipient_email="; ".join(sorted(recipient_emails)),
                 subject=candidate.subject.strip(),
                 attachment_name=candidate.attachment_name.strip(),
                 attachment_sha256=digest,
+                created_after=candidate.created_after.strip(),
             )
+            recipient_sets_by_key[key] = recipient_emails
+            created_after_by_key[key] = created_after
+            candidates_by_recipients.setdefault(recipient_emails, []).append(key)
         staging_dir = _require_outlook_worker_staging_dir(staging_dir)
         try:
             import pythoncom  # type: ignore[import-not-found]
@@ -1446,6 +1547,7 @@ class PyWin32OutlookGateway:
             candidate_mails = 0
             rejected = 0
             exact_by_key: dict[str, list[OutlookSentMatch]] = {}
+            ambiguous_keys: set[str] = set()
             item_count = int(_safe_attribute(items, "Count", 0) or 0)
             for item_index in range(1, item_count + 1):
                 try:
@@ -1465,17 +1567,21 @@ class PyWin32OutlookGateway:
                             break
                         continue
                     draft_key = self._draft_key(mail)
-                    candidate = candidate_by_key.get(draft_key)
-                    if candidate is None:
+                    keyed_candidate = candidate_by_key.get(draft_key)
+                    recipient_set = self._recipient_smtp_set(mail)
+                    recipient_candidate_keys = candidates_by_recipients.get(
+                        recipient_set,
+                        [],
+                    )
+                    if keyed_candidate is None and not recipient_candidate_keys:
                         continue
                     candidate_mails += 1
-                    if self._single_recipient_smtp(mail) != (
-                        candidate.recipient_email
-                    ):
+                    if not recipient_set:
                         rejected += 1
                         continue
-                    if _safe_text(_safe_attribute(mail, "Subject")) != (
-                        candidate.subject
+                    if (
+                        keyed_candidate is not None
+                        and recipient_set != recipient_sets_by_key[draft_key]
                     ):
                         rejected += 1
                         continue
@@ -1488,17 +1594,24 @@ class PyWin32OutlookGateway:
                         _safe_attribute(attachment, "FileName")
                     )
                     if (
-                        filename.casefold()
-                        != candidate.attachment_name.casefold()
-                        or not filename.casefold().endswith(".pdf")
+                        not filename.casefold().endswith(".pdf")
+                        or int(_safe_attribute(attachment, "Size", 0) or 0) <= 0
                         or int(_safe_attribute(attachment, "Size", 0) or 0)
                         > max_attachment_bytes
                     ):
                         rejected += 1
                         continue
+                    entry_id = _safe_text(_safe_attribute(mail, "EntryID"))
+                    if not entry_id:
+                        rejected += 1
+                        continue
                     temporary_path = ensure_within(
                         staging_dir
-                        / f"sent-{hashlib.sha256(draft_key.encode()).hexdigest()[:20]}-{item_index}.pdf.part",
+                        / (
+                            "sent-"
+                            f"{hashlib.sha256(entry_id.encode()).hexdigest()[:20]}-"
+                            f"{item_index}.pdf.part"
+                        ),
                         staging_dir,
                     )
                     actual_sha256 = self._saved_attachment_sha256(
@@ -1506,13 +1619,51 @@ class PyWin32OutlookGateway:
                         temporary_path,
                         max_attachment_bytes,
                     )
-                    entry_id = _safe_text(_safe_attribute(mail, "EntryID"))
-                    if actual_sha256 != candidate.attachment_sha256 or not entry_id:
+                    if not actual_sha256:
                         rejected += 1
                         continue
-                    exact_by_key.setdefault(draft_key, []).append(
+                    matched_key = ""
+                    if (
+                        keyed_candidate is not None
+                        and actual_sha256
+                        == keyed_candidate.attachment_sha256
+                    ):
+                        matched_key = draft_key
+                    elif keyed_candidate is not None:
+                        rejected += 1
+                        continue
+                    else:
+                        fallback_keys: list[str] = []
+                        try:
+                            comparable_sent_on = sent_on.astimezone()
+                        except (AttributeError, OSError, ValueError):
+                            rejected += 1
+                            continue
+                        for candidate_key in recipient_candidate_keys:
+                            candidate = candidate_by_key[candidate_key]
+                            if candidate.attachment_sha256 != actual_sha256:
+                                continue
+                            threshold = created_after_by_key[candidate_key]
+                            if threshold is None:
+                                continue
+                            try:
+                                comparable_threshold = threshold.astimezone()
+                            except (OSError, ValueError):
+                                continue
+                            if comparable_sent_on >= (
+                                comparable_threshold - timedelta(minutes=5)
+                            ):
+                                fallback_keys.append(candidate_key)
+                        if len(fallback_keys) != 1:
+                            if fallback_keys:
+                                ambiguous_keys.update(fallback_keys)
+                            else:
+                                rejected += 1
+                            continue
+                        matched_key = fallback_keys[0]
+                    exact_by_key.setdefault(matched_key, []).append(
                         OutlookSentMatch(
-                            draft_key=draft_key,
+                            draft_key=matched_key,
                             entry_id=entry_id,
                             sent_at=sent_on.isoformat(),
                         )
@@ -1520,19 +1671,19 @@ class PyWin32OutlookGateway:
                 except Exception:
                     rejected += 1
                     continue
-            ambiguous = sum(
-                1 for values in exact_by_key.values() if len(values) > 1
+            ambiguous_keys.update(
+                key for key, values in exact_by_key.items() if len(values) > 1
             )
             matches = tuple(
                 values[0]
-                for values in exact_by_key.values()
-                if len(values) == 1
+                for key, values in exact_by_key.items()
+                if len(values) == 1 and key not in ambiguous_keys
             )
             return OutlookSentScan(
                 inspected_mail_count=inspected,
                 candidate_mail_count=candidate_mails,
                 rejected_mail_count=rejected,
-                ambiguous_candidate_count=ambiguous,
+                ambiguous_candidate_count=len(ambiguous_keys),
                 matches=matches,
             )
         except OutlookIntegrationError:
@@ -2021,6 +2172,7 @@ class SubprocessOutlookGateway:
         attachment_name: str,
         sending_account: str = "",
         create_if_missing: bool = True,
+        replace_existing: bool = False,
         display: bool = True,
         send_immediately: bool = False,
     ) -> OutlookDraftResult:
@@ -2036,6 +2188,7 @@ class SubprocessOutlookGateway:
                 "attachment_name": attachment_name,
                 "sending_account": sending_account,
                 "create_if_missing": create_if_missing,
+                "replace_existing": replace_existing,
                 "display": display,
                 "send_immediately": send_immediately,
             },
@@ -2278,6 +2431,7 @@ class OutlookService:
         attachment_name: str,
         sending_account: str = "",
         create_if_missing: bool = True,
+        replace_existing: bool = False,
         display: bool = True,
         send_immediately: bool = False,
     ) -> OutlookDraftResult:
@@ -2296,6 +2450,7 @@ class OutlookService:
                 attachment_name=attachment_name,
                 sending_account=sending_account,
                 create_if_missing=create_if_missing,
+                replace_existing=replace_existing,
                 display=display,
                 send_immediately=send_immediately,
             )
@@ -2639,6 +2794,58 @@ class OutlookOutgoingService:
         )
         return result
 
+    def recreate_draft(
+        self,
+        workflow: OutlookWorkflow,
+        letter_id: str,
+    ) -> dict[str, Any]:
+        """Rebuild one tracked draft in place from its confirmed PDF."""
+
+        with self._draft_lock:
+            scan = workflow.get_confirmed_signed_response_scan(letter_id)
+            existing = (
+                self.db.fetch_one(
+                    "SELECT * FROM outlook_outgoing_messages "
+                    "WHERE signed_scan_id = ?",
+                    (scan["id"],),
+                )
+                if scan
+                else None
+            )
+            if not existing:
+                raise OutlookIntegrationError("Черновик ещё не создавался.")
+            if existing.get("status") == "draft_created":
+                self.reconcile_sent_messages()
+                existing = self.db.fetch_one(
+                    "SELECT * FROM outlook_outgoing_messages WHERE id = ?",
+                    (existing["id"],),
+                ) or existing
+            if existing.get("status") in {"sent", "send_requested"}:
+                raise OutlookIntegrationError(
+                    "Отправленное или отправляемое письмо пересоздать нельзя."
+                )
+            if existing.get("status") not in {
+                "draft_created",
+                "technical_error",
+            }:
+                raise OutlookIntegrationError(
+                    "Черновик сейчас занят другой операцией."
+                )
+            result = self._create_draft_locked(
+                workflow,
+                letter_id,
+                display=True,
+                replace_existing=True,
+            )
+            self.db.audit(
+                "outlook_outgoing_message",
+                str(result.get("id") or existing["id"]),
+                "outlook_draft_recreated",
+                {"signed_scan_id": existing["signed_scan_id"]},
+                actor=workflow.get_active_employee() or "Сотрудник",
+            )
+            return result
+
     def _create_draft_locked(
         self,
         workflow: OutlookWorkflow,
@@ -2646,6 +2853,7 @@ class OutlookOutgoingService:
         *,
         display: bool,
         send_immediately: bool = False,
+        replace_existing: bool = False,
     ) -> dict[str, Any]:
         letter = workflow.get_response_letter(letter_id)
         if not letter:
@@ -2663,12 +2871,14 @@ class OutlookOutgoingService:
             str(letter.get("district_place") or "")
         )
         test_recipient = self.get_test_recipient()
-        recipient_email = test_recipient or workflow.office_delivery_email(
+        recipient_email = test_recipient or workflow.office_delivery_recipients(
             office
         )
-        if not EMAIL_RE.fullmatch(recipient_email):
+        try:
+            recipient_email = _recipient_field(recipient_email)
+        except OutlookConnectionError:
             raise OutlookIntegrationError(
-                "Для подразделения ГНС не настроен однозначный email."
+                "Для подразделения ГНС не настроены корректные получатели."
             )
 
         try:
@@ -2704,13 +2914,14 @@ class OutlookOutgoingService:
         reopening_existing = bool(
             existing
             and existing.get("status") == "draft_created"
+            and not replace_existing
             and str(existing.get("recipient_email") or "").casefold()
             == recipient_email
         )
         if existing:
-            if existing.get("status") == "sent":
+            if existing.get("status") in {"sent", "send_requested"}:
                 raise OutlookIntegrationError(
-                    "Письмо с этим PDF уже отправлено."
+                    "Письмо с этим PDF уже отправлено или отправляется."
                 )
             message_id = str(existing["id"])
         now = utc_now()
@@ -2761,6 +2972,7 @@ class OutlookOutgoingService:
                 attachment_name=attachment_name,
                 sending_account=self.get_mailbox(),
                 create_if_missing=not reopening_existing,
+                replace_existing=replace_existing,
                 display=display,
                 send_immediately=send_immediately,
             )
@@ -3255,16 +3467,10 @@ class OutlookOutgoingService:
             )
             sequence = int(row.get("resend_sequence") or 0)
             draft_key = str(row.get("resend_draft_key") or "")
-            # Повторный черновик всегда создаётся с нейтральными данными.
-            # Для уже созданного до этой версии черновика сохраняем старые
-            # реквизиты только чтобы корректно завершить его сверку Outlook.
             resend_subject = str(
                 row.get("resend_subject")
-                or (
-                    row.get("subject")
-                    if reopening and not row.get("resend_subject")
-                    else self.DEFAULT_SUBJECT_TEMPLATE
-                )
+                or row.get("subject")
+                or self.DEFAULT_SUBJECT_TEMPLATE
             )
             resend_attachment_name = str(
                 row.get("resend_attachment_name")
@@ -3410,6 +3616,7 @@ class OutlookOutgoingService:
                         attachment_sha256=str(
                             row.get("attachment_sha256") or ""
                         ),
+                        created_after=str(row.get("updated_at") or ""),
                     )
                 )
             created_days: list[date] = []
@@ -3600,7 +3807,7 @@ class OutlookOutgoingService:
             recipient_email = (
                 str(existing.get("recipient_email") or "")
                 if existing
-                else workflow.office_delivery_email(office)
+                else workflow.office_delivery_recipients(office)
             )
             subject = (
                 str(existing.get("subject") or "")
@@ -4422,6 +4629,9 @@ def _bridge_payload(
                 sending_account=str(payload.get("sending_account") or ""),
                 create_if_missing=bool(
                     payload.get("create_if_missing", True)
+                ),
+                replace_existing=bool(
+                    payload.get("replace_existing", False)
                 ),
                 display=bool(payload.get("display", True)),
                 send_immediately=bool(payload.get("send_immediately", False)),

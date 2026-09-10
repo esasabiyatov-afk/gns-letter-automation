@@ -2167,6 +2167,43 @@ def test_confirmed_multi_page_scan_creates_one_idempotent_outlook_draft(
     assert "002lenin@sti.gov.kg" in page.text
 
 
+def test_outlook_draft_includes_primary_and_all_backup_recipients(workflow):
+    workflow.initialize_gns_offices()
+    workflow.initialize_gns_office_emails()
+    office = workflow.match_gns_office("по Ленинскому району г.Бишкек")
+    workflow.save_gns_office(
+        office["district_place"],
+        office["email_address"],
+        "reserve@example.kg",
+        office["aliases"],
+        salyk_backup_enabled=True,
+        office_id=office["id"],
+    )
+    _, letter = _ready_response_letter(workflow)
+    workflow.set_outgoing_number(letter["id"], "9545")
+    workflow.register_signed_response_scan(
+        letter["id"], "scan.png", _png_scan()
+    )
+
+    class Gateway:
+        def create_draft(self, **request):
+            return OutlookDraftResult(
+                entry_id="draft-entry",
+                recipient_email=request["recipient_email"],
+                subject=request["subject"],
+                attachment_name=request["attachment_name"],
+            )
+
+    outgoing = OutlookOutgoingService(
+        workflow.db, workflow.settings, OutlookService(Gateway())
+    )
+    result = outgoing.create_draft(workflow, letter["id"])
+
+    assert result["recipient_email"] == (
+        "002lenin@sti.gov.kg; reserve@example.kg; 002lenin@salyk.kg"
+    )
+
+
 def test_outlook_sent_reconciliation_updates_status_once(workflow, monkeypatch):
     workflow.initialize_gns_offices()
     workflow.initialize_gns_office_emails()
@@ -2280,12 +2317,65 @@ def test_outlook_sent_reconciliation_updates_status_once(workflow, monkeypatch):
     assert "Отправлено" in page.text
     assert "2026-09-04 10:30" in page.text
     assert "002lenin@sti.gov.kg" in page.text
-    assert "Подтверждено Outlook" in page.text
+    assert "Повторный черновик" in page.text
     assert "Подготовить письмо в Outlook" not in page.text
     history = client.get("/history")
     assert history.status_code == 200
     assert "Отправлено" in history.text
     assert "2026-09-04 10:30" in history.text
+
+
+def test_outlook_draft_can_be_recreated_from_same_confirmed_pdf(workflow):
+    workflow.initialize_gns_offices()
+    workflow.initialize_gns_office_emails()
+    _, letter = _ready_response_letter(workflow)
+    workflow.set_outgoing_number(letter["id"], "9549")
+    scan = workflow.register_signed_response_scan(
+        letter["id"], "scan.png", _png_scan()
+    )
+    expected_pdf = Path(scan["pdf_path"]).read_bytes()
+
+    class Gateway:
+        def __init__(self):
+            self.requests = []
+            self.attachments = []
+
+        def create_draft(self, **request):
+            self.requests.append(request)
+            self.attachments.append(request["attachment_path"].read_bytes())
+            return OutlookDraftResult(
+                entry_id="draft-entry",
+                recipient_email=request["recipient_email"],
+                subject=request["subject"],
+                attachment_name=request["attachment_name"],
+                existing=request["replace_existing"],
+            )
+
+        @staticmethod
+        def scan_sent_items(**_request):
+            return OutlookSentScan(0, 0, 0, 0, ())
+
+    gateway = Gateway()
+    outgoing = OutlookOutgoingService(
+        workflow.db, workflow.settings, OutlookService(gateway)
+    )
+    created = outgoing.create_draft(workflow, letter["id"])
+    recreated = outgoing.recreate_draft(workflow, letter["id"])
+
+    assert recreated["id"] == created["id"]
+    assert gateway.requests[1]["replace_existing"] is True
+    assert gateway.requests[1]["create_if_missing"] is True
+    assert gateway.attachments == [expected_pdf, expected_pdf]
+    assert workflow.db.fetch_one(
+        "SELECT COUNT(*) AS count FROM outlook_outgoing_messages"
+    )["count"] == 1
+
+    workflow.db.execute(
+        "UPDATE outlook_outgoing_messages SET status = 'sent' WHERE id = ?",
+        (created["id"],),
+    )
+    with pytest.raises(OutlookIntegrationError, match="пересоздать нельзя"):
+        outgoing.recreate_draft(workflow, letter["id"])
 
 
 def test_external_send_can_be_marked_once_without_outlook(workflow, monkeypatch):
@@ -2331,6 +2421,9 @@ def test_external_send_can_be_marked_once_without_outlook(workflow, monkeypatch)
     assert page.status_code == 200
     assert "Отмечено вручную" in page.text
     assert 'form="signed-copy-print-form"' in page.text
+    assert "data-signed-copy-select-all" in page.text
+    assert "data-signed-copy-clear" in page.text
+    assert f'action="/outlook-messages/{first["id"]}/resend-draft"' in page.text
 
     printed = TestClient(main.app).post(
         "/signed-response-scans/print-selected",

@@ -143,6 +143,51 @@ def test_initialize_adds_original_sender_to_legacy_outlook_messages(tmp_path):
     }
 
 
+def test_initialize_adds_salyk_switch_without_changing_legacy_office(tmp_path):
+    path = tmp_path / "legacy-offices.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE gns_offices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                office_key TEXT NOT NULL UNIQUE,
+                office_name TEXT NOT NULL,
+                district_place TEXT NOT NULL,
+                postal_address TEXT,
+                email_address TEXT,
+                backup_emails_json TEXT NOT NULL DEFAULT '[]',
+                aliases_json TEXT NOT NULL DEFAULT '[]',
+                active INTEGER NOT NULL DEFAULT 1,
+                user_modified INTEGER NOT NULL DEFAULT 0,
+                is_custom INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO gns_offices(
+                office_key, office_name, district_place, email_address,
+                backup_emails_json, created_at, updated_at
+            ) VALUES ('legacy', 'УГНС', 'по району', 'office@sti.gov.kg',
+                      '["reserve@example.kg"]', '2026-01-01', '2026-01-01')
+            """
+        )
+
+    db = Database(path)
+    db.initialize()
+
+    assert db.fetch_one(
+        "SELECT email_address, backup_emails_json, salyk_backup_enabled "
+        "FROM gns_offices WHERE office_key = 'legacy'"
+    ) == {
+        "email_address": "office@sti.gov.kg",
+        "backup_emails_json": '["reserve@example.kg"]',
+        "salyk_backup_enabled": 0,
+    }
+
+
 def test_initialize_backfills_legacy_outlook_draft_key(tmp_path):
     path = tmp_path / "legacy-outgoing.sqlite3"
     with sqlite3.connect(path) as connection:

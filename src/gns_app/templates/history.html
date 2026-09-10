@@ -8,17 +8,63 @@
     <h1>История писем</h1>
   </div>
   <form class="history-search" method="get" action="/history" data-history-search>
-    <input name="query" value="{{ history.query }}"
-           placeholder="Название, район, ИНН или исх. №"
-           aria-label="Поиск по истории">
-    <select name="sort_order" aria-label="Сортировка истории">
-      <option value="date_desc" {% if history.sort_order == 'date_desc' %}selected{% endif %}>Сначала новые</option>
-      <option value="date_asc" {% if history.sort_order == 'date_asc' %}selected{% endif %}>Сначала старые</option>
-      <option value="district_asc" {% if history.sort_order == 'district_asc' %}selected{% endif %}>Район А–Я</option>
-      <option value="district_desc" {% if history.sort_order == 'district_desc' %}selected{% endif %}>Район Я–А</option>
-    </select>
-    <button class="button button-primary button-compact" type="submit">Найти</button>
-    {% if history.query %}<a class="button button-quiet button-compact" href="/history">Сбросить</a>{% endif %}
+    <div class="history-search-main">
+      <input name="query" value="{{ history.query }}"
+             placeholder="Название, ИНН или отправитель"
+             aria-label="Поиск по истории">
+      <select name="sort_order" aria-label="Сортировка истории">
+        <optgroup label="Дата">
+          <option value="date_desc" {% if history.sort_order == 'date_desc' %}selected{% endif %}>Сначала новые</option>
+          <option value="date_asc" {% if history.sort_order == 'date_asc' %}selected{% endif %}>Сначала старые</option>
+        </optgroup>
+        <optgroup label="Место">
+          <option value="district_asc" {% if history.sort_order == 'district_asc' %}selected{% endif %}>Место А–Я</option>
+          <option value="district_desc" {% if history.sort_order == 'district_desc' %}selected{% endif %}>Место Я–А</option>
+        </optgroup>
+        <optgroup label="Исходящий номер">
+          <option value="outgoing_asc" {% if history.sort_order == 'outgoing_asc' %}selected{% endif %}>Исходящий по возрастанию</option>
+          <option value="outgoing_desc" {% if history.sort_order == 'outgoing_desc' %}selected{% endif %}>Исходящий по убыванию</option>
+        </optgroup>
+        <optgroup label="ФИО адресата">
+          <option value="recipient_asc" {% if history.sort_order == 'recipient_asc' %}selected{% endif %}>ФИО А–Я</option>
+          <option value="recipient_desc" {% if history.sort_order == 'recipient_desc' %}selected{% endif %}>ФИО Я–А</option>
+        </optgroup>
+      </select>
+      <button class="button button-primary button-compact" type="submit">Применить</button>
+      {% if history.filters_active %}<a class="button button-quiet button-compact" href="/history">Сбросить</a>{% endif %}
+    </div>
+    <div class="history-filter-row" aria-label="Фильтры истории">
+      <select name="delivery_status" aria-label="Статус отправки">
+        <option value="all" {% if history.delivery_status == 'all' %}selected{% endif %}>Все статусы</option>
+        <option value="sent" {% if history.delivery_status == 'sent' %}selected{% endif %}>Отправленные</option>
+        <option value="not_sent" {% if history.delivery_status == 'not_sent' %}selected{% endif %}>Не отправленные</option>
+      </select>
+      <input name="outgoing_number" value="{{ history.outgoing_number }}"
+             inputmode="numeric" pattern="[0-9]+" maxlength="9"
+             placeholder="Исх. №" aria-label="Исходящий номер">
+      <label class="history-date-filter">
+        <span>с</span>
+        <input type="date" name="date_from" value="{{ history.date_from }}"
+               aria-label="Дата с">
+      </label>
+      <label class="history-date-filter">
+        <span>по</span>
+        <input type="date" name="date_to" value="{{ history.date_to }}"
+               aria-label="Дата по">
+      </label>
+      <select name="district_place" aria-label="Место">
+        <option value="">Все места</option>
+        {% for place in history.district_options %}
+          <option value="{{ place }}" {% if history.district_place == place %}selected{% endif %}>{{ place }}</option>
+        {% endfor %}
+      </select>
+      <select name="recipient_full_name" aria-label="ФИО адресата">
+        <option value="">Все адресаты</option>
+        {% for recipient in history.recipient_options %}
+          <option value="{{ recipient }}" {% if history.recipient_full_name == recipient %}selected{% endif %}>{{ recipient }}</option>
+        {% endfor %}
+      </select>
+    </div>
   </form>
 </header>
 
@@ -28,7 +74,7 @@
 <section class="work-section history-section" data-history-results>
   <div class="work-section-toolbar">
     <div>
-      <h2>{% if history.query %}Результаты поиска{% else %}Все обращения{% endif %}</h2>
+      <h2>{% if history.filters_active %}Результаты поиска{% else %}Все обращения{% endif %}</h2>
       <p>{{ history.total }} {{ case_word(history.total) }}</p>
     </div>
   </div>
@@ -107,9 +153,15 @@
                     onsubmit="return confirm('Создать повторный черновик с сохранённым подписанным PDF?');">
                 <input type="hidden" name="query" value="{{ history.query }}">
                 <input type="hidden" name="sort_order" value="{{ history.sort_order }}">
+                <input type="hidden" name="delivery_status" value="{{ history.delivery_status }}">
+                <input type="hidden" name="outgoing_number" value="{{ history.outgoing_number }}">
+                <input type="hidden" name="date_from" value="{{ history.date_from }}">
+                <input type="hidden" name="date_to" value="{{ history.date_to }}">
+                <input type="hidden" name="district_place" value="{{ history.district_place }}">
+                <input type="hidden" name="recipient_full_name" value="{{ history.recipient_full_name }}">
                 <input type="hidden" name="page" value="{{ history.page }}">
                 <button type="submit">
-                  {% if item.resend_status == 'draft_created' %}Открыть повторный черновик{% else %}Отправить повторно{% endif %}
+                  {% if item.resend_status == 'draft_created' %}Открыть повторный черновик{% else %}Повторный черновик{% endif %}
                 </button>
               </form>
             {% endif %}
@@ -128,12 +180,12 @@
     <nav class="server-pagination" aria-label="Страницы истории">
       {% if history.page > 1 %}
         <a class="button button-secondary button-compact"
-           href="/history?query={{ history.query|urlencode }}&amp;sort_order={{ history.sort_order }}&amp;page={{ history.page - 1 }}">← Назад</a>
+           href="/history?query={{ history.query|urlencode }}&amp;sort_order={{ history.sort_order }}&amp;delivery_status={{ history.delivery_status }}&amp;outgoing_number={{ history.outgoing_number|urlencode }}&amp;date_from={{ history.date_from }}&amp;date_to={{ history.date_to }}&amp;district_place={{ history.district_place|urlencode }}&amp;recipient_full_name={{ history.recipient_full_name|urlencode }}&amp;page={{ history.page - 1 }}">← Назад</a>
       {% endif %}
       <strong>{{ history.page }} из {{ history.page_count }}</strong>
       {% if history.page < history.page_count %}
         <a class="button button-secondary button-compact"
-           href="/history?query={{ history.query|urlencode }}&amp;sort_order={{ history.sort_order }}&amp;page={{ history.page + 1 }}">Дальше →</a>
+           href="/history?query={{ history.query|urlencode }}&amp;sort_order={{ history.sort_order }}&amp;delivery_status={{ history.delivery_status }}&amp;outgoing_number={{ history.outgoing_number|urlencode }}&amp;date_from={{ history.date_from }}&amp;date_to={{ history.date_to }}&amp;district_place={{ history.district_place|urlencode }}&amp;recipient_full_name={{ history.recipient_full_name|urlencode }}&amp;page={{ history.page + 1 }}">Дальше →</a>
       {% endif %}
     </nav>
   {% endif %}

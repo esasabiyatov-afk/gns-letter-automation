@@ -285,6 +285,7 @@ def test_office_directory_is_editable_from_settings(workflow, monkeypatch):
     assert 'data-settings-tab="offices"' in page.text
     assert 'data-office-filter' in page.text
     assert "Резервные почты" in page.text
+    assert 'name="salyk_backup_enabled"' in page.text
     assert 'name="aliases"' in page.text
     assert "УГНС по Иссык-Атинскому району" in page.text
 
@@ -292,9 +293,10 @@ def test_office_directory_is_editable_from_settings(workflow, monkeypatch):
         "/settings/offices/save",
         data={
             "district_place": "по Новому району Нарынской области",
-            "email_address": "new@example.kg",
+            "email_address": "new@sti.gov.kg",
             "backup_emails": "reserve@example.kg",
             "aliases": "Новый район, Новая налоговая",
+            "salyk_backup_enabled": "true",
         },
         follow_redirects=False,
     )
@@ -303,9 +305,14 @@ def test_office_directory_is_editable_from_settings(workflow, monkeypatch):
     office = next(
         item
         for item in workflow.list_gns_offices()
-        if item["email_address"] == "new@example.kg"
+        if item["email_address"] == "new@sti.gov.kg"
     )
     assert office["aliases"] == ["Новый район", "Новая налоговая"]
+    assert office["delivery_emails"] == [
+        "new@sti.gov.kg",
+        "reserve@example.kg",
+        "new@salyk.kg",
+    ]
 
     deleted = client.post(
         f"/settings/offices/{office['id']}/delete",

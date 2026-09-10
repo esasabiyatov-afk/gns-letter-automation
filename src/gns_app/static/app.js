@@ -467,6 +467,124 @@
     input.addEventListener("change", save);
   });
 
+  const signedCopyPrintForm = document.querySelector("#signed-copy-print-form");
+  if (signedCopyPrintForm) {
+    const printButton = signedCopyPrintForm.querySelector("[data-signed-copy-print]");
+    const selectAllButton = signedCopyPrintForm.querySelector(
+      "[data-signed-copy-select-all]",
+    );
+    const clearButton = signedCopyPrintForm.querySelector("[data-signed-copy-clear]");
+    const checkboxes = () => [
+      ...document.querySelectorAll(
+        'input[type="checkbox"][form="signed-copy-print-form"]:not(:disabled)',
+      ),
+    ];
+    const syncSignedCopyActions = () => {
+      const available = checkboxes();
+      const selectedCount = available.filter((checkbox) => checkbox.checked).length;
+      if (printButton) printButton.disabled = selectedCount === 0;
+      if (selectAllButton) {
+        selectAllButton.disabled = available.length === 0
+          || selectedCount === available.length;
+      }
+      if (clearButton) clearButton.disabled = selectedCount === 0;
+    };
+    selectAllButton?.addEventListener("click", () => {
+      checkboxes().forEach((checkbox) => { checkbox.checked = true; });
+      syncSignedCopyActions();
+    });
+    clearButton?.addEventListener("click", () => {
+      checkboxes().forEach((checkbox) => { checkbox.checked = false; });
+      syncSignedCopyActions();
+    });
+    checkboxes().forEach((checkbox) => {
+      checkbox.addEventListener("change", syncSignedCopyActions);
+    });
+    syncSignedCopyActions();
+  }
+
+  const createdOutlookMonitor = document.querySelector(
+    "[data-created-outlook-monitor]",
+  );
+  if (createdOutlookMonitor) {
+    const outlookSignature = (root) => [
+      ...root.querySelectorAll("[data-created-outlook-row]"),
+    ].map((row) => (
+      `${row.dataset.createdOutlookRow}:${row.dataset.outlookState || ""}`
+    )).sort().join(";");
+    const initialSignature = outlookSignature(document);
+    let refreshTimer = null;
+    let refreshController = null;
+    let updateWaiting = false;
+
+    const hasUnsafeLocalState = () => {
+      const active = document.activeElement;
+      const editing = active && active !== document.body
+        && active.matches("input, textarea, select, [contenteditable='true']");
+      const unsavedNumber = inlineNumberForms.some((form) => {
+        const input = form.querySelector("[data-inline-number-input]");
+        return input && input.value.trim() !== (input.dataset.originalNumber || "").trim();
+      });
+      const printSelection = Boolean(document.querySelector(
+        'input[type="checkbox"][form="signed-copy-print-form"]:checked',
+      ));
+      const focusedLetter = new URL(window.location.href).searchParams.has(
+        "focus_letter",
+      );
+      return Boolean(
+        editing || unsavedNumber || printSelection || focusedLetter
+        || document.querySelector("dialog[open], details.action-menu[open]"),
+      );
+    };
+    const scheduleOutlookRefresh = (delay = 10000) => {
+      window.clearTimeout(refreshTimer);
+      refreshTimer = window.setTimeout(checkOutlookStatus, delay);
+    };
+    const checkOutlookStatus = async () => {
+      if (document.visibilityState === "hidden") {
+        scheduleOutlookRefresh(30000);
+        return;
+      }
+      if (updateWaiting) {
+        if (!hasUnsafeLocalState()) window.location.reload();
+        else scheduleOutlookRefresh(1500);
+        return;
+      }
+      refreshController?.abort();
+      refreshController = new AbortController();
+      try {
+        const response = await fetch(window.location.href, {
+          cache: "no-store",
+          headers: { Accept: "text/html" },
+          signal: refreshController.signal,
+        });
+        if (!response.ok) throw new Error("outlook status refresh failed");
+        const documentCopy = new DOMParser().parseFromString(
+          await response.text(),
+          "text/html",
+        );
+        if (!documentCopy.querySelector("[data-created-outlook-monitor]")) {
+          throw new Error("created responses missing");
+        }
+        if (outlookSignature(documentCopy) !== initialSignature) {
+          updateWaiting = true;
+          if (!hasUnsafeLocalState()) {
+            window.location.reload();
+            return;
+          }
+        }
+      } catch (error) {
+        if (error.name === "AbortError") return;
+      }
+      scheduleOutlookRefresh(updateWaiting ? 1500 : 10000);
+    };
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") scheduleOutlookRefresh(250);
+    });
+    window.addEventListener("beforeunload", () => refreshController?.abort());
+    scheduleOutlookRefresh();
+  }
+
   const actionMenus = [...document.querySelectorAll(".action-menu")];
   actionMenus.forEach((menu) => {
     menu.addEventListener("toggle", () => {
@@ -1205,5 +1323,13 @@
       timer = window.setTimeout(refreshHistory, 350);
     });
     sortInput?.addEventListener("change", refreshHistory);
+    historySearch.querySelectorAll(
+      "select:not([name='sort_order']), input[type='date']",
+    ).forEach((input) => input.addEventListener("change", refreshHistory));
+    historySearch.querySelector("[name='outgoing_number']")
+      ?.addEventListener("input", () => {
+        window.clearTimeout(timer);
+        timer = window.setTimeout(refreshHistory, 350);
+      });
   }
 })();

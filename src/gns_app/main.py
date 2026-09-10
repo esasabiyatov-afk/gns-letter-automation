@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager, suppress
 from datetime import date
 from pathlib import Path
 from threading import Lock, Thread
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import uvicorn
 from fastapi import (
@@ -1071,6 +1071,12 @@ def letter_history(
     query: str = "",
     page: int = 1,
     sort_order: str = "date_desc",
+    delivery_status: str = "all",
+    outgoing_number: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    district_place: str = "",
+    recipient_full_name: str = "",
     message: str = "",
     error: str = "",
 ):
@@ -1083,6 +1089,12 @@ def letter_history(
                 query,
                 page=page,
                 sort_order=sort_order,
+                delivery_status=delivery_status,
+                outgoing_number=outgoing_number,
+                date_from=date_from,
+                date_to=date_to,
+                district_place=district_place,
+                recipient_full_name=recipient_full_name,
             ),
             message=message,
             error=error,
@@ -1093,16 +1105,46 @@ def letter_history(
 @app.post("/outlook-messages/{message_id}/resend-draft")
 def create_outlook_resend_draft(
     message_id: str,
+    return_to: str = Form("history"),
+    group_id: str = Form(""),
     query: str = Form(""),
     sort_order: str = Form("date_desc"),
+    delivery_status: str = Form("all"),
+    outgoing_number: str = Form(""),
+    date_from: str = Form(""),
+    date_to: str = Form(""),
+    district_place: str = Form(""),
+    recipient_full_name: str = Form(""),
     page: int = Form(1),
 ):
-    parameters = (
-        f"query={quote(query)}&sort_order={quote(sort_order)}&page={max(page, 1)}"
+    parameters = urlencode(
+        {
+            "query": query,
+            "sort_order": sort_order,
+            "delivery_status": delivery_status,
+            "outgoing_number": outgoing_number,
+            "date_from": date_from,
+            "date_to": date_to,
+            "district_place": district_place,
+            "recipient_full_name": recipient_full_name,
+            "page": max(page, 1),
+        }
     )
     try:
         result = outlook_outgoing.create_resend_draft(workflow, message_id)
     except OutlookIntegrationError as exc:
+        if return_to == "created":
+            target = "/?" + urlencode(
+                {
+                    "tab": "responses",
+                    "response_view": "created",
+                    "error": str(exc),
+                }
+            )
+            return RedirectResponse(
+                target + (f"#group-{quote(group_id)}" if group_id else ""),
+                status_code=303,
+            )
         return RedirectResponse(
             f"/history?{parameters}&error={quote(str(exc))}",
             status_code=303,
@@ -1112,6 +1154,18 @@ def create_outlook_resend_draft(
         if result.get("existing_outlook_draft")
         else "Повторный черновик Outlook создан и открыт."
     )
+    if return_to == "created":
+        target = "/?" + urlencode(
+            {
+                "tab": "responses",
+                "response_view": "created",
+                "message": notice,
+            }
+        )
+        return RedirectResponse(
+            target + (f"#group-{quote(group_id)}" if group_id else ""),
+            status_code=303,
+        )
     return RedirectResponse(
         f"/history?{parameters}&message={quote(notice)}",
         status_code=303,
@@ -1386,6 +1440,29 @@ def create_response_letter_outlook_draft(
     )
 
 
+@app.post("/response-letters/{letter_id}/outlook-draft/recreate")
+def recreate_response_letter_outlook_draft(
+    letter_id: str,
+    group_id: str = Form(""),
+):
+    try:
+        result = outlook_outgoing.recreate_draft(workflow, letter_id)
+    except OutlookIntegrationError as exc:
+        return RedirectResponse(
+            f"/today?error={quote(str(exc))}#group-{quote(group_id)}",
+            status_code=303,
+        )
+    message = (
+        "Черновик Outlook обновлён тем же подписанным PDF."
+        if result.get("existing_outlook_draft")
+        else "Черновик Outlook создан заново с тем же подписанным PDF."
+    )
+    return RedirectResponse(
+        f"/today?message={quote(message)}#group-{quote(group_id)}",
+        status_code=303,
+    )
+
+
 @app.post("/response-letters/{letter_id}/mark-sent")
 def mark_response_letter_sent(
     letter_id: str,
@@ -1572,6 +1649,7 @@ def save_gns_office_settings(
     email_address: str = Form(""),
     backup_emails: str = Form(""),
     aliases: str = Form(""),
+    salyk_backup_enabled: bool = Form(False),
 ):
     try:
         workflow.save_gns_office(
@@ -1579,6 +1657,7 @@ def save_gns_office_settings(
             email_address,
             backup_emails,
             aliases,
+            salyk_backup_enabled=salyk_backup_enabled,
             office_id=office_id or None,
             actor=workflow.get_active_employee() or "Сотрудник",
         )

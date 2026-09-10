@@ -1627,6 +1627,15 @@ pre { white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow
 .office-settings-form .field { min-width: 0; margin: 0; }
 .office-settings-form .field span { font-size: 11px; }
 .office-settings-form input { min-width: 0; }
+.office-email-stack { display: grid; gap: 6px; min-width: 0; }
+.office-domain-toggle {
+  display: flex; gap: 6px; align-items: flex-start; min-width: 0;
+  color: var(--muted); font-size: 11px; line-height: 1.3; cursor: pointer;
+}
+.office-domain-toggle input {
+  flex: 0 0 auto; width: 15px; height: 15px; min-width: 15px; margin: 0;
+}
+.office-domain-toggle.is-disabled { opacity: 0.65; cursor: default; }
 .office-settings-form .button,
 .office-delete-form .button { min-height: 40px; white-space: nowrap; }
 .office-delete-form { margin: 0; }
@@ -2511,9 +2520,16 @@ pre { white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow
 .ready-scan-upload form { display: flex; align-items: end; gap: 7px; margin-top: 8px; }
 .ready-scan-upload input[type="file"] { min-width: 0; max-width: 380px; }
 
-.history-search { display: flex; align-items: center; gap: 5px; }
-.history-search input { width: min(520px, 48vw); min-height: 32px; }
+.history-search { display: grid; gap: 6px; min-width: min(860px, 70vw); }
+.history-search-main,
+.history-filter-row { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+.history-search-main > input { width: min(420px, 38vw); }
+.history-search input { min-height: 32px; }
 .history-search select { min-height: 32px; border: 1px solid var(--line); border-radius: 8px; background: white; }
+.history-filter-row input[name="outgoing_number"] { width: 86px; }
+.history-date-filter { display: flex; align-items: center; gap: 4px; color: var(--muted); font-size: 11px; }
+.history-date-filter input { width: 132px; }
+.signed-copy-actions { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
 .history-list-grid { grid-template-columns: 150px minmax(210px, 1fr) minmax(200px, 1fr) minmax(180px, .9fr) 30px; }
 .history-received,
 .history-recipient,
@@ -2589,6 +2605,7 @@ pre { white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow
   .created-letter-line > .letter-primary-action,
   .created-letter-line > .action-menu { grid-column: 3; }
   .scan-sheet-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .history-search { width: 100%; }
-  .history-search input { width: 100%; min-width: 0; }
+  .history-search { width: 100%; min-width: 0; }
+  .history-search-main > input { width: 100%; min-width: 0; }
+  .history-filter-row { align-items: stretch; }
 }

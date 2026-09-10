@@ -236,6 +236,7 @@ CREATE TABLE IF NOT EXISTS gns_offices (
     postal_address TEXT,
     email_address TEXT,
     backup_emails_json TEXT NOT NULL DEFAULT '[]',
+    salyk_backup_enabled INTEGER NOT NULL DEFAULT 0,
     aliases_json TEXT NOT NULL DEFAULT '[]',
     active INTEGER NOT NULL DEFAULT 1,
     user_modified INTEGER NOT NULL DEFAULT 0,
@@ -575,6 +576,11 @@ class Database:
             connection.execute(
                 "ALTER TABLE gns_offices ADD COLUMN "
                 "backup_emails_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "salyk_backup_enabled" not in existing:
+            connection.execute(
+                "ALTER TABLE gns_offices ADD COLUMN "
+                "salyk_backup_enabled INTEGER NOT NULL DEFAULT 0"
             )
         if "user_modified" not in existing:
             connection.execute(
