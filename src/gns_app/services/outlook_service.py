@@ -698,6 +698,18 @@ def _safe_attribute(value: Any, name: str, default: Any = "") -> Any:
         return default
 
 
+def _outlook_error_code(exc: Exception) -> str:
+    """Return only the COM error number, without mail contents."""
+
+    value = getattr(exc, "hresult", None)
+    if value is None and exc.args and isinstance(exc.args[0], int):
+        value = exc.args[0]
+    try:
+        return f"0x{(int(value) & 0xFFFFFFFF):08X}" if value is not None else ""
+    except (TypeError, ValueError):
+        return ""
+
+
 class PyWin32OutlookGateway:
     """Низкоуровневый Outlook COM-адаптер, запускаемый в дочернем процессе."""
 
@@ -769,6 +781,33 @@ class PyWin32OutlookGateway:
             return matches[0]
         if len(available_accounts) == 1:
             return available_accounts[0]
+
+        default_store = _safe_attribute(namespace, "DefaultStore", None)
+        default_store_id = _safe_text(
+            _safe_attribute(default_store, "StoreID")
+        )
+        if not default_store_id:
+            try:
+                default_inbox = namespace.GetDefaultFolder(OL_FOLDER_INBOX)
+            except Exception:
+                default_inbox = None
+            default_store_id = _safe_text(
+                _safe_attribute(default_inbox, "StoreID")
+            )
+        if default_store_id:
+            default_matches = [
+                account
+                for account in available_accounts
+                if _safe_text(
+                    _safe_attribute(
+                        _safe_attribute(account, "DeliveryStore", None),
+                        "StoreID",
+                    )
+                )
+                == default_store_id
+            ]
+            if len(default_matches) == 1:
+                return default_matches[0]
         return None
 
     @staticmethod
@@ -1242,10 +1281,14 @@ class PyWin32OutlookGateway:
                 exc,
                 details={"stage": stage},
             )
-            raise OutlookConnectionError(
+            error_code = _outlook_error_code(exc)
+            message = (
                 "Outlook не смог создать или открыть черновик письма. "
                 f"Этап: {stage}."
-            ) from exc
+            )
+            if error_code:
+                message += f" Код Outlook: {error_code}."
+            raise OutlookConnectionError(message) from exc
         finally:
             pythoncom.CoUninitialize()
 
@@ -1369,10 +1412,11 @@ class PyWin32OutlookGateway:
                 exc,
                 details={"stage": stage},
             )
-            raise OutlookConnectionError(
-                "Outlook не смог отправить письмо. "
-                f"Этап: {stage}."
-            ) from exc
+            error_code = _outlook_error_code(exc)
+            message = f"Outlook не смог отправить письмо. Этап: {stage}."
+            if error_code:
+                message += f" Код Outlook: {error_code}."
+            raise OutlookConnectionError(message) from exc
         finally:
             pythoncom.CoUninitialize()
 
@@ -3549,7 +3593,9 @@ class OutlookOutgoingService:
                 """
                 SELECT *
                 FROM outlook_outgoing_messages
-                WHERE status IN ('draft_created', 'send_requested')
+                WHERE status IN (
+                    'draft_created', 'send_requested', 'technical_error'
+                )
                    OR (status = 'sent' AND resend_status = 'draft_created')
                 ORDER BY created_at, id
                 """
@@ -3597,7 +3643,14 @@ class OutlookOutgoingService:
                         attachment_sha256=str(
                             row.get("attachment_sha256") or ""
                         ),
-                        created_after=str(row.get("updated_at") or ""),
+                        created_after=str(
+                            (
+                                row.get("updated_at")
+                                if is_resend
+                                else row.get("created_at")
+                            )
+                            or ""
+                        ),
                     )
                 )
             created_days: list[date] = []
@@ -3701,7 +3754,10 @@ class OutlookOutgoingService:
                             SET status = 'sent', outlook_entry_id = ?, sent_at = ?,
                                 error_message = NULL, updated_at = ?
                             WHERE id = ?
-                              AND status IN ('draft_created', 'send_requested')
+                              AND status IN (
+                                  'draft_created', 'send_requested',
+                                  'technical_error'
+                              )
                             """,
                             (match.entry_id, match.sent_at, now, row["id"]),
                         )

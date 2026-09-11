@@ -671,9 +671,14 @@ def test_com_gateway_creates_and_reopens_same_outlook_draft(
         def Send(self):
             self.send_count += 1
 
-    sending_account = SimpleNamespace(SmtpAddress="employee@bank.kg")
+    primary_store = SimpleNamespace(StoreID="primary-store")
+    sending_account = SimpleNamespace(
+        SmtpAddress="employee@bank.kg",
+        DeliveryStore=primary_store,
+    )
     namespace = SimpleNamespace(
         GetDefaultFolder=lambda folder_id: SimpleNamespace(Items=items),
+        DefaultStore=primary_store,
         Accounts=SimpleNamespace(
             Count=1,
             Item=lambda _index: sending_account,
@@ -750,7 +755,10 @@ def test_com_gateway_creates_and_reopens_same_outlook_draft(
     assert items.values[0].GetInspector.activate_count == 1
     assert items.values[0].send_count == 1
 
-    second_account = SimpleNamespace(SmtpAddress="archive@bank.kg")
+    second_account = SimpleNamespace(
+        SmtpAddress="archive@bank.kg",
+        DeliveryStore=SimpleNamespace(StoreID="archive-store"),
+    )
     namespace.Accounts = SimpleNamespace(
         Count=2,
         Item=lambda index: (sending_account, second_account)[index - 1],
@@ -769,7 +777,7 @@ def test_com_gateway_creates_and_reopens_same_outlook_draft(
     )
     assert sent_with_default.send_requested
     assert items.values[0].send_count == 2
-    assert items.values[0].SendUsingAccount is None
+    assert items.values[0].SendUsingAccount is sending_account
 
     items.values.clear()
     with pytest.raises(OutlookConnectionError, match="дождитесь обновления"):

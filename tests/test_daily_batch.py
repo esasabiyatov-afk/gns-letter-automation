@@ -2219,6 +2219,7 @@ def test_outlook_sent_reconciliation_updates_status_once(workflow, monkeypatch):
             self.sent_scans = 0
             self.fail_scan = True
             self.simulate_competing_update = False
+            self.last_candidate = None
 
         def create_draft(self, **request):
             self.draft_calls += 1
@@ -2231,6 +2232,7 @@ def test_outlook_sent_reconciliation_updates_status_once(workflow, monkeypatch):
 
         def scan_sent_items(self, **request):
             self.sent_scans += 1
+            self.last_candidate = request["candidates"][0]
             if self.fail_scan:
                 raise OutlookConnectionError("Outlook временно недоступен")
             candidate = request["candidates"][0]
@@ -2267,6 +2269,15 @@ def test_outlook_sent_reconciliation_updates_status_once(workflow, monkeypatch):
         "SELECT status FROM outlook_outgoing_messages WHERE id = ?",
         (created["id"],),
     )
+    created_row = workflow.db.fetch_one(
+        "SELECT created_at FROM outlook_outgoing_messages WHERE id = ?",
+        (created["id"],),
+    )
+    workflow.db.execute(
+        "UPDATE outlook_outgoing_messages "
+        "SET status = 'technical_error', updated_at = ? WHERE id = ?",
+        ("2099-01-01T00:00:00+00:00", created["id"]),
+    )
     gateway.fail_scan = False
     first = outgoing.reconcile_sent_messages()
     second = outgoing.reconcile_sent_messages()
@@ -2290,6 +2301,7 @@ def test_outlook_sent_reconciliation_updates_status_once(workflow, monkeypatch):
     )
     assert first["confirmed"] == 1
     assert unchanged == {"status": "draft_created"}
+    assert gateway.last_candidate.created_after == created_row["created_at"]
     assert second["pending"] == 0
     assert raced["confirmed"] == 0
     assert gateway.sent_scans == 3
