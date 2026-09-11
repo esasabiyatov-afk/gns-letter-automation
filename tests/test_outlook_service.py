@@ -750,6 +750,27 @@ def test_com_gateway_creates_and_reopens_same_outlook_draft(
     assert items.values[0].GetInspector.activate_count == 1
     assert items.values[0].send_count == 1
 
+    second_account = SimpleNamespace(SmtpAddress="archive@bank.kg")
+    namespace.Accounts = SimpleNamespace(
+        Count=2,
+        Item=lambda index: (sending_account, second_account)[index - 1],
+    )
+    items.values[0].SendUsingAccount = None
+    sent_with_default = gateway.create_draft(
+        draft_key="gns-scan-one",
+        recipient_email="recipient@example.test",
+        subject="Ответ № 9544",
+        body="",
+        attachment_path=attachment,
+        attachment_name=attachment.name,
+        sending_account="",
+        display=False,
+        send_immediately=True,
+    )
+    assert sent_with_default.send_requested
+    assert items.values[0].send_count == 2
+    assert items.values[0].SendUsingAccount is None
+
     items.values.clear()
     with pytest.raises(OutlookConnectionError, match="дождитесь обновления"):
         gateway.create_draft(

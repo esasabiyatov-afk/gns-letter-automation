@@ -727,6 +727,51 @@ class PyWin32OutlookGateway:
         return client.Dispatch("Outlook.Application")
 
     @staticmethod
+    def _select_sending_account(
+        namespace: Any,
+        account_identifier: str,
+    ) -> Any | None:
+        """Resolve an explicitly configured account or use Outlook's default.
+
+        Outlook profiles may expose several auxiliary accounts even when the
+        employee uses one default mailbox.  In that case an empty setting must
+        not turn a valid Send call into an ambiguous-account error: leaving
+        ``SendUsingAccount`` untouched makes Outlook use its configured default.
+        """
+
+        configured = account_identifier.strip().casefold()
+        accounts = _safe_attribute(namespace, "Accounts", None)
+        account_count = int(_safe_attribute(accounts, "Count", 0) or 0)
+        available_accounts: list[Any] = []
+        matches: list[Any] = []
+        for index in range(1, account_count + 1):
+            account = accounts.Item(index)
+            available_accounts.append(account)
+            delivery_store = _safe_attribute(account, "DeliveryStore", None)
+            identifiers = {
+                _safe_text(_safe_attribute(account, "SmtpAddress")).casefold(),
+                _safe_text(_safe_attribute(account, "DisplayName")).casefold(),
+                _safe_text(_safe_attribute(account, "UserName")).casefold(),
+                _safe_text(
+                    _safe_attribute(delivery_store, "DisplayName")
+                ).casefold(),
+            }
+            identifiers.discard("")
+            if configured and configured in identifiers:
+                matches.append(account)
+
+        if configured:
+            if len(matches) != 1:
+                raise OutlookConnectionError(
+                    "Учётная запись отправителя не выбрана однозначно. "
+                    "Проверьте почтовый ящик в настройках Outlook."
+                )
+            return matches[0]
+        if len(available_accounts) == 1:
+            return available_accounts[0]
+        return None
+
+    @staticmethod
     def _ensure_outlook_window(application: Any, inbox: Any) -> None:
         explorers = _safe_attribute(application, "Explorers", None)
         if explorers is None:
@@ -1030,30 +1075,10 @@ class PyWin32OutlookGateway:
                 mail.Body = body
                 if account_identifier:
                     stage = "select_account"
-                    accounts = _safe_attribute(namespace, "Accounts", None)
-                    account_count = int(
-                        _safe_attribute(accounts, "Count", 0) or 0
+                    mail.SendUsingAccount = self._select_sending_account(
+                        namespace,
+                        account_identifier,
                     )
-                    matches = []
-                    for index in range(1, account_count + 1):
-                        account = accounts.Item(index)
-                        smtp = _safe_text(
-                            _safe_attribute(account, "SmtpAddress")
-                        ).casefold()
-                        delivery_store = _safe_attribute(
-                            account, "DeliveryStore", None
-                        )
-                        store_name = _safe_text(
-                            _safe_attribute(delivery_store, "DisplayName")
-                        ).casefold()
-                        if account_identifier in {smtp, store_name}:
-                            matches.append(account)
-                    if len(matches) != 1:
-                        raise OutlookConnectionError(
-                            "Учётная запись отправителя не выбрана однозначно. "
-                            "Проверьте почтовый ящик в настройках Outlook."
-                        )
-                    mail.SendUsingAccount = matches[0]
                 stage = "set_deduplication_key"
                 properties = mail.UserProperties
                 property_item = properties.Add(
@@ -1157,34 +1182,10 @@ class PyWin32OutlookGateway:
                     )
 
                 stage = "select_account"
-                accounts = _safe_attribute(namespace, "Accounts", None)
-                account_count = int(_safe_attribute(accounts, "Count", 0) or 0)
-                available_accounts: list[Any] = []
-                matches: list[Any] = []
-                for index in range(1, account_count + 1):
-                    account = accounts.Item(index)
-                    available_accounts.append(account)
-                    smtp = _safe_text(
-                        _safe_attribute(account, "SmtpAddress")
-                    ).casefold()
-                    delivery_store = _safe_attribute(
-                        account, "DeliveryStore", None
-                    )
-                    store_name = _safe_text(
-                        _safe_attribute(delivery_store, "DisplayName")
-                    ).casefold()
-                    if account_identifier and account_identifier in {
-                        smtp,
-                        store_name,
-                    }:
-                        matches.append(account)
-                if not account_identifier and len(available_accounts) == 1:
-                    matches = available_accounts
-                if len(matches) != 1:
-                    raise OutlookConnectionError(
-                        "Учётная запись отправителя не выбрана однозначно. "
-                        "Укажите точный почтовый ящик в настройках Outlook."
-                    )
+                sending_account = self._select_sending_account(
+                    namespace,
+                    account_identifier,
+                )
 
                 stage = "send"
                 mail.To = recipient_field
@@ -1196,7 +1197,8 @@ class PyWin32OutlookGateway:
                     raise OutlookConnectionError(
                         "Outlook не смог распознать одного из получателей."
                     )
-                mail.SendUsingAccount = matches[0]
+                if sending_account is not None:
+                    mail.SendUsingAccount = sending_account
                 mail.Save()
                 certificate_watcher = (
                     start_outlook_certificate_dialog_watcher()
@@ -1320,32 +1322,10 @@ class PyWin32OutlookGateway:
                 )
 
             stage = "select_account"
-            accounts = _safe_attribute(namespace, "Accounts", None)
-            account_count = int(_safe_attribute(accounts, "Count", 0) or 0)
-            available_accounts: list[Any] = []
-            matches: list[Any] = []
-            for index in range(1, account_count + 1):
-                account = accounts.Item(index)
-                available_accounts.append(account)
-                smtp = _safe_text(
-                    _safe_attribute(account, "SmtpAddress")
-                ).casefold()
-                delivery_store = _safe_attribute(account, "DeliveryStore", None)
-                store_name = _safe_text(
-                    _safe_attribute(delivery_store, "DisplayName")
-                ).casefold()
-                if account_identifier and account_identifier in {
-                    smtp,
-                    store_name,
-                }:
-                    matches.append(account)
-            if not account_identifier and len(available_accounts) == 1:
-                matches = available_accounts
-            if len(matches) != 1:
-                raise OutlookConnectionError(
-                    "Учётная запись отправителя не выбрана однозначно. "
-                    "Укажите точный почтовый ящик в настройках Outlook."
-                )
+            selected_account = self._select_sending_account(
+                namespace,
+                account_identifier,
+            )
 
             stage = "lock_recipient"
             mail.To = recipient
@@ -1357,7 +1337,8 @@ class PyWin32OutlookGateway:
                 raise OutlookConnectionError(
                     "Outlook не смог распознать одного из получателей."
                 )
-            mail.SendUsingAccount = matches[0]
+            if selected_account is not None:
+                mail.SendUsingAccount = selected_account
             mail.Save()
 
             stage = "send"

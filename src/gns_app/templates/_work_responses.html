@@ -265,7 +265,12 @@
                     if letter.outlook_message
                     else (outlook_test_email if outlook_test_mode else letter.gns_email)
                   ) %}
-                  {% if letter.outlook_message and letter.outlook_message.status == 'sent' %}
+                  {% if letter.outlook_message and letter.outlook_message.status == 'technical_error' %}
+                    <span class="status status-technical_error">Ошибка Outlook</span>
+                    {% if letter.outlook_message.error_message %}
+                      <small title="{{ letter.outlook_message.error_message }}">{{ letter.outlook_message.error_message }}</small>
+                    {% endif %}
+                  {% elif letter.outlook_message and letter.outlook_message.status == 'sent' %}
                     <span class="status status-completed">Отправлено</span>
                     {% if letter.outlook_message.sent_at %}
                       <small>{{ letter.outlook_message.sent_at[:16].replace('T', ' ') }}</small>
