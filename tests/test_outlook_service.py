@@ -777,7 +777,7 @@ def test_com_gateway_creates_and_reopens_same_outlook_draft(
     )
     assert sent_with_default.send_requested
     assert items.values[0].send_count == 2
-    assert items.values[0].SendUsingAccount is sending_account
+    assert items.values[0].SendUsingAccount is None
 
     items.values.clear()
     with pytest.raises(OutlookConnectionError, match="дождитесь обновления"):

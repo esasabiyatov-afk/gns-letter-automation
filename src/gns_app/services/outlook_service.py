@@ -743,22 +743,21 @@ class PyWin32OutlookGateway:
         namespace: Any,
         account_identifier: str,
     ) -> Any | None:
-        """Resolve an explicitly configured account or use Outlook's default.
+        """Resolve only an explicitly configured non-default account.
 
-        Outlook profiles may expose several auxiliary accounts even when the
-        employee uses one default mailbox.  In that case an empty setting must
-        not turn a valid Send call into an ambiguous-account error: leaving
-        ``SendUsingAccount`` untouched makes Outlook use its configured default.
+        When the setting is empty, ``SendUsingAccount`` must remain untouched.
+        Outlook then uses the session's default account itself; assigning its
+        COM Account object explicitly is unreliable in Outlook 2013.
         """
 
         configured = account_identifier.strip().casefold()
+        if not configured:
+            return None
         accounts = _safe_attribute(namespace, "Accounts", None)
         account_count = int(_safe_attribute(accounts, "Count", 0) or 0)
-        available_accounts: list[Any] = []
         matches: list[Any] = []
         for index in range(1, account_count + 1):
             account = accounts.Item(index)
-            available_accounts.append(account)
             delivery_store = _safe_attribute(account, "DeliveryStore", None)
             identifiers = {
                 _safe_text(_safe_attribute(account, "SmtpAddress")).casefold(),
@@ -769,46 +768,15 @@ class PyWin32OutlookGateway:
                 ).casefold(),
             }
             identifiers.discard("")
-            if configured and configured in identifiers:
+            if configured in identifiers:
                 matches.append(account)
 
-        if configured:
-            if len(matches) != 1:
-                raise OutlookConnectionError(
-                    "Учётная запись отправителя не выбрана однозначно. "
-                    "Проверьте почтовый ящик в настройках Outlook."
-                )
-            return matches[0]
-        if len(available_accounts) == 1:
-            return available_accounts[0]
-
-        default_store = _safe_attribute(namespace, "DefaultStore", None)
-        default_store_id = _safe_text(
-            _safe_attribute(default_store, "StoreID")
-        )
-        if not default_store_id:
-            try:
-                default_inbox = namespace.GetDefaultFolder(OL_FOLDER_INBOX)
-            except Exception:
-                default_inbox = None
-            default_store_id = _safe_text(
-                _safe_attribute(default_inbox, "StoreID")
+        if len(matches) != 1:
+            raise OutlookConnectionError(
+                "Учётная запись отправителя не выбрана однозначно. "
+                "Проверьте почтовый ящик в настройках Outlook."
             )
-        if default_store_id:
-            default_matches = [
-                account
-                for account in available_accounts
-                if _safe_text(
-                    _safe_attribute(
-                        _safe_attribute(account, "DeliveryStore", None),
-                        "StoreID",
-                    )
-                )
-                == default_store_id
-            ]
-            if len(default_matches) == 1:
-                return default_matches[0]
-        return None
+        return matches[0]
 
     @staticmethod
     def _ensure_outlook_window(application: Any, inbox: Any) -> None:
