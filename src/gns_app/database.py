@@ -264,6 +264,8 @@ CREATE TABLE IF NOT EXISTS response_groups (
     response_path TEXT,
     response_page_overflow INTEGER,
     word_page_count INTEGER,
+    word_page_count_size INTEGER,
+    word_page_count_mtime_ns INTEGER,
     opened_for_print_at TEXT,
     word_reopen_required INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
@@ -654,6 +656,16 @@ class Database:
         if "word_page_count" not in existing:
             connection.execute(
                 "ALTER TABLE response_groups ADD COLUMN word_page_count INTEGER"
+            )
+        if "word_page_count_size" not in existing:
+            connection.execute(
+                "ALTER TABLE response_groups ADD COLUMN "
+                "word_page_count_size INTEGER"
+            )
+        if "word_page_count_mtime_ns" not in existing:
+            connection.execute(
+                "ALTER TABLE response_groups ADD COLUMN "
+                "word_page_count_mtime_ns INTEGER"
             )
         groups = connection.execute(
             """

@@ -3021,3 +3021,25 @@ def test_existing_response_page_count_is_calculated_without_opening_word(
     assert response.status_code == 200
     assert response.json()["page_count"] == 4
     assert workflow.get_response_group(group_id)["word_page_count"] == 4
+
+
+def test_word_page_count_is_recalculated_after_manual_file_edit(
+    workflow, monkeypatch
+):
+    group_id, _ = _ready_response_letter(workflow)
+    counts = iter((2, 3))
+    monkeypatch.setattr(
+        "gns_app.services.workflow.exact_word_page_count",
+        lambda _path: next(counts),
+    )
+
+    assert workflow.refresh_response_group_word_page_count(group_id) == 2
+    group = workflow.get_response_group(group_id)
+    path = Path(group["response_path"])
+    path.write_bytes(path.read_bytes() + b"manual edit")
+
+    assert workflow.refresh_response_group_word_page_count(group_id) == 3
+    refreshed = workflow.get_response_group(group_id)
+    assert refreshed["word_page_count"] == 3
+    assert refreshed["word_page_count_size"] == path.stat().st_size
+    assert refreshed["word_page_count_mtime_ns"] == path.stat().st_mtime_ns

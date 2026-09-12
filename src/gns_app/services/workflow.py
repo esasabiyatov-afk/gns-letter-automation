@@ -7198,18 +7198,30 @@ class WorkflowService:
         group = self.get_response_group(group_id)
         if not group:
             raise WorkflowValidationError("Общий ответ не найден")
-        stored_count = int(group.get("word_page_count") or 0)
-        if stored_count > 0:
-            return stored_count
         path = ensure_within(
             Path(group["response_path"]), self.settings.responses_dir
         )
+        stat = path.stat()
+        stored_count = int(group.get("word_page_count") or 0)
+        if (
+            stored_count > 0
+            and group.get("word_page_count_size") == stat.st_size
+            and group.get("word_page_count_mtime_ns") == stat.st_mtime_ns
+        ):
+            return stored_count
         page_count = exact_word_page_count(path)
         if page_count:
             self.db.execute(
-                "UPDATE response_groups SET word_page_count = ?, updated_at = ? "
-                "WHERE id = ?",
-                (page_count, utc_now(), group_id),
+                "UPDATE response_groups SET word_page_count = ?, "
+                "word_page_count_size = ?, word_page_count_mtime_ns = ?, "
+                "updated_at = ? WHERE id = ?",
+                (
+                    page_count,
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                    utc_now(),
+                    group_id,
+                ),
             )
         return page_count
 

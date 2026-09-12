@@ -560,14 +560,17 @@
     syncActions();
   }
 
-  const missingWordPageCounts = [
+  const wordPageCountNodes = [
     ...document.querySelectorAll("[data-word-page-count][data-group-id]"),
-  ].filter((node) => node.textContent.includes("определяется"));
-  if (missingWordPageCounts.length) {
-    const groupIds = [...new Set(
-      missingWordPageCounts.map((node) => node.dataset.groupId),
-    )];
-    (async () => {
+  ];
+  if (wordPageCountNodes.length) {
+    let wordPageRefreshRunning = false;
+    const refreshWordPageCounts = async () => {
+      if (wordPageRefreshRunning) return;
+      wordPageRefreshRunning = true;
+      const groupIds = [...new Set(
+        wordPageCountNodes.map((node) => node.dataset.groupId),
+      )];
       for (const groupId of groupIds) {
         const nodes = () => [
           ...document.querySelectorAll("[data-word-page-count][data-group-id]"),
@@ -584,11 +587,16 @@
           });
         } catch (_) {
           nodes().forEach((node) => {
-            node.textContent = "Word · не удалось определить";
+            if (node.textContent.includes("определяется")) {
+              node.textContent = "Word · не удалось определить";
+            }
           });
         }
       }
-    })();
+      wordPageRefreshRunning = false;
+    };
+    refreshWordPageCounts();
+    window.addEventListener("focus", refreshWordPageCounts);
   }
 
   const createdOutlookMonitor = document.querySelector(
