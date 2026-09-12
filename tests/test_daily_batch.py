@@ -2990,3 +2990,34 @@ def test_created_response_stores_exact_word_page_count(workflow, monkeypatch):
     group_id, _ = _ready_response_letter(workflow)
 
     assert workflow.get_response_group(group_id)["word_page_count"] == 3
+
+
+def test_existing_response_page_count_is_calculated_without_opening_word(
+    workflow, monkeypatch
+):
+    group_id, _ = _ready_response_letter(workflow)
+    workflow.db.execute(
+        "UPDATE response_groups SET word_page_count = NULL WHERE id = ?",
+        (group_id,),
+    )
+    monkeypatch.setattr(
+        "gns_app.services.workflow.exact_word_page_count", lambda _path: 4
+    )
+
+    from starlette.testclient import TestClient
+
+    from gns_app import main
+
+    monkeypatch.setattr(main, "workflow", workflow)
+    client = TestClient(main.app)
+    page = client.get("/?tab=responses&response_view=created")
+    assert "Word · определяется…" in page.text
+    assert "страницы определятся при открытии" not in page.text
+
+    response = client.get(
+        f"/response-groups/{group_id}/word-page-count"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["page_count"] == 4
+    assert workflow.get_response_group(group_id)["word_page_count"] == 4

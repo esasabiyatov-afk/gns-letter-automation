@@ -17,7 +17,7 @@ from typing import Any
 from uuid import uuid4
 
 
-APP_VERSION = "0.1.6-office"
+APP_VERSION = "0.1.7-office"
 _MAX_LOG_BYTES = 2 * 1024 * 1024
 _MAX_ARCHIVES = 3
 _WRITE_LOCK = threading.Lock()

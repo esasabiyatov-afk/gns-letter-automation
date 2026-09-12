@@ -317,8 +317,9 @@
                     <small class="letter-recipient-email"
                            title="Получатель письма">{{ recipient_email }}{% if outlook_test_mode and not letter.outlook_message %} · тестовый режим{% endif %}</small>
                   {% endif %}
-                  <small class="word-page-count">
-                    Word · {% if group.word_page_count %}{{ group.word_page_count }} стр.{% else %}страницы определятся при открытии{% endif %}
+                  <small class="word-page-count" data-word-page-count
+                         data-group-id="{{ group.id }}">
+                    Word · {% if group.word_page_count %}{{ group.word_page_count }} стр.{% else %}определяется…{% endif %}
                   </small>
                 </div>
 

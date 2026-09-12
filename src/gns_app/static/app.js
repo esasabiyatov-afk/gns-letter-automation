@@ -560,6 +560,37 @@
     syncActions();
   }
 
+  const missingWordPageCounts = [
+    ...document.querySelectorAll("[data-word-page-count][data-group-id]"),
+  ].filter((node) => node.textContent.includes("определяется"));
+  if (missingWordPageCounts.length) {
+    const groupIds = [...new Set(
+      missingWordPageCounts.map((node) => node.dataset.groupId),
+    )];
+    (async () => {
+      for (const groupId of groupIds) {
+        const nodes = () => [
+          ...document.querySelectorAll("[data-word-page-count][data-group-id]"),
+        ].filter((node) => node.dataset.groupId === groupId);
+        try {
+          const response = await fetch(
+            `/response-groups/${encodeURIComponent(groupId)}/word-page-count`,
+            { cache: "no-store", headers: { Accept: "application/json" } },
+          );
+          const payload = await response.json();
+          if (!response.ok || !payload.page_count) throw new Error("missing count");
+          nodes().forEach((node) => {
+            node.textContent = `Word · ${payload.page_count} стр.`;
+          });
+        } catch (_) {
+          nodes().forEach((node) => {
+            node.textContent = "Word · не удалось определить";
+          });
+        }
+      }
+    })();
+  }
+
   const createdOutlookMonitor = document.querySelector(
     "[data-created-outlook-monitor]",
   );

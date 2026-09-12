@@ -2617,6 +2617,17 @@ def download_grouped_response(group_id: str):
     )
 
 
+@app.get("/response-groups/{group_id}/word-page-count")
+def grouped_response_word_page_count(group_id: str):
+    try:
+        page_count = workflow.refresh_response_group_word_page_count(group_id)
+    except (WorkflowValidationError, StorageError, OSError, ValueError) as exc:
+        return JSONResponse(
+            {"ok": False, "message": str(exc)}, status_code=404
+        )
+    return JSONResponse({"ok": True, "page_count": page_count})
+
+
 @app.post("/response-groups/{group_id}/open-for-print")
 def open_grouped_response_for_print(group_id: str):
     group = workflow.get_response_group(group_id)
