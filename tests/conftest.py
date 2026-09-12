@@ -96,13 +96,7 @@ def test_settings(
 @pytest.fixture
 def workflow(
     test_settings: Settings,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> WorkflowService:
-    # Word pagination is an external desktop integration.  Keep ordinary
-    # workflow tests deterministic and cover the worker contract separately.
-    monkeypatch.setattr(
-        "gns_app.services.workflow.exact_word_page_count", lambda _path: 1
-    )
     database = Database(test_settings.database_path)
     database.initialize()
     return WorkflowService(database, test_settings)

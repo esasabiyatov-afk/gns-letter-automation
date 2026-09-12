@@ -158,8 +158,6 @@
           <details class="compact-menu bulk-action-menu">
             <summary class="button button-secondary button-compact">Ещё</summary>
             <div class="compact-menu-panel">
-              <button type="submit" formaction="/response-letters/actions/open-word"
-                      data-response-action="open-word" disabled>Открыть Word</button>
               <button type="submit" formaction="/signed-response-scans/print-selected"
                       formtarget="_blank" data-response-action="print-signed" disabled>
                 Печатать подписанные PDF
@@ -317,10 +315,6 @@
                     <small class="letter-recipient-email"
                            title="Получатель письма">{{ recipient_email }}{% if outlook_test_mode and not letter.outlook_message %} · тестовый режим{% endif %}</small>
                   {% endif %}
-                  <small class="word-page-count" data-word-page-count
-                         data-group-id="{{ group.id }}">
-                    Word · {% if group.word_page_count %}{{ group.word_page_count }} стр.{% else %}определяется…{% endif %}
-                  </small>
                 </div>
 
                 <div class="letter-primary-action">

@@ -560,45 +560,6 @@
     syncActions();
   }
 
-  const wordPageCountNodes = [
-    ...document.querySelectorAll("[data-word-page-count][data-group-id]"),
-  ];
-  if (wordPageCountNodes.length) {
-    let wordPageRefreshRunning = false;
-    const refreshWordPageCounts = async () => {
-      if (wordPageRefreshRunning) return;
-      wordPageRefreshRunning = true;
-      const groupIds = [...new Set(
-        wordPageCountNodes.map((node) => node.dataset.groupId),
-      )];
-      for (const groupId of groupIds) {
-        const nodes = () => [
-          ...document.querySelectorAll("[data-word-page-count][data-group-id]"),
-        ].filter((node) => node.dataset.groupId === groupId);
-        try {
-          const response = await fetch(
-            `/response-groups/${encodeURIComponent(groupId)}/word-page-count`,
-            { cache: "no-store", headers: { Accept: "application/json" } },
-          );
-          const payload = await response.json();
-          if (!response.ok || !payload.page_count) throw new Error("missing count");
-          nodes().forEach((node) => {
-            node.textContent = `Word · ${payload.page_count} стр.`;
-          });
-        } catch (_) {
-          nodes().forEach((node) => {
-            if (node.textContent.includes("определяется")) {
-              node.textContent = "Word · не удалось определить";
-            }
-          });
-        }
-      }
-      wordPageRefreshRunning = false;
-    };
-    refreshWordPageCounts();
-    window.addEventListener("focus", refreshWordPageCounts);
-  }
-
   const createdOutlookMonitor = document.querySelector(
     "[data-created-outlook-monitor]",
   );

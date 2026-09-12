@@ -1713,7 +1713,7 @@ def mark_selected_response_letters_sent(
     )
 
 
-def _selected_word_action(letter_ids: list[str], *, print_now: bool) -> int:
+def _print_selected_word_responses(letter_ids: list[str]) -> int:
     groups = workflow.response_groups_for_letters(letter_ids)
     completed = 0
     for group in groups:
@@ -1721,11 +1721,7 @@ def _selected_word_action(letter_ids: list[str], *, print_now: bool) -> int:
             path = ensure_within(
                 Path(group["response_path"]), workflow.settings.responses_dir
             )
-            workflow.refresh_response_group_word_page_count(group["id"])
-            if print_now:
-                print_word_document(path)
-            else:
-                open_word_document(path)
+            print_word_document(path)
             workflow.mark_response_group_opened_for_print(
                 group["id"],
                 actor=workflow.get_active_employee() or "Сотрудник",
@@ -1733,29 +1729,15 @@ def _selected_word_action(letter_ids: list[str], *, print_now: bool) -> int:
             completed += 1
         except (StorageError, OSError, WordDesktopError) as exc:
             raise WorkflowValidationError(
-                "Не удалось открыть один из выбранных Word-ответов"
+                "Не удалось распечатать один из выбранных Word-ответов"
             ) from exc
     return completed
-
-
-@app.post("/response-letters/actions/open-word")
-def open_selected_word_responses(letter_ids: list[str] = Form(default=[])):
-    try:
-        count = _selected_word_action(letter_ids, print_now=False)
-    except WorkflowValidationError as exc:
-        return RedirectResponse(
-            "/today?error=" + quote(str(exc)), status_code=303
-        )
-    return RedirectResponse(
-        "/today?message=" + quote(f"Открыто Word-документов: {count}."),
-        status_code=303,
-    )
 
 
 @app.post("/response-letters/actions/print-word")
 def print_selected_word_responses(letter_ids: list[str] = Form(default=[])):
     try:
-        count = _selected_word_action(letter_ids, print_now=True)
+        count = _print_selected_word_responses(letter_ids)
     except WorkflowValidationError as exc:
         return RedirectResponse(
             "/today?error=" + quote(str(exc)), status_code=303
@@ -2617,17 +2599,6 @@ def download_grouped_response(group_id: str):
     )
 
 
-@app.get("/response-groups/{group_id}/word-page-count")
-def grouped_response_word_page_count(group_id: str):
-    try:
-        page_count = workflow.refresh_response_group_word_page_count(group_id)
-    except (WorkflowValidationError, StorageError, OSError, ValueError) as exc:
-        return JSONResponse(
-            {"ok": False, "message": str(exc)}, status_code=404
-        )
-    return JSONResponse({"ok": True, "page_count": page_count})
-
-
 @app.post("/response-groups/{group_id}/open-for-print")
 def open_grouped_response_for_print(group_id: str):
     group = workflow.get_response_group(group_id)
@@ -2643,7 +2614,6 @@ def open_grouped_response_for_print(group_id: str):
         )
         if not path.exists():
             raise OSError("missing response")
-        workflow.refresh_response_group_word_page_count(group_id)
         open_word_document(path)
         workflow.mark_response_group_opened_for_print(
             group_id,

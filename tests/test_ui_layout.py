@@ -774,6 +774,9 @@ def test_created_response_actions_are_reachable_without_card_expansion():
     assert "Подготовить черновик Outlook" in template
     assert "Открыть письмо повторно" in template
     assert "Скачать копию Word" in template
+    assert "/response-letters/actions/open-word" not in template
+    assert "data-word-page-count" not in template
+    assert "/word-page-count" not in script
     assert "Подробнее" not in template
     assert "/scan-session/start" in template
     sequence_start = template.index('class="outgoing-sequence-form"')

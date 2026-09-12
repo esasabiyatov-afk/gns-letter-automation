@@ -2549,7 +2549,6 @@ pre { white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow
 .bulk-action-menu .compact-menu-panel button:disabled { opacity: .45; cursor: default; }
 .selected-scan-upload-row { display: grid; gap: 5px; margin-bottom: 10px; }
 .selected-scan-upload-row strong { font-size: 12px; }
-.word-page-count { color: var(--muted); }
 .danger-link { color: var(--red) !important; }
 .trash-row { grid-template-columns: minmax(0, 1fr) auto auto; }
 .history-list-grid { grid-template-columns: 150px minmax(210px, 1fr) minmax(200px, 1fr) minmax(180px, .9fr) 30px; }

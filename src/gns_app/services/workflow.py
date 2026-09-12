@@ -78,7 +78,6 @@ from gns_app.services.taxpayer_service import (
     response_taxpayer_name,
 )
 from gns_app.services.word_service import WordTemplateError, WordTemplateService
-from gns_app.services.word_desktop import exact_word_page_count
 from gns_app.text_cleanup import clean_location, clean_taxpayer_name
 
 
@@ -1754,7 +1753,6 @@ class WorkflowService:
                         for letter in letters
                     ],
                 )
-                word_page_count = exact_word_page_count(temporary)
                 temporary.replace(output)
             except (OSError, WordTemplateError, ValueError):
                 temporary.unlink(missing_ok=True)
@@ -1763,7 +1761,7 @@ class WorkflowService:
                 """
                 UPDATE response_groups
                 SET district_place = ?, response_page_overflow = ?,
-                    word_page_count = ?,
+                    word_page_count = NULL,
                     opened_for_print_at = NULL, word_reopen_required = 1,
                     updated_at = ?
                 WHERE id = ?
@@ -1771,7 +1769,6 @@ class WorkflowService:
                 (
                     after,
                     int(likely_overflow),
-                    word_page_count,
                     now,
                     group["id"],
                 ),
@@ -6581,7 +6578,6 @@ class WorkflowService:
             group["taxpayers"],
             per_page,
         )
-        word_page_count = exact_word_page_count(output)
         letter_count = (
             group["taxpayer_count"] + per_page - 1
         ) // per_page
@@ -6614,7 +6610,7 @@ class WorkflowService:
                     per_page,
                     str(output),
                     int(likely_overflow),
-                    word_page_count,
+                    None,
                     now,
                     now,
                 ),
@@ -6840,7 +6836,6 @@ class WorkflowService:
         temporary: Path | None = None
         backup: Path | None = None
         likely_overflow = bool(stored_group["response_page_overflow"])
-        word_page_count = stored_group.get("word_page_count")
         if additions:
             temporary = output.with_name(
                 f".{output.stem}-late-merge-{uuid4().hex}.docx"
@@ -6862,7 +6857,6 @@ class WorkflowService:
                         str(letters[0]["outgoing_number"] or "")
                     ],
                 )
-                word_page_count = exact_word_page_count(temporary)
                 backup = output.with_name(
                     f".{output.stem}-before-late-merge-{uuid4().hex}.docx"
                 )
@@ -6989,7 +6983,7 @@ class WorkflowService:
                         UPDATE response_groups
                         SET taxpayer_count = ?, taxpayers_per_letter = ?,
                             response_page_overflow = ?,
-                            word_page_count = ?,
+                            word_page_count = NULL,
                             opened_for_print_at = NULL,
                             word_reopen_required = 1, updated_at = ?
                         WHERE id = ? AND status = 'created'
@@ -6998,7 +6992,6 @@ class WorkflowService:
                             len(combined),
                             len(combined),
                             int(likely_overflow),
-                            word_page_count,
                             now,
                             group_id,
                         ),
@@ -7194,37 +7187,6 @@ class WorkflowService:
                 (group_id, actor, now),
             )
 
-    def refresh_response_group_word_page_count(self, group_id: str) -> int | None:
-        group = self.get_response_group(group_id)
-        if not group:
-            raise WorkflowValidationError("Общий ответ не найден")
-        path = ensure_within(
-            Path(group["response_path"]), self.settings.responses_dir
-        )
-        stat = path.stat()
-        stored_count = int(group.get("word_page_count") or 0)
-        if (
-            stored_count > 0
-            and group.get("word_page_count_size") == stat.st_size
-            and group.get("word_page_count_mtime_ns") == stat.st_mtime_ns
-        ):
-            return stored_count
-        page_count = exact_word_page_count(path)
-        if page_count:
-            self.db.execute(
-                "UPDATE response_groups SET word_page_count = ?, "
-                "word_page_count_size = ?, word_page_count_mtime_ns = ?, "
-                "updated_at = ? WHERE id = ?",
-                (
-                    page_count,
-                    stat.st_size,
-                    stat.st_mtime_ns,
-                    utc_now(),
-                    group_id,
-                ),
-            )
-        return page_count
-
     @staticmethod
     def _canonical_outgoing_number(
         value: str | int | None,
@@ -7418,7 +7380,7 @@ class WorkflowService:
             raise WorkflowValidationError(
                 "Не удалось обновить исходящий номер в Word"
             ) from exc
-        return temporary, output, likely_overflow, exact_word_page_count(temporary)
+        return temporary, output, likely_overflow, None
 
     def _apply_outgoing_number_updates(
         self,
