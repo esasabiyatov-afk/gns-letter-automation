@@ -2925,3 +2925,68 @@ def test_office_spelling_aliases_share_one_response_group(workflow):
     assert len(groups) == 1
     assert groups[0]["taxpayer_count"] == 2
     assert groups[0]["gns_office_key"]
+
+
+def test_response_group_trash_preserves_word_and_releases_number(workflow):
+    group_id, letter = _ready_response_letter(workflow)
+    workflow.set_outgoing_number(letter["id"], "81234")
+    word_path = Path(workflow.get_response_group(group_id)["response_path"])
+
+    trash_id = workflow.move_response_group_to_trash(group_id)
+
+    assert word_path.is_file()
+    assert workflow.get_response_group(group_id)["status"] == "trashed"
+    assert workflow.get_response_letter(letter["id"])["outgoing_number"] is None
+    assert workflow.today_overview(view="created")["generated_groups"] == []
+
+    restored = workflow.restore_trash_item(trash_id)
+
+    assert restored["number_conflicts"] == 0
+    assert workflow.get_response_group(group_id)["status"] == "created"
+    assert workflow.get_response_letter(letter["id"])["outgoing_number"] == "81234"
+
+
+def test_response_group_trash_keeps_sent_outgoing_number(workflow):
+    group_id, letter = _ready_response_letter(workflow)
+    workflow.set_outgoing_number(letter["id"], "81235")
+    OutlookOutgoingService(
+        workflow.db, workflow.settings, OutlookService(object())
+    ).mark_sent_manually(workflow, letter["id"])
+
+    workflow.move_response_group_to_trash(group_id)
+
+    assert workflow.get_response_letter(letter["id"])["outgoing_number"] == "81235"
+
+
+def test_upload_trash_preserves_source_and_restores_processing_state(workflow):
+    case_id = _insert_ready_case(workflow, "12345678901234", 'ОсОО "Первый"')
+    case = workflow.get_case(case_id)
+    source = workflow.settings.uploads_dir / "kept-source.pdf"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"preserved source")
+    workflow.db.execute(
+        "UPDATE uploads SET stored_path = ? WHERE id = ?",
+        (str(source), case["upload_id"]),
+    )
+
+    trash_id = workflow.move_upload_to_trash(case["upload_id"])
+
+    assert source.is_file()
+    assert workflow.count_incoming_work() == 0
+    assert workflow.get_case(case_id)["status"] == "trashed"
+
+    workflow.restore_trash_item(trash_id)
+
+    assert source.is_file()
+    assert workflow.count_incoming_work() == 1
+    assert workflow.get_case(case_id)["status"] == "ready_for_abs"
+
+
+def test_created_response_stores_exact_word_page_count(workflow, monkeypatch):
+    monkeypatch.setattr(
+        "gns_app.services.workflow.exact_word_page_count", lambda _path: 3
+    )
+
+    group_id, _ = _ready_response_letter(workflow)
+
+    assert workflow.get_response_group(group_id)["word_page_count"] == 3

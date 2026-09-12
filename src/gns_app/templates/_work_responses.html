@@ -132,14 +132,6 @@
     {% endfor %}
     {% set pending_created_groups = created_split.pending %}
     {% set sent_created_groups = created_split.sent %}
-    {% set printable = namespace(count=0) %}
-    {% for created_group in overview.generated_groups %}
-      {% for created_letter in created_group.letters %}
-        {% if created_letter.signed_scan and created_letter.signed_scan.status == 'confirmed' %}
-          {% set printable.count = printable.count + 1 %}
-        {% endif %}
-      {% endfor %}
-    {% endfor %}
     <div class="work-section-toolbar response-toolbar"
          data-tour-anchor="created" data-created-outlook-monitor>
       <div>
@@ -147,20 +139,45 @@
         <p>Сначала откройте письмо в Word, проверьте и распечатайте его. Затем отсканируйте подписанный ответ.</p>
       </div>
       <div class="work-toolbar-actions created-toolbar-actions">
-        {% if printable.count %}
-          <form id="signed-copy-print-form" class="signed-copy-actions"
-                method="post" target="_blank"
-                action="/signed-response-scans/print-selected">
-            <button class="button button-secondary button-compact" type="submit"
-                    data-signed-copy-print disabled>
-              Печать выбранных
-            </button>
-            <button class="button button-quiet button-compact" type="button"
-                    data-signed-copy-select-all>Выбрать все</button>
-            <button class="button button-quiet button-compact" type="button"
-                    data-signed-copy-clear disabled>Снять выбор</button>
-          </form>
-        {% endif %}
+        <form id="signed-copy-print-form" class="signed-copy-actions"
+              method="post">
+          <span class="bulk-selection-count" data-response-selection-count>Выбрано: 0</span>
+          <button class="button button-quiet button-compact" type="button"
+                  data-response-select-all data-signed-copy-select-all>Выбрать ожидающие</button>
+          <button class="button button-quiet button-compact" type="button"
+                  data-response-clear data-signed-copy-clear disabled>Снять выбор</button>
+          <button class="button button-primary button-compact" type="submit"
+                  formaction="/response-letters/actions/send"
+                  data-response-action="send" disabled>Отправить</button>
+          <button class="button button-secondary button-compact" type="submit"
+                  formaction="/response-letters/actions/print-word"
+                  data-response-action="print-word" disabled
+                  onclick="return confirm('Распечатать выбранные Word-ответы?');">
+            Печатать Word
+          </button>
+          <details class="compact-menu bulk-action-menu">
+            <summary class="button button-secondary button-compact">Ещё</summary>
+            <div class="compact-menu-panel">
+              <button type="submit" formaction="/response-letters/actions/open-word"
+                      data-response-action="open-word" disabled>Открыть Word</button>
+              <button type="submit" formaction="/signed-response-scans/print-selected"
+                      formtarget="_blank" data-response-action="print-signed" disabled>
+                Печатать подписанные PDF
+              </button>
+              <button type="button" data-response-upload disabled>Загрузить сканы</button>
+              <button type="submit" formaction="/response-letters/actions/mark-sent"
+                      data-response-action="mark-sent" disabled
+                      onclick="return confirm('Отметить выбранные письма отправленными?');">
+                Отметить отправленными
+              </button>
+              <button type="submit" formaction="/response-letters/actions/trash"
+                      data-response-action="trash" disabled
+                      onclick="return confirm('Переместить выбранные ответы в корзину?');">
+                В корзину
+              </button>
+            </div>
+          </details>
+        </form>
         {% if overview.unnumbered_letters %}
           <form class="outgoing-sequence-form" method="post"
                 action="/today/outgoing-numbers/assign">
@@ -225,18 +242,19 @@
           {% endif %}
           <div class="created-letter-list">
             {% for letter in group.letters %}
+              {% set letter_is_sent = letter.outlook_message and letter.outlook_message.status == 'sent' %}
               <div class="created-letter-line" id="letter-{{ letter.id }}"
                    data-created-outlook-row="{{ letter.id }}"
                    data-outlook-state="{% if letter.outlook_message %}{{ letter.outlook_message.id or '' }}|{{ letter.outlook_message.status or '' }}|{{ letter.outlook_message.updated_at or '' }}|{{ letter.outlook_message.resend_status or '' }}|{{ letter.outlook_message.resent_at or '' }}{% else %}none{% endif %}">
-                {% if letter.signed_scan and letter.signed_scan.status == 'confirmed' %}
-                  <label class="signed-copy-select" title="Выбрать подписанный ответ для печати">
-                    <input type="checkbox" name="letter_ids" value="{{ letter.id }}"
-                           form="signed-copy-print-form"
-                           aria-label="Выбрать ответ {{ group.recipient_display_name }} для печати">
-                  </label>
-                {% else %}
-                  <span class="signed-copy-select-placeholder" aria-hidden="true"></span>
-                {% endif %}
+                <label class="signed-copy-select" title="Выбрать ответ">
+                  <input type="checkbox" name="letter_ids" value="{{ letter.id }}"
+                         form="signed-copy-print-form" data-response-select
+                         data-pending="{{ 'false' if letter_is_sent else 'true' }}"
+                         data-sendable="{{ 'true' if (not letter_is_sent and letter.outgoing_number and letter.signed_scan and letter.signed_scan.status == 'confirmed' and (outlook_test_mode or letter.gns_email)) else 'false' }}"
+                         data-has-scan="{{ 'true' if letter.signed_scan and letter.signed_scan.status == 'confirmed' else 'false' }}"
+                         data-label="{{ group.recipient_display_name }}{% if group.letters|length > 1 %} · письмо {{ letter.letter_order }}{% endif %}"
+                         aria-label="Выбрать ответ {{ group.recipient_display_name }}">
+                </label>
                 {% if group.letters|length > 1 %}
                   <span class="letter-order">Письмо {{ letter.letter_order }}</span>
                 {% endif %}
@@ -299,6 +317,9 @@
                     <small class="letter-recipient-email"
                            title="Получатель письма">{{ recipient_email }}{% if outlook_test_mode and not letter.outlook_message %} · тестовый режим{% endif %}</small>
                   {% endif %}
+                  <small class="word-page-count">
+                    Word · {% if group.word_page_count %}{{ group.word_page_count }} стр.{% else %}страницы определятся при открытии{% endif %}
+                  </small>
                 </div>
 
                 <div class="letter-primary-action">
@@ -361,7 +382,8 @@
                     </form>
                   {% elif group.opened_for_print_at %}
                     <form method="post"
-                          action="/response-letters/{{ letter.id }}/scan-session/start">
+                          action="/response-letters/{{ letter.id }}/scan-session/start"
+                          data-scan-start data-letter-id="{{ letter.id }}">
                       <input type="hidden" name="group_id" value="{{ group.id }}">
                       <button class="button button-primary button-compact" type="submit">
                         Сканировать
@@ -423,6 +445,12 @@
                         <button type="submit">Пересоздать черновик</button>
                       </form>
                     {% endif %}
+                    {% if loop.first %}
+                      <form method="post" action="/response-groups/{{ group.id }}/trash"
+                            onsubmit="return confirm('Переместить этот ответ и входящих в него лиц в корзину?');">
+                        <button type="submit" class="danger-link">В корзину</button>
+                      </form>
+                    {% endif %}
                   </div>
                 </details>
               </div>
@@ -482,6 +510,19 @@
     {% if active_letter and active_group %}
       {% include "_response_letter_drawer.html" %}
     {% endif %}
+
+    <dialog class="scan-upload-dialog" data-response-upload-dialog>
+      <form method="post" enctype="multipart/form-data"
+            action="/response-letters/actions/upload-scans"
+            data-response-upload-form>
+        <header><strong>Загрузить сканы</strong></header>
+        <div data-response-upload-list></div>
+        <div class="letter-drawer-actions">
+          <button class="button button-primary" type="submit">Загрузить</button>
+          <button class="button button-quiet" type="button" data-response-upload-close>Отмена</button>
+        </div>
+      </form>
+    </dialog>
 
   {% else %}
     <div class="work-section-toolbar response-toolbar"

@@ -1,4 +1,5 @@
-<aside id="letter-workflow" class="letter-drawer" aria-label="Подписанный ответ">
+<aside id="letter-workflow" class="letter-drawer" aria-label="Подписанный ответ"
+       data-scan-drawer data-letter-id="{{ active_letter.id }}">
   <header class="letter-drawer-header">
     <div>
       <p class="eyebrow">ПОДПИСАННЫЙ ОТВЕТ</p>
@@ -30,18 +31,18 @@
           </a>
           <strong>Лист {{ page.page_order }}</strong>
           <div class="scan-sheet-actions">
-            <form method="post" action="/signed-scan-sessions/{{ session.id }}/pages/{{ page.id }}/move">
+            <form method="post" action="/signed-scan-sessions/{{ session.id }}/pages/{{ page.id }}/move" data-scan-drawer-form>
               <input type="hidden" name="group_id" value="{{ active_group.id }}">
               <button name="direction" value="up" title="Переместить выше"
                       {% if loop.first %}disabled{% endif %}>↑</button>
               <button name="direction" value="down" title="Переместить ниже"
                       {% if loop.last %}disabled{% endif %}>↓</button>
             </form>
-            <form method="post" action="/signed-scan-sessions/{{ session.id }}/pages/{{ page.id }}/replace">
+            <form method="post" action="/signed-scan-sessions/{{ session.id }}/pages/{{ page.id }}/replace" data-scan-drawer-form>
               <input type="hidden" name="group_id" value="{{ active_group.id }}">
               <button title="Пересканировать">↻</button>
             </form>
-            <form method="post" action="/signed-scan-sessions/{{ session.id }}/pages/{{ page.id }}/remove">
+            <form method="post" action="/signed-scan-sessions/{{ session.id }}/pages/{{ page.id }}/remove" data-scan-drawer-form>
               <input type="hidden" name="group_id" value="{{ active_group.id }}">
               <button class="scan-sheet-remove" title="Убрать лист">×</button>
             </form>
@@ -52,16 +53,16 @@
       {% endfor %}
     </div>
     <div class="letter-drawer-actions">
-      <form method="post" action="/signed-scan-sessions/{{ session.id }}/pages/acquire">
+      <form method="post" action="/signed-scan-sessions/{{ session.id }}/pages/acquire" data-scan-drawer-form>
         <input type="hidden" name="group_id" value="{{ active_group.id }}">
         <button class="button button-primary" type="submit">Добавить лист</button>
       </form>
-      <form method="post" action="/signed-scan-sessions/{{ session.id }}/finalize">
+      <form method="post" action="/signed-scan-sessions/{{ session.id }}/finalize" data-scan-drawer-form>
         <input type="hidden" name="group_id" value="{{ active_group.id }}">
         <button class="button button-secondary" type="submit"
                 {% if not session.pages %}disabled{% endif %}>Сохранить скан</button>
       </form>
-      <form method="post" action="/signed-scan-sessions/{{ session.id }}/cancel">
+      <form method="post" action="/signed-scan-sessions/{{ session.id }}/cancel" data-scan-drawer-form>
         <input type="hidden" name="group_id" value="{{ active_group.id }}">
         <button class="button button-quiet" type="submit">Отменить сессию</button>
       </form>
@@ -71,7 +72,8 @@
       <strong>Получите листы со сканера или загрузите готовый файл.</strong>
     </div>
     <form method="post"
-          action="/response-letters/{{ active_letter.id }}/scan-session/start">
+          action="/response-letters/{{ active_letter.id }}/scan-session/start"
+          data-scan-drawer-form>
       <input type="hidden" name="group_id" value="{{ active_group.id }}">
       <button class="button button-primary" type="submit">Начать сканирование</button>
     </form>
@@ -116,7 +118,8 @@
   <details class="ready-scan-upload" {% if not active_letter.scan_session and not active_letter.signed_scan %}open{% endif %}>
     <summary>Загрузить готовый файл с МФУ</summary>
     <form method="post" enctype="multipart/form-data"
-          action="/response-letters/{{ active_letter.id }}/scan-upload">
+          action="/response-letters/{{ active_letter.id }}/scan-upload"
+          data-scan-drawer-form>
       <input type="hidden" name="group_id" value="{{ active_group.id }}">
       <input type="file" name="scan_file"
              accept="application/pdf,image/tiff,image/png,image/jpeg,.pdf,.tif,.tiff,.png,.jpg,.jpeg"

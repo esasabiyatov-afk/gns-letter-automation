@@ -12,6 +12,7 @@ class UploadStatus(StrEnum):
     READY = "ready"
     COMPLETED = "completed"
     TECHNICAL_ERROR = "technical_error"
+    TRASHED = "trashed"
 
 
 class PageStatus(StrEnum):
@@ -24,6 +25,7 @@ class PageStatus(StrEnum):
     MANUALLY_CONFIRMED = "manually_confirmed"
     COMPLETED = "completed"
     TECHNICAL_ERROR = "technical_error"
+    TRASHED = "trashed"
 
 
 class PageType(StrEnum):
@@ -62,6 +64,7 @@ class CaseStatus(StrEnum):
     RESPONSE_CREATED = "response_created"
     COMPLETED = "completed"
     TECHNICAL_ERROR = "technical_error"
+    TRASHED = "trashed"
 
 
 class AbsStatus(StrEnum):

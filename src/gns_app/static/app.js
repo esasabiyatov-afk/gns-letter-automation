@@ -424,7 +424,10 @@
   const inlineNumberForms = [
     ...document.querySelectorAll("form[data-inline-number-form]"),
   ];
-  inlineNumberForms.forEach((form) => {
+  const bindInlineNumberForm = (form) => {
+    if (form.dataset.inlineNumberBound === "true") return;
+    form.dataset.inlineNumberBound = "true";
+    if (!inlineNumberForms.includes(form)) inlineNumberForms.push(form);
     const input = form.querySelector("[data-inline-number-input]");
     const state = form.querySelector("[data-inline-number-state]");
     if (!input) return;
@@ -465,42 +468,96 @@
       save();
     });
     input.addEventListener("change", save);
-  });
+  };
+  inlineNumberForms.forEach(bindInlineNumberForm);
 
-  const signedCopyPrintForm = document.querySelector("#signed-copy-print-form");
-  if (signedCopyPrintForm) {
-    const printButton = signedCopyPrintForm.querySelector("[data-signed-copy-print]");
-    const selectAllButton = signedCopyPrintForm.querySelector(
-      "[data-signed-copy-select-all]",
-    );
-    const clearButton = signedCopyPrintForm.querySelector("[data-signed-copy-clear]");
-    const checkboxes = () => [
-      ...document.querySelectorAll(
-        'input[type="checkbox"][form="signed-copy-print-form"]:not(:disabled)',
-      ),
-    ];
-    const syncSignedCopyActions = () => {
-      const available = checkboxes();
-      const selectedCount = available.filter((checkbox) => checkbox.checked).length;
-      if (printButton) printButton.disabled = selectedCount === 0;
-      if (selectAllButton) {
-        selectAllButton.disabled = available.length === 0
-          || selectedCount === available.length;
-      }
-      if (clearButton) clearButton.disabled = selectedCount === 0;
+  const responseBulkForm = document.querySelector("#signed-copy-print-form");
+  if (responseBulkForm) {
+    const checkboxes = () => [...document.querySelectorAll("[data-response-select]")];
+    const selected = () => checkboxes().filter((checkbox) => checkbox.checked);
+    const count = responseBulkForm.querySelector("[data-response-selection-count]");
+    const selectAll = responseBulkForm.querySelector("[data-response-select-all]");
+    const clear = responseBulkForm.querySelector("[data-response-clear]");
+    const storageKey = "gns-selected-response-letters";
+    const persistSelection = () => {
+      try {
+        sessionStorage.setItem(
+          storageKey,
+          JSON.stringify(selected().map((checkbox) => checkbox.value)),
+        );
+      } catch (_) {}
     };
-    selectAllButton?.addEventListener("click", () => {
-      checkboxes().forEach((checkbox) => { checkbox.checked = true; });
-      syncSignedCopyActions();
+    const syncActions = () => {
+      const chosen = selected();
+      if (count) count.textContent = `Выбрано: ${chosen.length}`;
+      if (clear) clear.disabled = chosen.length === 0;
+      responseBulkForm.querySelectorAll("[data-response-action]").forEach((button) => {
+        const action = button.dataset.responseAction;
+        if (action === "send") {
+          button.disabled = !chosen.some((item) => item.dataset.sendable === "true");
+        } else if (action === "print-signed") {
+          button.disabled = !chosen.some((item) => item.dataset.hasScan === "true");
+        } else {
+          button.disabled = chosen.length === 0;
+        }
+      });
+      const upload = responseBulkForm.querySelector("[data-response-upload]");
+      if (upload) {
+        upload.disabled = !chosen.some((item) => (
+          item.dataset.pending === "true" && item.dataset.hasScan !== "true"
+        ));
+      }
+      persistSelection();
+    };
+    try {
+      const saved = new Set(JSON.parse(sessionStorage.getItem(storageKey) || "[]"));
+      checkboxes().forEach((checkbox) => { checkbox.checked = saved.has(checkbox.value); });
+    } catch (_) {}
+    selectAll?.addEventListener("click", () => {
+      checkboxes().forEach((checkbox) => {
+        checkbox.checked = checkbox.dataset.pending === "true";
+      });
+      syncActions();
     });
-    clearButton?.addEventListener("click", () => {
+    clear?.addEventListener("click", () => {
       checkboxes().forEach((checkbox) => { checkbox.checked = false; });
-      syncSignedCopyActions();
+      syncActions();
     });
-    checkboxes().forEach((checkbox) => {
-      checkbox.addEventListener("change", syncSignedCopyActions);
+    document.addEventListener("change", (event) => {
+      if (event.target.matches("[data-response-select]")) syncActions();
     });
-    syncSignedCopyActions();
+
+    const dialog = document.querySelector("[data-response-upload-dialog]");
+    const uploadList = dialog?.querySelector("[data-response-upload-list]");
+    responseBulkForm.querySelector("[data-response-upload]")?.addEventListener("click", () => {
+      const targets = selected().filter((item) => (
+        item.dataset.pending === "true" && item.dataset.hasScan !== "true"
+      ));
+      if (!dialog || !uploadList || !targets.length) return;
+      uploadList.replaceChildren();
+      targets.forEach((checkbox) => {
+        const row = document.createElement("label");
+        row.className = "selected-scan-upload-row";
+        const title = document.createElement("strong");
+        title.textContent = checkbox.dataset.label || "Ответ";
+        const id = document.createElement("input");
+        id.type = "hidden";
+        id.name = "letter_ids";
+        id.value = checkbox.value;
+        const file = document.createElement("input");
+        file.type = "file";
+        file.name = "scan_files";
+        file.accept = "application/pdf,image/tiff,image/png,image/jpeg,.pdf,.tif,.tiff,.png,.jpg,.jpeg";
+        file.required = true;
+        row.append(title, id, file);
+        uploadList.append(row);
+      });
+      dialog.showModal();
+    });
+    dialog?.querySelector("[data-response-upload-close]")?.addEventListener(
+      "click", () => dialog.close(),
+    );
+    syncActions();
   }
 
   const createdOutlookMonitor = document.querySelector(
@@ -526,7 +583,7 @@
         return input && input.value.trim() !== (input.dataset.originalNumber || "").trim();
       });
       const printSelection = Boolean(document.querySelector(
-        'input[type="checkbox"][form="signed-copy-print-form"]:checked',
+        "[data-response-select]:checked",
       ));
       const focusedLetter = new URL(window.location.href).searchParams.has(
         "focus_letter",
@@ -600,6 +657,105 @@
     });
   });
 
+  const refreshScanDrawer = async (letterId, responseUrl = "") => {
+    const response = await fetch(`/response-letters/${encodeURIComponent(letterId)}/drawer`, {
+      cache: "no-store",
+      headers: { Accept: "text/html" },
+    });
+    if (!response.ok) throw new Error("scan drawer unavailable");
+    const wrapper = document.createElement("div");
+    wrapper.innerHTML = await response.text();
+    const fresh = wrapper.querySelector("[data-scan-drawer]");
+    if (!fresh) throw new Error("scan drawer missing");
+    const current = document.querySelector("[data-scan-drawer]");
+    if (current) current.replaceWith(fresh);
+    else document.body.append(fresh);
+    if (responseUrl) {
+      const resultUrl = new URL(responseUrl, window.location.href);
+      const text = resultUrl.searchParams.get("error") || resultUrl.searchParams.get("message");
+      if (text) {
+        const state = document.createElement("div");
+        state.className = resultUrl.searchParams.has("error")
+          ? "inline-state inline-state-error" : "inline-state";
+        state.textContent = text;
+        fresh.querySelector(".letter-drawer-header")?.after(state);
+      }
+    }
+  };
+
+  const refreshCreatedLetterRow = async (letterId) => {
+    const current = document.getElementById(`letter-${letterId}`);
+    if (!current) return;
+    const wasSelected = Boolean(
+      current.querySelector("[data-response-select]")?.checked,
+    );
+    const response = await fetch(window.location.href, {
+      cache: "no-store",
+      headers: { Accept: "text/html" },
+    });
+    if (!response.ok) return;
+    const documentCopy = new DOMParser().parseFromString(
+      await response.text(), "text/html",
+    );
+    const fresh = documentCopy.getElementById(`letter-${letterId}`);
+    if (!fresh) return;
+    const freshCheckbox = fresh.querySelector("[data-response-select]");
+    if (freshCheckbox) freshCheckbox.checked = wasSelected;
+    current.replaceWith(fresh);
+    const form = fresh.querySelector("form[data-inline-number-form]");
+    if (form) bindInlineNumberForm(form);
+    freshCheckbox?.dispatchEvent(new Event("change", { bubbles: true }));
+  };
+
+  document.addEventListener("submit", async (event) => {
+    const form = event.target.closest("[data-scan-drawer-form], [data-scan-start]");
+    if (!form) return;
+    event.preventDefault();
+    const letterId = form.dataset.letterId
+      || document.querySelector("[data-scan-drawer]")?.dataset.letterId;
+    if (!letterId) return;
+    if (!document.querySelector("[data-scan-drawer]")) {
+      const waiting = document.createElement("aside");
+      waiting.className = "letter-drawer";
+      waiting.dataset.scanDrawer = "";
+      waiting.dataset.letterId = letterId;
+      waiting.innerHTML = '<div class="letter-drawer-empty"><strong>Сканирование…</strong></div>';
+      document.body.append(waiting);
+    }
+    form.querySelectorAll("button, input[type='submit']").forEach((item) => {
+      item.disabled = true;
+    });
+    try {
+      const formData = new FormData(form);
+      const submitter = event.submitter;
+      if (submitter?.name) formData.append(submitter.name, submitter.value);
+      const result = await fetch(form.action, {
+        method: "POST",
+        body: formData,
+        redirect: "manual",
+      });
+      const resultUrl = result.headers.get("Location") || "";
+      await refreshScanDrawer(letterId, resultUrl);
+      await refreshCreatedLetterRow(letterId);
+    } catch (_) {
+      const drawer = document.querySelector("[data-scan-drawer]");
+      const state = document.createElement("div");
+      state.className = "inline-state inline-state-error";
+      state.textContent = "Не удалось обновить панель сканирования.";
+      drawer?.prepend(state);
+    }
+  });
+
+  document.addEventListener("click", (event) => {
+    const close = event.target.closest(".letter-drawer-close");
+    if (!close) return;
+    event.preventDefault();
+    close.closest("[data-scan-drawer]")?.remove();
+    const url = new URL(window.location.href);
+    url.searchParams.delete("focus_letter");
+    history.replaceState({}, "", url);
+  });
+
   const workflowTabs = [...document.querySelectorAll("[data-workflow-tab]")];
   const workflowPanels = [...document.querySelectorAll("[data-workflow-panel]")];
   if (workflowTabs.length && workflowPanels.length) {
@@ -668,33 +824,18 @@
     });
   }
 
-  const officeFilter = document.querySelector("[data-office-filter]");
-  const officeRows = [...document.querySelectorAll("[data-office-row]")];
-  const officeEmpty = document.querySelector("[data-office-empty]");
-  officeFilter?.addEventListener("input", () => {
-    const query = officeFilter.value.trim().toLocaleLowerCase("ru");
-    let visible = 0;
-    officeRows.forEach((row) => {
-      const matches = !query || (row.dataset.officeSearch || "")
-        .toLocaleLowerCase("ru").includes(query);
-      row.hidden = !matches;
-      if (matches) visible += 1;
-    });
-    if (officeEmpty) officeEmpty.hidden = visible > 0;
-  });
-
   let settingsDirty = false;
+  const markSettingsDirty = () => {
+    settingsDirty = true;
+    if (settingsSaveState) {
+      settingsSaveState.textContent = "Есть несохранённые изменения";
+      settingsSaveState.classList.add("is-dirty");
+      settingsSaveState.classList.remove("is-saving");
+    }
+  };
   document.querySelectorAll("[data-settings-form]").forEach((form) => {
-    const markDirty = () => {
-      settingsDirty = true;
-      if (settingsSaveState) {
-        settingsSaveState.textContent = "Есть несохранённые изменения";
-        settingsSaveState.classList.add("is-dirty");
-        settingsSaveState.classList.remove("is-saving");
-      }
-    };
-    form.addEventListener("input", markDirty);
-    form.addEventListener("change", markDirty);
+    form.addEventListener("input", markSettingsDirty);
+    form.addEventListener("change", markSettingsDirty);
     form.addEventListener("submit", () => {
       settingsDirty = false;
       if (settingsSaveState) {
@@ -704,6 +845,191 @@
       }
     });
   });
+
+  const officeDirectory = document.querySelector("[data-office-directory]");
+  const officeFilter = document.querySelector("[data-office-filter]");
+  const officeList = document.querySelector("[data-office-list]");
+  const officeEmpty = document.querySelector("[data-office-empty]");
+  const officeSaveResult = document.querySelector("[data-office-save-result]");
+  const officeRows = () => [...document.querySelectorAll("[data-office-row]")];
+  const updateOfficeSearch = (row) => {
+    row.dataset.officeSearch = [...row.querySelectorAll("input")]
+      .filter((input) => input.type !== "checkbox")
+      .map((input) => input.value)
+      .join(" ");
+  };
+  const filterOfficeRows = () => {
+    const query = officeFilter?.value.trim().toLocaleLowerCase("ru") || "";
+    let visible = 0;
+    officeRows().forEach((row) => {
+      const matches = !query || (row.dataset.officeSearch || "")
+        .toLocaleLowerCase("ru").includes(query);
+      row.hidden = row.dataset.deleted === "true" || !matches;
+      if (!row.hidden) visible += 1;
+    });
+    if (officeEmpty) officeEmpty.hidden = visible > 0;
+  };
+  officeFilter?.addEventListener("input", filterOfficeRows);
+
+  const makeOfficeRow = (values) => {
+    const row = document.createElement("div");
+    row.className = "office-settings-row is-new";
+    row.dataset.officeRow = "";
+    row.innerHTML = `
+      <div class="office-settings-form">
+        <label class="field"><span>Район / город</span><input name="district_place" required></label>
+        <label class="field"><span>Основная почта</span><input type="email" name="email_address"></label>
+        <div class="office-email-stack">
+          <label class="field"><span>Резервные почты</span><input name="backup_emails"></label>
+          <label class="office-domain-toggle"><input type="checkbox" name="salyk_backup_enabled" value="true"><span>Добавлять адрес с тем же логином @salyk.kg</span></label>
+        </div>
+        <label class="field office-alias-field"><span>Алиасы</span><input name="aliases"></label>
+      </div>
+      <button class="button button-danger office-delete-button" type="button" data-office-delete-row>Удалить</button>`;
+    Object.entries(values).forEach(([name, value]) => {
+      const input = row.querySelector(`[name="${name}"]`);
+      if (input) input.value = value;
+    });
+    updateOfficeSearch(row);
+    return row;
+  };
+
+  document.querySelector("[data-office-add]")?.addEventListener("click", () => {
+    const source = document.querySelector("[data-office-new]");
+    const district = source?.querySelector('[name="district_place"]')?.value.trim();
+    if (!source || !district) {
+      source?.querySelector('[name="district_place"]')?.focus();
+      return;
+    }
+    const values = {};
+    source.querySelectorAll("input").forEach((input) => {
+      values[input.name] = input.type === "checkbox" ? input.checked : input.value;
+    });
+    const row = makeOfficeRow(values);
+    row.querySelector('[name="salyk_backup_enabled"]').checked = Boolean(
+      values.salyk_backup_enabled,
+    );
+    officeList?.prepend(row);
+    source.querySelectorAll("input").forEach((input) => {
+      if (input.type === "checkbox") input.checked = false;
+      else input.value = "";
+    });
+    markSettingsDirty();
+    filterOfficeRows();
+  });
+
+  officeDirectory?.addEventListener("input", (event) => {
+    const row = event.target.closest("[data-office-row]");
+    if (row) {
+      updateOfficeSearch(row);
+      markSettingsDirty();
+      filterOfficeRows();
+    } else if (event.target.closest("[data-office-new]")) {
+      markSettingsDirty();
+    }
+  });
+  officeDirectory?.addEventListener("change", (event) => {
+    if (event.target.closest("[data-office-row], [data-office-new]")) {
+      markSettingsDirty();
+    }
+  });
+  officeDirectory?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-office-delete-row]");
+    if (!button) return;
+    const row = button.closest("[data-office-row]");
+    if (!row || !window.confirm("Переместить район из справочника?")) return;
+    if (row.dataset.officeId) {
+      row.dataset.deleted = "true";
+      row.hidden = true;
+    } else {
+      row.remove();
+    }
+    markSettingsDirty();
+    filterOfficeRows();
+  });
+
+  document.querySelector("[data-office-save-all]")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    const offices = officeRows().map((row) => ({
+      office_id: row.dataset.officeId || null,
+      deleted: row.dataset.deleted === "true",
+      district_place: row.querySelector('[name="district_place"]')?.value || "",
+      email_address: row.querySelector('[name="email_address"]')?.value || "",
+      backup_emails: row.querySelector('[name="backup_emails"]')?.value || "",
+      aliases: row.querySelector('[name="aliases"]')?.value || "",
+      salyk_backup_enabled: Boolean(
+        row.querySelector('[name="salyk_backup_enabled"]')?.checked,
+      ),
+    }));
+    const newSource = document.querySelector("[data-office-new]");
+    const pendingNew = newSource ? {
+      district_place: newSource.querySelector('[name="district_place"]')?.value.trim() || "",
+      email_address: newSource.querySelector('[name="email_address"]')?.value || "",
+      backup_emails: newSource.querySelector('[name="backup_emails"]')?.value || "",
+      aliases: newSource.querySelector('[name="aliases"]')?.value || "",
+      salyk_backup_enabled: Boolean(
+        newSource.querySelector('[name="salyk_backup_enabled"]')?.checked,
+      ),
+    } : null;
+    const hasPendingNew = pendingNew && Object.entries(pendingNew).some(
+      ([key, value]) => key === "salyk_backup_enabled" ? value : String(value).trim(),
+    );
+    if (hasPendingNew && !pendingNew.district_place) {
+      if (officeSaveResult) officeSaveResult.textContent = "Укажите район или город.";
+      newSource.querySelector('[name="district_place"]')?.focus();
+      return;
+    }
+    if (hasPendingNew) offices.push(pendingNew);
+    button.disabled = true;
+    if (officeSaveResult) officeSaveResult.textContent = "Сохраняем…";
+    try {
+      const response = await fetch("/settings/offices/save-all", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ offices }),
+      });
+      const payload = await response.json();
+      if (!response.ok || !payload.ok) throw new Error(payload.message || "Ошибка сохранения");
+      officeRows().filter((row) => row.dataset.deleted === "true")
+        .forEach((row) => row.remove());
+      const activeRows = officeRows();
+      let savedIndex = 0;
+      activeRows.forEach((row) => {
+        if (!row.dataset.officeId) {
+          row.dataset.officeId = String(payload.saved[savedIndex]?.office_id || "");
+          row.classList.remove("is-new");
+        }
+        savedIndex += 1;
+      });
+      if (hasPendingNew) {
+        const row = makeOfficeRow(pendingNew);
+        row.dataset.officeId = String(
+          payload.saved[savedIndex]?.office_id || "",
+        );
+        row.querySelector('[name="salyk_backup_enabled"]').checked = Boolean(
+          pendingNew.salyk_backup_enabled,
+        );
+        row.classList.remove("is-new");
+        officeList?.prepend(row);
+        newSource.querySelectorAll("input").forEach((input) => {
+          if (input.type === "checkbox") input.checked = false;
+          else input.value = "";
+        });
+      }
+      settingsDirty = false;
+      if (officeSaveResult) officeSaveResult.textContent = payload.message;
+      if (settingsSaveState) {
+        settingsSaveState.textContent = "Все изменения сохранены";
+        settingsSaveState.classList.remove("is-dirty", "is-saving");
+      }
+      filterOfficeRows();
+    } catch (error) {
+      if (officeSaveResult) officeSaveResult.textContent = error.message;
+    } finally {
+      button.disabled = false;
+    }
+  });
+
   window.addEventListener("beforeunload", (event) => {
     if (!settingsDirty) return;
     event.preventDefault();

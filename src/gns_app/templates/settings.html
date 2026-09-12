@@ -195,16 +195,15 @@
   </section>
 
   <section class="settings-section" role="tabpanel"
-           data-settings-panel="offices" hidden>
+           data-settings-panel="offices" data-office-directory hidden>
     <section class="settings-card">
       <header>
         <h2>Добавить район или город</h2>
       </header>
-      <form method="post" action="/settings/offices/save"
-            class="office-settings-form" data-settings-form>
+      <div class="office-settings-form" data-office-new>
         <label class="field">
           <span>Район / город</span>
-          <input name="district_place" required placeholder="по г.Ош Ошской области">
+          <input name="district_place" placeholder="по г.Ош Ошской области">
         </label>
         <label class="field">
           <span>Основная почта</span>
@@ -224,8 +223,9 @@
           <span>Алиасы</span>
           <input name="aliases" placeholder="Старое название, сокращение">
         </label>
-        <button class="button button-primary" type="submit">Добавить</button>
-      </form>
+        <button class="button button-primary" type="button"
+                data-office-add>Добавить в список</button>
+      </div>
     </section>
 
     <section class="settings-card">
@@ -237,10 +237,9 @@
       <div class="office-settings-list" data-office-list>
         {% for office in gns_offices %}
           <div class="office-settings-row" data-office-row
+               data-office-id="{{ office.id }}"
                data-office-search="{{ office.district_place|lower }} {{ office.delivery_emails|join(' ') }} {{ office.aliases|join(' ')|lower }}">
-            <form method="post" action="/settings/offices/save"
-                  class="office-settings-form" data-settings-form>
-              <input type="hidden" name="office_id" value="{{ office.id }}">
+            <div class="office-settings-form">
               <label class="field">
                 <span>Район / город</span>
                 <input name="district_place" value="{{ office.district_place }}"
@@ -274,17 +273,9 @@
                 <input name="aliases"
                        value="{{ office.aliases|join(', ') }}">
               </label>
-              <button class="button button-secondary" type="submit">
-                Сохранить
-              </button>
-            </form>
-            <form method="post" action="/settings/offices/{{ office.id }}/delete"
-                  class="office-delete-form">
-              <button class="button button-danger" type="submit"
-                      onclick="return confirm('Удалить район из справочника?');">
-                Удалить
-              </button>
-            </form>
+            </div>
+            <button class="button button-danger office-delete-button"
+                    type="button" data-office-delete-row>Удалить</button>
           </div>
         {% endfor %}
       </div>
@@ -292,6 +283,11 @@
         Ничего не найдено.
       </p>
     </section>
+    <div class="settings-submit-bar office-save-bar">
+      <span data-office-save-result></span>
+      <button class="button button-primary" type="button"
+              data-office-save-all>Сохранить все районы</button>
+    </div>
   </section>
 
   <section class="settings-section" role="tabpanel"

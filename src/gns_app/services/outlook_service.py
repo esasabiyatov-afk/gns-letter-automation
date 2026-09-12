@@ -3348,6 +3348,7 @@ class OutlookOutgoingService:
     def send_all_ready_messages(
         self,
         workflow: OutlookWorkflow,
+        letter_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         """Send every complete production response; isolate per-letter errors."""
 
@@ -3356,8 +3357,17 @@ class OutlookOutgoingService:
                 "Для тестового режима используется отдельная отправка."
             )
         with self._draft_lock:
+            requested = list(dict.fromkeys(str(item) for item in (letter_ids or []) if item))
+            selected_clause = ""
+            parameters: tuple[Any, ...] = ()
+            if letter_ids is not None:
+                if not requested:
+                    return {"ready": 0, "sent": [], "errors": []}
+                placeholders = ",".join("?" for _ in requested)
+                selected_clause = f" AND response_letters.id IN ({placeholders})"
+                parameters = tuple(requested)
             letters = self.db.fetch_all(
-                """
+                f"""
                 SELECT response_letters.id
                 FROM response_letters
                 JOIN response_groups
@@ -3373,6 +3383,7 @@ class OutlookOutgoingService:
                         AND signed_response_scans.page_count > 0
                   )
                   AND response_letters.taxpayer_count > 0
+                  {selected_clause}
                   AND NOT EXISTS (
                       SELECT 1 FROM outlook_outgoing_messages
                       WHERE outlook_outgoing_messages.response_letter_id =
@@ -3384,7 +3395,8 @@ class OutlookOutgoingService:
                 ORDER BY response_groups.created_at, response_groups.rowid,
                          CAST(response_letters.outgoing_number AS INTEGER),
                          response_letters.letter_order
-                """
+                """,
+                parameters,
             )
             sent: list[str] = []
             errors: list[dict[str, str]] = []

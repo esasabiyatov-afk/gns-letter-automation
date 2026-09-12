@@ -109,8 +109,14 @@
         <span class="status status-{{ upload.status }}">
           {{ status_labels.get(upload.status, upload.status) }}
         </span>
-        <a class="button button-secondary button-compact"
-           href="/uploads/{{ upload.id }}">Открыть</a>
+        <div class="compact-row-actions">
+          <a class="button button-secondary button-compact"
+             href="/uploads/{{ upload.id }}">Открыть</a>
+          <form method="post" action="/uploads/{{ upload.id }}/trash"
+                onsubmit="return confirm('Переместить это входящее письмо в корзину?');">
+            <button class="button button-quiet button-compact" type="submit">В корзину</button>
+          </form>
+        </div>
       </article>
     {% else %}
       <div class="empty-state large">

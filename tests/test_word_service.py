@@ -83,7 +83,15 @@ def test_renders_non_bishkek_city_with_its_region(tmp_path, templates_dir):
         [{"name": 'ОсОО "Тест"', "inn": "02312201410117"}],
     )
 
-    assert "по г.Ош Ошской области" in _all_word_text(output)
+    assert "по г.Ош\nОшской области" in _all_word_text(output)
+
+
+def test_word_location_keeps_bishkek_on_one_line(templates_dir):
+    service = WordTemplateService(templates_dir)
+
+    assert service._location_for_word(
+        "по Ленинскому району города Бишкек"
+    ) == "по Ленинскому району г.Бишкек"
 
 
 def test_render_returns_overflow_flag_alongside_path(tmp_path, templates_dir):

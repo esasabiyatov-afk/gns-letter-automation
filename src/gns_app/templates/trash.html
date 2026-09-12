@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Корзина · Автоматизатор писем{% endblock %}
+{% block content %}
+<header class="history-header">
+  <div>
+    <p class="eyebrow">ВОССТАНОВЛЕНИЕ</p>
+    <h1>Корзина</h1>
+  </div>
+  <a class="button button-secondary button-compact" href="/history">← История писем</a>
+</header>
+{% if message %}<div class="inline-state">{{ message }}</div>{% endif %}
+{% if error %}<div class="inline-state inline-state-error">{{ error }}</div>{% endif %}
+<section class="work-section">
+  <div class="compact-list">
+    {% for item in trash_items %}
+      <article class="compact-list-row trash-row">
+        <div class="compact-primary">
+          <strong>{{ item.label }}</strong>
+          <small>{{ 'Входящее письмо' if item.entity_type == 'upload' else 'Готовый ответ' }}</small>
+        </div>
+        <time>{{ item.deleted_at[:16].replace('T', ' ') }}</time>
+        <form method="post" action="/trash/{{ item.id }}/restore">
+          <button class="button button-secondary button-compact" type="submit">Восстановить</button>
+        </form>
+      </article>
+    {% else %}
+      <div class="empty-state large"><strong>Корзина пуста</strong></div>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}

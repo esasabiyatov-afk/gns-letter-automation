@@ -263,6 +263,7 @@ CREATE TABLE IF NOT EXISTS response_groups (
     taxpayers_per_letter INTEGER NOT NULL DEFAULT 1,
     response_path TEXT,
     response_page_overflow INTEGER,
+    word_page_count INTEGER,
     opened_for_print_at TEXT,
     word_reopen_required INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
@@ -407,6 +408,22 @@ CREATE TABLE IF NOT EXISTS outlook_outgoing_messages (
 
 CREATE INDEX IF NOT EXISTS idx_outlook_outgoing_letter
 ON outlook_outgoing_messages(response_letter_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS trash_items (
+    id TEXT PRIMARY KEY,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    label TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    deleted_by TEXT NOT NULL,
+    deleted_at TEXT NOT NULL,
+    restored_by TEXT,
+    restored_at TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trash_items_active
+ON trash_items(entity_type, entity_id)
+WHERE restored_at IS NULL;
 """
 
 
@@ -633,6 +650,10 @@ class Database:
             connection.execute(
                 "ALTER TABLE response_groups ADD COLUMN "
                 "word_reopen_required INTEGER NOT NULL DEFAULT 0"
+            )
+        if "word_page_count" not in existing:
+            connection.execute(
+                "ALTER TABLE response_groups ADD COLUMN word_page_count INTEGER"
             )
         groups = connection.execute(
             """

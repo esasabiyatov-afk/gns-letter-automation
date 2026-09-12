@@ -53,7 +53,11 @@ from gns_app.services.outlook_service import (
 from gns_app.services.registry_service import RegistryLookupError
 from gns_app.services.scanner_service import ScannerCancelled, ScannerError
 from gns_app.services.taxpayer_service import TaxpayerKind, classify_taxpayer
-from gns_app.services.word_desktop import WordDesktopError, open_word_document
+from gns_app.services.word_desktop import (
+    WordDesktopError,
+    open_word_document,
+    print_word_document,
+)
 from gns_app.services.workflow import (
     WorkflowService,
     WorkflowValidationError,
@@ -132,9 +136,9 @@ def _outlook_send_is_active() -> bool:
         return _outlook_send_active
 
 
-def _run_outlook_batch_send() -> None:
+def _run_outlook_batch_send(letter_ids: list[str] | None = None) -> None:
     try:
-        outlook_outgoing.send_all_ready_messages(workflow)
+        outlook_outgoing.send_all_ready_messages(workflow, letter_ids=letter_ids)
     except Exception as exc:
         record_exception(
             "outlook",
@@ -146,15 +150,18 @@ def _run_outlook_batch_send() -> None:
         _release_outlook_send()
 
 
-def _queue_outlook_batch_send() -> bool:
+def _queue_outlook_batch_send(letter_ids: list[str] | None = None) -> bool:
     if not _claim_outlook_send():
         return False
     try:
-        Thread(
+        thread_options = dict(
             target=_run_outlook_batch_send,
             name="gns-outlook-batch-send",
             daemon=True,
-        ).start()
+        )
+        if letter_ids is not None:
+            thread_options["args"] = (letter_ids,)
+        Thread(**thread_options).start()
     except Exception:
         _release_outlook_send()
         raise
@@ -1045,6 +1052,20 @@ def incoming_workspace_fragment(
     )
 
 
+@app.get("/response-letters/{letter_id}/drawer", response_class=HTMLResponse)
+def response_letter_drawer(request: Request, letter_id: str):
+    overview = workflow.today_overview(view="created")
+    for group in overview.get("generated_groups", []):
+        for letter in group.get("letters", []):
+            if str(letter.get("id")) == letter_id:
+                return templates.TemplateResponse(
+                    request,
+                    "_response_letter_drawer.html",
+                    context(request, active_letter=letter, active_group=group),
+                )
+    raise HTTPException(404, "Готовое письмо не найдено")
+
+
 @app.get("/today", response_class=HTMLResponse)
 def today(
     request: Request,
@@ -1099,6 +1120,92 @@ def letter_history(
             message=message,
             error=error,
         ),
+    )
+
+
+@app.get("/trash", response_class=HTMLResponse)
+def trash_page(request: Request, message: str = "", error: str = ""):
+    return templates.TemplateResponse(
+        request,
+        "trash.html",
+        context(
+            request,
+            trash_items=workflow.list_trash_items(),
+            message=message,
+            error=error,
+        ),
+    )
+
+
+@app.post("/uploads/{upload_id}/trash")
+def trash_upload(upload_id: str):
+    try:
+        workflow.move_upload_to_trash(
+            upload_id, actor=workflow.get_active_employee() or "Сотрудник"
+        )
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            "/?tab=incoming&error=" + quote(str(exc)), status_code=303
+        )
+    return RedirectResponse(
+        "/?tab=incoming&message=" + quote("Письмо перемещено в корзину."),
+        status_code=303,
+    )
+
+
+@app.post("/cases/{case_id}/trash")
+def trash_history_case(case_id: str):
+    case = workflow.get_case(case_id)
+    if not case:
+        return RedirectResponse(
+            "/history?error=" + quote("Обращение не найдено"), status_code=303
+        )
+    try:
+        workflow.move_upload_to_trash(
+            str(case["upload_id"]),
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            "/history?error=" + quote(str(exc)), status_code=303
+        )
+    return RedirectResponse(
+        "/history?message=" + quote("Входящее письмо перемещено в корзину."),
+        status_code=303,
+    )
+
+
+@app.post("/response-groups/{group_id}/trash")
+def trash_response_group(group_id: str):
+    try:
+        workflow.move_response_group_to_trash(
+            group_id, actor=workflow.get_active_employee() or "Сотрудник"
+        )
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            "/today?error=" + quote(str(exc)), status_code=303
+        )
+    return RedirectResponse(
+        "/today?message=" + quote("Ответ перемещён в корзину."),
+        status_code=303,
+    )
+
+
+@app.post("/trash/{trash_id}/restore")
+def restore_trash_item(trash_id: str):
+    try:
+        result = workflow.restore_trash_item(
+            trash_id, actor=workflow.get_active_employee() or "Сотрудник"
+        )
+    except (WorkflowValidationError, ValueError) as exc:
+        return RedirectResponse(
+            "/trash?error=" + quote(str(exc)), status_code=303
+        )
+    message = "Запись восстановлена."
+    if result.get("number_conflicts"):
+        message += " Прежний исходящий уже занят и оставлен пустым."
+    return RedirectResponse(
+        "/trash?message=" + quote(message), status_code=303
     )
 
 
@@ -1557,6 +1664,166 @@ def send_all_ready_outlook_messages():
     )
 
 
+@app.post("/response-letters/actions/send")
+def send_selected_response_letters(letter_ids: list[str] = Form(default=[])):
+    selected = list(dict.fromkeys(letter_ids))
+    if not selected:
+        return RedirectResponse(
+            "/today?error=" + quote("Выберите ответы для отправки"),
+            status_code=303,
+        )
+    started = _queue_outlook_batch_send(selected)
+    message = (
+        f"Отправка выбранных ответов запущена в фоне: {len(selected)}."
+        if started
+        else "Отправка писем уже выполняется."
+    )
+    return RedirectResponse(
+        f"/today?message={quote(message)}",
+        status_code=303,
+    )
+
+
+@app.post("/response-letters/actions/mark-sent")
+def mark_selected_response_letters_sent(
+    letter_ids: list[str] = Form(default=[]),
+):
+    selected = list(dict.fromkeys(letter_ids))
+    if not selected:
+        return RedirectResponse(
+            "/today?error=" + quote("Выберите ответы"), status_code=303
+        )
+    changed = 0
+    errors: list[str] = []
+    for letter_id in selected:
+        try:
+            result = outlook_outgoing.mark_sent_manually(workflow, letter_id)
+            if not result.get("already_sent"):
+                changed += 1
+        except OutlookIntegrationError as exc:
+            errors.append(str(exc))
+    if errors:
+        message = f"Отмечено: {changed}. Ошибок: {len(errors)}. {errors[0]}"
+        return RedirectResponse(
+            "/today?error=" + quote(message), status_code=303
+        )
+    return RedirectResponse(
+        "/today?message=" + quote(f"Отмечено отправленными: {changed}."),
+        status_code=303,
+    )
+
+
+def _selected_word_action(letter_ids: list[str], *, print_now: bool) -> int:
+    groups = workflow.response_groups_for_letters(letter_ids)
+    completed = 0
+    for group in groups:
+        try:
+            path = ensure_within(
+                Path(group["response_path"]), workflow.settings.responses_dir
+            )
+            workflow.refresh_response_group_word_page_count(group["id"])
+            if print_now:
+                print_word_document(path)
+            else:
+                open_word_document(path)
+            workflow.mark_response_group_opened_for_print(
+                group["id"],
+                actor=workflow.get_active_employee() or "Сотрудник",
+            )
+            completed += 1
+        except (StorageError, OSError, WordDesktopError) as exc:
+            raise WorkflowValidationError(
+                "Не удалось открыть один из выбранных Word-ответов"
+            ) from exc
+    return completed
+
+
+@app.post("/response-letters/actions/open-word")
+def open_selected_word_responses(letter_ids: list[str] = Form(default=[])):
+    try:
+        count = _selected_word_action(letter_ids, print_now=False)
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            "/today?error=" + quote(str(exc)), status_code=303
+        )
+    return RedirectResponse(
+        "/today?message=" + quote(f"Открыто Word-документов: {count}."),
+        status_code=303,
+    )
+
+
+@app.post("/response-letters/actions/print-word")
+def print_selected_word_responses(letter_ids: list[str] = Form(default=[])):
+    try:
+        count = _selected_word_action(letter_ids, print_now=True)
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            "/today?error=" + quote(str(exc)), status_code=303
+        )
+    return RedirectResponse(
+        "/today?message=" + quote(f"Передано на печать Word-документов: {count}."),
+        status_code=303,
+    )
+
+
+@app.post("/response-letters/actions/upload-scans")
+def upload_selected_response_scans(
+    letter_ids: list[str] = Form(default=[]),
+    scan_files: list[UploadFile] = File(default=[]),
+):
+    if not letter_ids or len(letter_ids) != len(scan_files):
+        raise HTTPException(422, "Для каждого ответа выберите один файл")
+    completed = 0
+    try:
+        for letter_id, scan_file in zip(letter_ids, scan_files, strict=True):
+            workflow.register_signed_response_scan(
+                letter_id,
+                scan_file.filename or "scan.pdf",
+                scan_file.file,
+                actor=workflow.get_active_employee() or "Сотрудник",
+            )
+            completed += 1
+    except (WorkflowValidationError, ValueError) as exc:
+        return RedirectResponse(
+            "/today?error="
+            + quote(f"Загружено: {completed}. Ошибка: {exc}"),
+            status_code=303,
+        )
+    finally:
+        for scan_file in scan_files:
+            scan_file.file.close()
+    return RedirectResponse(
+        "/today?message=" + quote(f"Загружено сканов: {completed}."),
+        status_code=303,
+    )
+
+
+@app.post("/response-letters/actions/trash")
+def trash_selected_response_letters(
+    letter_ids: list[str] = Form(default=[]),
+):
+    groups = workflow.response_groups_for_letters(letter_ids)
+    if not groups:
+        return RedirectResponse(
+            "/today?error=" + quote("Выберите ответы"), status_code=303
+        )
+    try:
+        for group in groups:
+            workflow.move_response_group_to_trash(
+                group["id"],
+                actor=workflow.get_active_employee() or "Сотрудник",
+            )
+    except WorkflowValidationError as exc:
+        return RedirectResponse(
+            "/today?error=" + quote(str(exc)), status_code=303
+        )
+    return RedirectResponse(
+        "/today?message="
+        + quote(f"Перемещено в корзину ответов: {len(groups)}."),
+        status_code=303,
+    )
+
+
 @app.post("/settings/outlook/import")
 def import_outlook_attachments(background_tasks: BackgroundTasks):
     started = _queue_outlook_import(background_tasks)
@@ -1670,6 +1937,22 @@ def save_gns_office_settings(
     return RedirectResponse(
         f"/settings?message={quote(message)}#offices",
         status_code=303,
+    )
+
+
+@app.post("/settings/offices/save-all")
+async def save_all_gns_office_settings(request: Request):
+    try:
+        payload = await request.json()
+        entries = payload.get("offices") if isinstance(payload, dict) else None
+        saved = workflow.save_gns_offices_batch(
+            entries,
+            actor=workflow.get_active_employee() or "Сотрудник",
+        )
+    except (TypeError, ValueError, WorkflowValidationError) as exc:
+        return JSONResponse({"ok": False, "message": str(exc)}, status_code=400)
+    return JSONResponse(
+        {"ok": True, "message": "Справочник сохранён.", "saved": saved}
     )
 
 
@@ -2237,7 +2520,12 @@ def print_selected_signed_response_scans(
     letter_ids: list[str] = Form(default=[]),
 ):
     try:
-        pdf = workflow.build_signed_response_print_bundle(letter_ids)
+        eligible = [
+            letter_id
+            for letter_id in dict.fromkeys(letter_ids)
+            if workflow.get_confirmed_signed_response_scan(letter_id)
+        ]
+        pdf = workflow.build_signed_response_print_bundle(eligible)
     except WorkflowValidationError as exc:
         raise HTTPException(422, str(exc)) from exc
     return Response(
@@ -2344,6 +2632,7 @@ def open_grouped_response_for_print(group_id: str):
         )
         if not path.exists():
             raise OSError("missing response")
+        workflow.refresh_response_group_word_page_count(group_id)
         open_word_document(path)
         workflow.mark_response_group_opened_for_print(
             group_id,

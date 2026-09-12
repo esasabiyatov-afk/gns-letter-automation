@@ -903,7 +903,7 @@ def test_com_gateway_sends_only_existing_pdf_draft_to_exact_account(
     assert mail.To == "esensabiyatov@gmail.com"
     assert mail.CC == ""
     assert mail.BCC == ""
-    assert mail.SendUsingAccount is account
+    assert mail.SendUsingAccount is None
     assert mail.sent == 1
 
     real = PyWin32OutlookGateway().send_draft(

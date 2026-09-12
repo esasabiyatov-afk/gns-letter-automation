@@ -7,6 +7,7 @@
     <p class="eyebrow">ПОИСК И ПРОВЕРКА</p>
     <h1>История писем</h1>
   </div>
+  <a class="button button-secondary button-compact" href="/trash">Корзина</a>
   <form class="history-search" method="get" action="/history" data-history-search>
     <div class="history-search-main">
       <input name="query" value="{{ history.query }}"
@@ -148,6 +149,10 @@
                 <button type="submit">Проверить заново вручную</button>
               </form>
             {% endif %}
+            <form method="post" action="/cases/{{ item.id }}/trash"
+                  onsubmit="return confirm('Переместить всё входящее письмо в корзину?');">
+              <button type="submit" class="danger-link">В корзину</button>
+            </form>
             {% if item.mail_status == 'sent' and item.outlook_message_id and item.signed_scan_id %}
               <form method="post" action="/outlook-messages/{{ item.outlook_message_id }}/resend-draft"
                     onsubmit="return confirm('Создать повторный черновик с сохранённым подписанным PDF?');">

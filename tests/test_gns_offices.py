@@ -745,3 +745,41 @@ def test_saved_district_typo_is_canonicalized_from_directory(workflow):
     assert workflow.get_case(case_id)["district_place"] == (
         "по Панфиловскому району Чуйской области"
     )
+
+
+def test_office_directory_is_saved_together(workflow):
+    workflow.initialize_gns_offices()
+    offices = workflow.list_gns_offices()
+    entries = [
+        {
+            "office_id": office["id"],
+            "district_place": office["district_place"],
+            "email_address": office["email_address"] or "",
+            "backup_emails": ", ".join(office["backup_emails"]),
+            "aliases": ", ".join(office["aliases"]),
+            "salyk_backup_enabled": office["salyk_backup_enabled"],
+        }
+        for office in offices
+    ]
+    entries[0]["aliases"] += ", Проверочный алиас"
+    entries[1]["deleted"] = True
+    entries.append(
+        {
+            "district_place": "по Новому тестовому району",
+            "email_address": "new-office@example.test",
+            "backup_emails": "",
+            "aliases": "Новый тестовый район",
+            "salyk_backup_enabled": False,
+        }
+    )
+
+    saved = workflow.save_gns_offices_batch(entries)
+    refreshed = workflow.list_gns_offices()
+
+    assert len(saved) == len(offices)
+    assert not any(office["id"] == offices[1]["id"] for office in refreshed)
+    assert any("Проверочный алиас" in office["aliases"] for office in refreshed)
+    assert any(
+        office["email_address"] == "new-office@example.test"
+        for office in refreshed
+    )

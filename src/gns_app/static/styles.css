@@ -1620,6 +1620,11 @@ pre { white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow
   display: grid; grid-template-columns: 1.5fr 1fr 1.25fr auto;
   gap: 8px; align-items: end; margin: 0;
 }
+.office-settings-row .office-settings-form {
+  grid-template-columns: 1.5fr 1fr 1.25fr;
+}
+.office-settings-row .office-alias-field { grid-column: 1 / -1; }
+.office-settings-row.is-new { border-color: #9cc8b5; }
 .office-settings-form .office-alias-field { grid-column: 1 / 4; }
 .office-settings-form > .button {
   grid-column: 4; grid-row: 1 / span 2; align-self: end;
@@ -1639,6 +1644,9 @@ pre { white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow
 .office-settings-form .button,
 .office-delete-form .button { min-height: 40px; white-space: nowrap; }
 .office-delete-form { margin: 0; }
+.office-delete-button { min-height: 40px; white-space: nowrap; }
+.office-save-bar { justify-content: space-between; align-items: center; }
+.office-save-bar > span { color: var(--muted); font-size: 13px; }
 .office-settings-empty { margin: 10px 0 0; color: var(--muted); text-align: center; }
 
 @media (max-width: 1120px) {
@@ -2530,6 +2538,20 @@ pre { white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow
 .history-date-filter { display: flex; align-items: center; gap: 4px; color: var(--muted); font-size: 11px; }
 .history-date-filter input { width: 132px; }
 .signed-copy-actions { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+.bulk-selection-count { color: var(--muted); font-size: 11px; font-weight: 750; }
+.bulk-action-menu .compact-menu-panel { display: grid; gap: 3px; }
+.bulk-action-menu .compact-menu-panel button {
+  width: 100%; padding: 7px 9px; border: 0; border-radius: 7px;
+  background: transparent; color: var(--ink); text-align: left;
+  font: inherit; font-size: 11px; font-weight: 700; cursor: pointer;
+}
+.bulk-action-menu .compact-menu-panel button:hover { background: var(--green-soft); }
+.bulk-action-menu .compact-menu-panel button:disabled { opacity: .45; cursor: default; }
+.selected-scan-upload-row { display: grid; gap: 5px; margin-bottom: 10px; }
+.selected-scan-upload-row strong { font-size: 12px; }
+.word-page-count { color: var(--muted); }
+.danger-link { color: var(--red) !important; }
+.trash-row { grid-template-columns: minmax(0, 1fr) auto auto; }
 .history-list-grid { grid-template-columns: 150px minmax(210px, 1fr) minmax(200px, 1fr) minmax(180px, .9fr) 30px; }
 .history-received,
 .history-recipient,

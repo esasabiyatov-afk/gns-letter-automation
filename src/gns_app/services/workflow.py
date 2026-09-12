@@ -78,6 +78,7 @@ from gns_app.services.taxpayer_service import (
     response_taxpayer_name,
 )
 from gns_app.services.word_service import WordTemplateError, WordTemplateService
+from gns_app.services.word_desktop import exact_word_page_count
 from gns_app.text_cleanup import clean_location, clean_taxpayer_name
 
 
@@ -1201,6 +1202,286 @@ class WorkflowService:
             actor=actor,
         )
 
+    def save_gns_offices_batch(
+        self,
+        entries: list[dict[str, Any]],
+        *,
+        actor: str = "Сотрудник",
+    ) -> list[dict[str, Any]]:
+        """Validate and save the whole visible office directory atomically."""
+        if not isinstance(entries, list) or len(entries) > 500:
+            raise WorkflowValidationError("Некорректный список районов")
+
+        now = utc_now()
+        saved: list[dict[str, Any]] = []
+        with self.db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current_rows = {
+                int(row["id"]): dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM gns_offices WHERE active = 1"
+                ).fetchall()
+            }
+            baseline_terms: dict[str, set[str]] = {}
+            baseline_emails: dict[str, set[str]] = {}
+            for current_id, current_row in current_rows.items():
+                owner = str(current_id)
+                try:
+                    current_aliases = json.loads(
+                        current_row.get("aliases_json") or "[]"
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    current_aliases = []
+                for term in (
+                    current_row.get("district_place") or "",
+                    current_row.get("office_name") or "",
+                    *current_aliases,
+                ):
+                    normalized = self._normalize_office_text(str(term))
+                    if normalized:
+                        baseline_terms.setdefault(normalized, set()).add(owner)
+                try:
+                    current_backups = json.loads(
+                        current_row.get("backup_emails_json") or "[]"
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    current_backups = []
+                current_email_values = {
+                    str(current_row.get("email_address") or "").strip().casefold(),
+                    *(
+                        str(value or "").strip().casefold()
+                        for value in current_backups
+                    ),
+                } - {""}
+                if bool(current_row.get("salyk_backup_enabled")):
+                    current_email_values.add(
+                        self._salyk_backup_email(
+                            str(current_row.get("email_address") or "")
+                        )
+                    )
+                    current_email_values.discard("")
+                for email in current_email_values:
+                    baseline_emails.setdefault(email, set()).add(owner)
+            prepared: list[dict[str, Any]] = []
+            seen_ids: set[int] = set()
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise WorkflowValidationError("Некорректная строка района")
+                raw_id = entry.get("office_id")
+                office_id = int(raw_id) if str(raw_id or "").isdigit() else None
+                if office_id is not None:
+                    if office_id in seen_ids or office_id not in current_rows:
+                        raise WorkflowValidationError("Район не найден")
+                    seen_ids.add(office_id)
+                if bool(entry.get("deleted")):
+                    if office_id is not None:
+                        prepared.append({"office_id": office_id, "deleted": True})
+                    continue
+
+                district = clean_location(str(entry.get("district_place") or ""))
+                if not district:
+                    raise WorkflowValidationError("Укажите район или город")
+                if len(district) > 240:
+                    raise WorkflowValidationError("Название района слишком длинное")
+                primary_values = self._normalize_office_emails(
+                    str(entry.get("email_address") or "")
+                )
+                if len(primary_values) > 1:
+                    raise WorkflowValidationError("Укажите одну основную почту")
+                primary = primary_values[0] if primary_values else ""
+                reserves = [
+                    email
+                    for email in self._normalize_office_emails(
+                        str(entry.get("backup_emails") or "")
+                    )
+                    if email != primary
+                ]
+                salyk_enabled = bool(entry.get("salyk_backup_enabled"))
+                salyk_email = self._salyk_backup_email(primary)
+                if salyk_enabled and not salyk_email:
+                    raise WorkflowValidationError(
+                        "Резерв @salyk.kg доступен только для основной почты @sti.gov.kg"
+                    )
+                effective_reserves = list(reserves)
+                if salyk_enabled and salyk_email not in effective_reserves:
+                    effective_reserves.append(salyk_email)
+                if len(effective_reserves) > 5:
+                    raise WorkflowValidationError("Можно указать до пяти резервных почт")
+
+                aliases: list[str] = []
+                for raw_alias in re.split(
+                    r"[,;\n]+", str(entry.get("aliases") or "")
+                ):
+                    alias = " ".join(raw_alias.split())
+                    if not alias:
+                        continue
+                    if len(alias) > 240:
+                        raise WorkflowValidationError("Алиас слишком длинный")
+                    normalized_alias = self._normalize_office_text(alias)
+                    if normalized_alias and all(
+                        self._normalize_office_text(saved_alias) != normalized_alias
+                        for saved_alias in aliases
+                    ):
+                        aliases.append(alias)
+                if len(aliases) > 20:
+                    raise WorkflowValidationError("Можно указать до двадцати алиасов")
+
+                current = current_rows.get(office_id) if office_id else None
+                normalized_district = self._normalize_office_text(district)
+                if current:
+                    old_district = clean_location(current["district_place"])
+                    if (
+                        self._normalize_office_text(old_district)
+                        != normalized_district
+                        and all(
+                            self._normalize_office_text(alias)
+                            != self._normalize_office_text(old_district)
+                            for alias in aliases
+                        )
+                    ):
+                        aliases.append(old_district)
+                    office_key = current["office_key"]
+                    office_name = current["office_name"]
+                else:
+                    office_key = "manual:" + hashlib.sha256(
+                        normalized_district.encode("utf-8")
+                    ).hexdigest()[:24]
+                    office_name = (
+                        f"УГНС {district}"
+                        if district.casefold().startswith("по ")
+                        else f"УГНС по {district}"
+                    )
+                prepared.append(
+                    {
+                        "office_id": office_id,
+                        "deleted": False,
+                        "district": district,
+                        "primary": primary,
+                        "reserves": reserves,
+                        "effective_reserves": effective_reserves,
+                        "salyk_enabled": salyk_enabled,
+                        "aliases": aliases,
+                        "office_key": office_key,
+                        "office_name": office_name,
+                    }
+                )
+
+            if seen_ids != set(current_rows):
+                raise WorkflowValidationError(
+                    "Справочник изменился. Обновите страницу и повторите."
+                )
+
+            active_entries = [item for item in prepared if not item["deleted"]]
+            term_owners: dict[str, set[str]] = {}
+            email_owners: dict[str, set[str]] = {}
+            for item in active_entries:
+                owner = str(item.get("office_id") or item["office_key"])
+                terms = {
+                    self._normalize_office_text(term)
+                    for term in (
+                        item["district"],
+                        item["office_name"],
+                        *item["aliases"],
+                    )
+                    if self._normalize_office_text(term)
+                }
+                for term in terms:
+                    term_owners.setdefault(term, set()).add(owner)
+                for email in {item["primary"], *item["effective_reserves"]} - {""}:
+                    email_owners.setdefault(email, set()).add(owner)
+            if any(
+                len(owners) > 1
+                and not owners.issubset(baseline_terms.get(term, set()))
+                for term, owners in term_owners.items()
+            ):
+                raise WorkflowValidationError(
+                    "Название или алиас используется другим районом"
+                )
+            if any(
+                len(owners) > 1
+                and not owners.issubset(baseline_emails.get(email, set()))
+                for email, owners in email_owners.items()
+            ):
+                raise WorkflowValidationError(
+                    "Эта почта уже указана у другого района"
+                )
+
+            for item in prepared:
+                office_id = item.get("office_id")
+                if item["deleted"]:
+                    connection.execute(
+                        "UPDATE gns_offices SET active = 0, user_modified = 1, "
+                        "updated_at = ? WHERE id = ? AND active = 1",
+                        (now, office_id),
+                    )
+                    continue
+                values = (
+                    item["district"],
+                    item["primary"] or None,
+                    json.dumps(item["reserves"], ensure_ascii=False),
+                    int(item["salyk_enabled"]),
+                    json.dumps(item["aliases"], ensure_ascii=False),
+                    now,
+                )
+                if office_id:
+                    connection.execute(
+                        """
+                        UPDATE gns_offices
+                        SET district_place = ?, email_address = ?,
+                            backup_emails_json = ?, salyk_backup_enabled = ?,
+                            aliases_json = ?, user_modified = 1, updated_at = ?
+                        WHERE id = ? AND active = 1
+                        """,
+                        (*values, office_id),
+                    )
+                    saved_id = office_id
+                else:
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO gns_offices(
+                            office_key, office_name, district_place,
+                            postal_address, email_address, backup_emails_json,
+                            salyk_backup_enabled, aliases_json, active,
+                            user_modified, is_custom, created_at, updated_at
+                        ) VALUES (?, ?, ?, '', ?, ?, ?, ?, 1, 1, 1, ?, ?)
+                        """,
+                        (
+                            item["office_key"], item["office_name"],
+                            item["district"], item["primary"] or None,
+                            json.dumps(item["reserves"], ensure_ascii=False),
+                            int(item["salyk_enabled"]),
+                            json.dumps(item["aliases"], ensure_ascii=False),
+                            now, now,
+                        ),
+                    )
+                    saved_id = int(cursor.lastrowid)
+                saved.append({"office_id": saved_id})
+
+            connection.execute(
+                """
+                INSERT INTO audit_events(
+                    entity_type, entity_id, event_type, actor,
+                    payload_json, created_at
+                ) VALUES ('settings', 'gns_offices',
+                          'gns_offices_saved_together', ?, ?, ?)
+                """,
+                (
+                    actor,
+                    json.dumps(
+                        {
+                            "saved_count": len(saved),
+                            "deleted_count": sum(
+                                1 for item in prepared if item["deleted"]
+                            ),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    now,
+                ),
+            )
+        self._invalidate_gns_office_cache()
+        return saved
+
     def _gns_office_match_index(
         self,
     ) -> tuple[
@@ -1473,6 +1754,7 @@ class WorkflowService:
                         for letter in letters
                     ],
                 )
+                word_page_count = exact_word_page_count(temporary)
                 temporary.replace(output)
             except (OSError, WordTemplateError, ValueError):
                 temporary.unlink(missing_ok=True)
@@ -1481,11 +1763,18 @@ class WorkflowService:
                 """
                 UPDATE response_groups
                 SET district_place = ?, response_page_overflow = ?,
+                    word_page_count = ?,
                     opened_for_print_at = NULL, word_reopen_required = 1,
                     updated_at = ?
                 WHERE id = ?
                 """,
-                (after, int(likely_overflow), now, group["id"]),
+                (
+                    after,
+                    int(likely_overflow),
+                    word_page_count,
+                    now,
+                    group["id"],
+                ),
             )
             self.db.audit(
                 "response_group",
@@ -1917,6 +2206,7 @@ class WorkflowService:
             ),
         }
         with self.db.connect() as connection:
+            connection.execute("DELETE FROM trash_items")
             connection.execute("DELETE FROM response_groups")
             connection.execute("DELETE FROM uploads")
             connection.execute("DELETE FROM audit_events")
@@ -1951,12 +2241,15 @@ class WorkflowService:
         self, upload_id: str, only_registered_pages: bool = False
     ) -> None:
         upload = self.get_upload(upload_id)
-        if not upload:
+        if not upload or upload.get("status") == UploadStatus.TRASHED:
             return
-        self.db.execute(
-            "UPDATE uploads SET status = ? WHERE id = ?",
-            (UploadStatus.PROCESSING, upload_id),
-        )
+        with self.db.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE uploads SET status = ? WHERE id = ? AND status != ?",
+                (UploadStatus.PROCESSING, upload_id, UploadStatus.TRASHED),
+            )
+            if cursor.rowcount != 1:
+                return
         if only_registered_pages:
             pages = self.db.fetch_all(
                 """
@@ -1979,10 +2272,24 @@ class WorkflowService:
                 (upload_id,),
             )
         def process_page(page: dict[str, Any]) -> None:
+            current = self.get_upload(upload_id)
+            if not current or current.get("status") == UploadStatus.TRASHED:
+                return
             try:
                 self._process_page(upload, page)
             except Exception as exc:
                 self._record_page_processing_error(page["id"], exc)
+            current = self.get_upload(upload_id)
+            if current and current.get("status") == UploadStatus.TRASHED:
+                with self.db.connect() as connection:
+                    connection.execute(
+                        "UPDATE pages SET status = ?, updated_at = ? WHERE id = ?",
+                        (PageStatus.TRASHED, utc_now(), page["id"]),
+                    )
+                    connection.execute(
+                        "UPDATE cases SET status = ?, updated_at = ? WHERE upload_id = ?",
+                        (CaseStatus.TRASHED, utc_now(), upload_id),
+                    )
 
         worker_count = min(self.get_processing_workers(), len(pages))
         if worker_count > 1:
@@ -1996,6 +2303,9 @@ class WorkflowService:
         else:
             for page in pages:
                 process_page(page)
+        current = self.get_upload(upload_id)
+        if not current or current.get("status") == UploadStatus.TRASHED:
+            return
         self.reconcile_official_qr_pages(upload_id)
         self._complete_qr_companions(upload_id)
         self._require_letter_for_scan_only_decisions(upload_id)
@@ -2010,7 +2320,7 @@ class WorkflowService:
             """
             UPDATE pages
             SET status = ?, issue_code = ?, issue_message = ?, updated_at = ?
-            WHERE id = ?
+            WHERE id = ? AND status != ?
             """,
             (
                 PageStatus.TECHNICAL_ERROR,
@@ -2018,6 +2328,7 @@ class WorkflowService:
                 message,
                 utc_now(),
                 page_id,
+                PageStatus.TRASHED,
             ),
         )
         self.db.audit(
@@ -3951,7 +4262,7 @@ class WorkflowService:
             SET page_type = ?, type_confidence = 0,
                 manual_confirmed = 0, status = ?,
                 issue_code = ?, issue_message = ?, updated_at = ?
-            WHERE id = ?
+            WHERE id = ? AND status != ?
             """,
             (
                 PageType.UNKNOWN,
@@ -3960,6 +4271,7 @@ class WorkflowService:
                 "Выберите правильный тип страницы.",
                 utc_now(),
                 page_id,
+                PageStatus.TRASHED,
             ),
         )
         self.db.audit(
@@ -5535,7 +5847,7 @@ class WorkflowService:
         row = self.db.fetch_one(
             """
             SELECT
-                (SELECT COUNT(*) FROM uploads) AS incoming,
+                (SELECT COUNT(*) FROM uploads WHERE status != 'trashed') AS incoming,
                 (SELECT COUNT(*) FROM uploads
                  WHERE status = 'processing') AS processing,
                 (SELECT COUNT(*) FROM pages
@@ -5594,8 +5906,9 @@ class WorkflowService:
                 (SELECT COUNT(DISTINCT cases.id)
                  FROM cases
                  JOIN taxpayers ON taxpayers.case_id = cases.id
-                 WHERE taxpayers.abs_account_result = 'found'
-                    OR taxpayers.odb_result = 'found') AS manual_responses
+                 WHERE cases.status != 'trashed'
+                   AND (taxpayers.abs_account_result = 'found'
+                        OR taxpayers.odb_result = 'found')) AS manual_responses
             """
         ) or {}
         review_count = sum(
@@ -5718,6 +6031,8 @@ class WorkflowService:
                     JOIN cases ON cases.id = taxpayers.case_id
                     JOIN uploads ON uploads.id = cases.upload_id
                     WHERE taxpayers.id IN ({placeholders})
+                      AND cases.status != 'trashed'
+                      AND uploads.status != 'trashed'
                     """,
                     taxpayer_ids,
                 )
@@ -5735,6 +6050,8 @@ class WorkflowService:
                 JOIN uploads ON uploads.id = cases.upload_id
                 JOIN taxpayers ON taxpayers.case_id = cases.id
                 WHERE cases.id IN ({placeholders})
+                  AND cases.status != 'trashed'
+                  AND uploads.status != 'trashed'
                 """,
                 odb_case_ids,
             ):
@@ -6264,6 +6581,7 @@ class WorkflowService:
             group["taxpayers"],
             per_page,
         )
+        word_page_count = exact_word_page_count(output)
         letter_count = (
             group["taxpayer_count"] + per_page - 1
         ) // per_page
@@ -6277,9 +6595,9 @@ class WorkflowService:
                     district_place, recipient_position, recipient_full_name,
                     recipient_display_name, employee_name, taxpayer_count,
                     taxpayers_per_letter, response_path,
-                    response_page_overflow, created_at,
+                    response_page_overflow, word_page_count, created_at,
                     updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     group_id,
@@ -6296,6 +6614,7 @@ class WorkflowService:
                     per_page,
                     str(output),
                     int(likely_overflow),
+                    word_page_count,
                     now,
                     now,
                 ),
@@ -6521,6 +6840,7 @@ class WorkflowService:
         temporary: Path | None = None
         backup: Path | None = None
         likely_overflow = bool(stored_group["response_page_overflow"])
+        word_page_count = stored_group.get("word_page_count")
         if additions:
             temporary = output.with_name(
                 f".{output.stem}-late-merge-{uuid4().hex}.docx"
@@ -6542,6 +6862,7 @@ class WorkflowService:
                         str(letters[0]["outgoing_number"] or "")
                     ],
                 )
+                word_page_count = exact_word_page_count(temporary)
                 backup = output.with_name(
                     f".{output.stem}-before-late-merge-{uuid4().hex}.docx"
                 )
@@ -6668,6 +6989,7 @@ class WorkflowService:
                         UPDATE response_groups
                         SET taxpayer_count = ?, taxpayers_per_letter = ?,
                             response_page_overflow = ?,
+                            word_page_count = ?,
                             opened_for_print_at = NULL,
                             word_reopen_required = 1, updated_at = ?
                         WHERE id = ? AND status = 'created'
@@ -6676,6 +6998,7 @@ class WorkflowService:
                             len(combined),
                             len(combined),
                             int(likely_overflow),
+                            word_page_count,
                             now,
                             group_id,
                         ),
@@ -6871,6 +7194,25 @@ class WorkflowService:
                 (group_id, actor, now),
             )
 
+    def refresh_response_group_word_page_count(self, group_id: str) -> int | None:
+        group = self.get_response_group(group_id)
+        if not group:
+            raise WorkflowValidationError("Общий ответ не найден")
+        stored_count = int(group.get("word_page_count") or 0)
+        if stored_count > 0:
+            return stored_count
+        path = ensure_within(
+            Path(group["response_path"]), self.settings.responses_dir
+        )
+        page_count = exact_word_page_count(path)
+        if page_count:
+            self.db.execute(
+                "UPDATE response_groups SET word_page_count = ?, updated_at = ? "
+                "WHERE id = ?",
+                (page_count, utc_now(), group_id),
+            )
+        return page_count
+
     @staticmethod
     def _canonical_outgoing_number(
         value: str | int | None,
@@ -7030,7 +7372,7 @@ class WorkflowService:
         self,
         group_id: str,
         overrides: dict[str, str | None],
-    ) -> tuple[Path, Path, bool]:
+    ) -> tuple[Path, Path, bool, int | None]:
         group, taxpayers, letters = self._response_group_render_data(group_id)
         output = ensure_within(
             Path(group["response_path"]),
@@ -7064,7 +7406,7 @@ class WorkflowService:
             raise WorkflowValidationError(
                 "Не удалось обновить исходящий номер в Word"
             ) from exc
-        return temporary, output, likely_overflow
+        return temporary, output, likely_overflow, exact_word_page_count(temporary)
 
     def _apply_outgoing_number_updates(
         self,
@@ -7170,7 +7512,7 @@ class WorkflowService:
         group_ids = sorted(
             {row["response_group_id"] for row in changed_rows}
         )
-        rendered: dict[str, tuple[Path, Path, bool]] = {}
+        rendered: dict[str, tuple[Path, Path, bool, int | None]] = {}
         backups: dict[str, Path] = {}
         preserved_backups: set[str] = set()
         superseded_scan_count = 0
@@ -7179,7 +7521,7 @@ class WorkflowService:
                 rendered[group_id] = self._render_group_number_update(
                     group_id, normalized
                 )
-            for group_id, (_, output, _) in rendered.items():
+            for group_id, (_, output, _, _) in rendered.items():
                 backup = output.with_name(
                     f".{output.stem}-before-numbering-{uuid4().hex}.docx"
                 )
@@ -7345,17 +7687,18 @@ class WorkflowService:
                                 now,
                             ),
                         )
-                for group_id, (temporary, output, overflow) in rendered.items():
+                for group_id, (temporary, output, overflow, page_count) in rendered.items():
                     temporary.replace(output)
                     connection.execute(
                         """
                         UPDATE response_groups
                         SET response_page_overflow = ?,
+                            word_page_count = ?,
                             opened_for_print_at = NULL,
                             word_reopen_required = 1, updated_at = ?
                         WHERE id = ?
                         """,
-                        (int(overflow), now, group_id),
+                        (int(overflow), page_count, now, group_id),
                     )
         except sqlite3.IntegrityError as exc:
             preserved_backups.update(
@@ -7377,7 +7720,7 @@ class WorkflowService:
             )
             raise
         finally:
-            for temporary, _, _ in rendered.values():
+            for temporary, _, _, _ in rendered.values():
                 temporary.unlink(missing_ok=True)
             for group_id, backup in backups.items():
                 if group_id not in preserved_backups:
@@ -7393,7 +7736,7 @@ class WorkflowService:
     @staticmethod
     def _restore_numbering_backups(
         backups: dict[str, Path],
-        rendered: dict[str, tuple[Path, Path, bool]],
+        rendered: dict[str, tuple[Path, Path, bool, int | None]],
     ) -> set[str]:
         failed: set[str] = set()
         for group_id, backup in backups.items():
@@ -7497,6 +7840,29 @@ class WorkflowService:
             """,
             (letter_id,),
         )
+
+    def response_groups_for_letters(
+        self, letter_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        unique_ids = list(dict.fromkeys(str(item) for item in letter_ids if item))
+        if not unique_ids:
+            raise WorkflowValidationError("Выберите хотя бы один ответ")
+        placeholders = ",".join("?" for _ in unique_ids)
+        rows = self.db.fetch_all(
+            f"""
+            SELECT DISTINCT response_groups.*
+            FROM response_letters
+            JOIN response_groups
+              ON response_groups.id = response_letters.response_group_id
+            WHERE response_letters.id IN ({placeholders})
+              AND response_groups.status = 'created'
+            ORDER BY response_groups.created_at, response_groups.id
+            """,
+            unique_ids,
+        )
+        if not rows:
+            raise WorkflowValidationError("Выбранные Word-ответы не найдены")
+        return rows
 
     def build_signed_response_print_bundle(
         self,
@@ -8617,13 +8983,392 @@ class WorkflowService:
     ) -> list[dict[str, Any]]:
         if limit is None:
             return self.db.fetch_all(
-                "SELECT * FROM uploads ORDER BY created_at DESC"
+                "SELECT * FROM uploads WHERE status != 'trashed' "
+                "ORDER BY created_at DESC"
             )
         safe_limit = max(1, min(int(limit), 200))
         return self.db.fetch_all(
-            "SELECT * FROM uploads ORDER BY created_at DESC LIMIT ?",
+            "SELECT * FROM uploads WHERE status != 'trashed' "
+            "ORDER BY created_at DESC LIMIT ?",
             (safe_limit,),
         )
+
+    @staticmethod
+    def _rows_status_snapshot(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
+        return [
+            {"id": str(row["id"]), "status": str(row.get("status") or "")}
+            for row in rows
+        ]
+
+    def _trash_response_groups(
+        self,
+        connection,
+        group_ids: list[str],
+        snapshot: dict[str, Any],
+        now: str,
+    ) -> None:
+        if not group_ids:
+            return
+        placeholders = ",".join("?" for _ in group_ids)
+        groups = [
+            dict(row)
+            for row in connection.execute(
+                f"SELECT id, status FROM response_groups WHERE id IN ({placeholders})",
+                group_ids,
+            ).fetchall()
+        ]
+        snapshot["groups"] = self._rows_status_snapshot(groups)
+        letters = [
+            dict(row)
+            for row in connection.execute(
+                f"""
+                SELECT response_letters.id, response_letters.outgoing_number,
+                       response_letters.manually_sent_at,
+                       EXISTS(
+                           SELECT 1 FROM outlook_outgoing_messages
+                           WHERE outlook_outgoing_messages.response_letter_id =
+                                 response_letters.id
+                       ) AS has_outlook,
+                       EXISTS(
+                           SELECT 1 FROM outlook_outgoing_messages
+                           WHERE outlook_outgoing_messages.response_letter_id =
+                                 response_letters.id
+                             AND outlook_outgoing_messages.status IN
+                                 ('creating', 'send_requested')
+                       ) AS sending
+                FROM response_letters
+                WHERE response_group_id IN ({placeholders})
+                """,
+                group_ids,
+            ).fetchall()
+        ]
+        if any(bool(row["sending"]) for row in letters):
+            raise WorkflowValidationError(
+                "Дождитесь завершения отправки и повторите удаление"
+            )
+        snapshot["letters"] = [
+            {
+                "id": row["id"],
+                "outgoing_number": row.get("outgoing_number") or "",
+                "released": bool(
+                    row.get("outgoing_number")
+                    and not row.get("manually_sent_at")
+                    and not row.get("has_outlook")
+                ),
+            }
+            for row in letters
+        ]
+        connection.execute(
+            f"UPDATE response_groups SET status = 'trashed', updated_at = ? "
+            f"WHERE id IN ({placeholders})",
+            (now, *group_ids),
+        )
+        for letter in snapshot["letters"]:
+            if letter["released"]:
+                connection.execute(
+                    """
+                    UPDATE response_letters
+                    SET outgoing_number = NULL, assigned_at = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, letter["id"]),
+                )
+
+    def move_upload_to_trash(
+        self,
+        upload_id: str,
+        *,
+        actor: str = "Сотрудник",
+    ) -> str:
+        now = utc_now()
+        trash_id = uuid4().hex
+        with self.db.connect() as connection:
+            upload_row = connection.execute(
+                "SELECT * FROM uploads WHERE id = ?", (upload_id,)
+            ).fetchone()
+            if not upload_row:
+                raise WorkflowValidationError("Входящее письмо не найдено")
+            upload = dict(upload_row)
+            if upload.get("status") == UploadStatus.TRASHED:
+                existing = connection.execute(
+                    """
+                    SELECT id FROM trash_items
+                    WHERE entity_type = 'upload' AND entity_id = ?
+                      AND restored_at IS NULL
+                    """,
+                    (upload_id,),
+                ).fetchone()
+                return str(existing["id"]) if existing else trash_id
+            pages = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT id, status FROM pages WHERE upload_id = ?", (upload_id,)
+                ).fetchall()
+            ]
+            cases = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT id, status FROM cases WHERE upload_id = ?", (upload_id,)
+                ).fetchall()
+            ]
+            case_ids = [row["id"] for row in cases]
+            group_ids: list[str] = []
+            if case_ids:
+                placeholders = ",".join("?" for _ in case_ids)
+                group_ids = [
+                    str(row["response_group_id"])
+                    for row in connection.execute(
+                        f"""
+                        SELECT DISTINCT response_group_id
+                        FROM response_group_cases
+                        WHERE case_id IN ({placeholders})
+                        """,
+                        case_ids,
+                    ).fetchall()
+                ]
+            if group_ids:
+                group_placeholders = ",".join("?" for _ in group_ids)
+                case_placeholders = ",".join("?" for _ in case_ids)
+                mixed_group = connection.execute(
+                    f"""
+                    SELECT response_group_cases.response_group_id
+                    FROM response_group_cases
+                    WHERE response_group_cases.response_group_id IN
+                          ({group_placeholders})
+                    GROUP BY response_group_cases.response_group_id
+                    HAVING COUNT(*) != SUM(
+                        CASE WHEN response_group_cases.case_id IN
+                                  ({case_placeholders})
+                             THEN 1 ELSE 0 END
+                    )
+                    LIMIT 1
+                    """,
+                    (*group_ids, *case_ids),
+                ).fetchone()
+                if mixed_group:
+                    raise WorkflowValidationError(
+                        "Письмо уже объединено с другими обращениями. "
+                        "Переместите общий готовый ответ в корзину."
+                    )
+            snapshot: dict[str, Any] = {
+                "upload": {"id": upload_id, "status": upload.get("status") or ""},
+                "pages": self._rows_status_snapshot(pages),
+                "cases": self._rows_status_snapshot(cases),
+            }
+            self._trash_response_groups(connection, group_ids, snapshot, now)
+            connection.execute(
+                "UPDATE uploads SET status = ? WHERE id = ?",
+                (UploadStatus.TRASHED, upload_id),
+            )
+            connection.execute(
+                "UPDATE pages SET status = ?, updated_at = ? WHERE upload_id = ?",
+                (PageStatus.TRASHED, now, upload_id),
+            )
+            connection.execute(
+                "UPDATE cases SET status = ?, updated_at = ? WHERE upload_id = ?",
+                (CaseStatus.TRASHED, now, upload_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO trash_items(
+                    id, entity_type, entity_id, label, snapshot_json,
+                    deleted_by, deleted_at
+                ) VALUES (?, 'upload', ?, ?, ?, ?, ?)
+                """,
+                (
+                    trash_id,
+                    upload_id,
+                    str(upload.get("original_filename") or "Входящее письмо"),
+                    json.dumps(snapshot, ensure_ascii=False),
+                    actor,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO audit_events(
+                    entity_type, entity_id, event_type, actor,
+                    payload_json, created_at
+                ) VALUES ('upload', ?, 'moved_to_trash', ?, ?, ?)
+                """,
+                (
+                    upload_id,
+                    actor,
+                    json.dumps(
+                        {"case_count": len(cases), "group_count": len(group_ids)},
+                        ensure_ascii=False,
+                    ),
+                    now,
+                ),
+            )
+        return trash_id
+
+    def move_response_group_to_trash(
+        self,
+        group_id: str,
+        *,
+        actor: str = "Сотрудник",
+    ) -> str:
+        now = utc_now()
+        trash_id = uuid4().hex
+        with self.db.connect() as connection:
+            group_row = connection.execute(
+                "SELECT * FROM response_groups WHERE id = ?", (group_id,)
+            ).fetchone()
+            if not group_row:
+                raise WorkflowValidationError("Ответ не найден")
+            group = dict(group_row)
+            if group.get("status") == "trashed":
+                existing = connection.execute(
+                    """
+                    SELECT id FROM trash_items
+                    WHERE entity_type = 'response_group' AND entity_id = ?
+                      AND restored_at IS NULL
+                    """,
+                    (group_id,),
+                ).fetchone()
+                return str(existing["id"]) if existing else trash_id
+            cases = [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT cases.id, cases.status
+                    FROM response_group_cases
+                    JOIN cases ON cases.id = response_group_cases.case_id
+                    WHERE response_group_cases.response_group_id = ?
+                    """,
+                    (group_id,),
+                ).fetchall()
+            ]
+            snapshot: dict[str, Any] = {
+                "cases": self._rows_status_snapshot(cases),
+            }
+            self._trash_response_groups(connection, [group_id], snapshot, now)
+            for case in cases:
+                connection.execute(
+                    "UPDATE cases SET status = ?, updated_at = ? WHERE id = ?",
+                    (CaseStatus.TRASHED, now, case["id"]),
+                )
+            connection.execute(
+                """
+                INSERT INTO trash_items(
+                    id, entity_type, entity_id, label, snapshot_json,
+                    deleted_by, deleted_at
+                ) VALUES (?, 'response_group', ?, ?, ?, ?, ?)
+                """,
+                (
+                    trash_id,
+                    group_id,
+                    str(group.get("recipient_display_name") or "Готовый ответ"),
+                    json.dumps(snapshot, ensure_ascii=False),
+                    actor,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO audit_events(
+                    entity_type, entity_id, event_type, actor,
+                    payload_json, created_at
+                ) VALUES ('response_group', ?, 'moved_to_trash', ?, ?, ?)
+                """,
+                (
+                    group_id,
+                    actor,
+                    json.dumps({"case_count": len(cases)}, ensure_ascii=False),
+                    now,
+                ),
+            )
+        return trash_id
+
+    def list_trash_items(self) -> list[dict[str, Any]]:
+        return self.db.fetch_all(
+            """
+            SELECT id, entity_type, entity_id, label, deleted_by, deleted_at
+            FROM trash_items
+            WHERE restored_at IS NULL
+            ORDER BY deleted_at DESC, id DESC
+            """
+        )
+
+    def restore_trash_item(
+        self,
+        trash_id: str,
+        *,
+        actor: str = "Сотрудник",
+    ) -> dict[str, Any]:
+        now = utc_now()
+        number_conflicts = 0
+        with self.db.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM trash_items WHERE id = ? AND restored_at IS NULL",
+                (trash_id,),
+            ).fetchone()
+            if not row:
+                raise WorkflowValidationError("Запись корзины не найдена")
+            snapshot = json.loads(row["snapshot_json"])
+            upload = snapshot.get("upload")
+            if upload:
+                connection.execute(
+                    "UPDATE uploads SET status = ? WHERE id = ?",
+                    (upload["status"], upload["id"]),
+                )
+            for table, key in (("pages", "pages"), ("cases", "cases")):
+                for item in snapshot.get(key, []):
+                    connection.execute(
+                        f"UPDATE {table} SET status = ?, updated_at = ? WHERE id = ?",
+                        (item["status"], now, item["id"]),
+                    )
+            for group in snapshot.get("groups", []):
+                connection.execute(
+                    "UPDATE response_groups SET status = ?, updated_at = ? WHERE id = ?",
+                    (group["status"], now, group["id"]),
+                )
+            for letter in snapshot.get("letters", []):
+                number = str(letter.get("outgoing_number") or "")
+                if not letter.get("released") or not number:
+                    continue
+                owner = connection.execute(
+                    "SELECT id FROM response_letters WHERE outgoing_number = ?",
+                    (number,),
+                ).fetchone()
+                if owner and owner["id"] != letter["id"]:
+                    number_conflicts += 1
+                    continue
+                connection.execute(
+                    """
+                    UPDATE response_letters
+                    SET outgoing_number = ?, assigned_at = ?, updated_at = ?
+                    WHERE id = ? AND outgoing_number IS NULL
+                    """,
+                    (number, now, now, letter["id"]),
+                )
+            connection.execute(
+                """
+                UPDATE trash_items
+                SET restored_by = ?, restored_at = ? WHERE id = ?
+                """,
+                (actor, now, trash_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO audit_events(
+                    entity_type, entity_id, event_type, actor,
+                    payload_json, created_at
+                ) VALUES (?, ?, 'restored_from_trash', ?, ?, ?)
+                """,
+                (
+                    row["entity_type"],
+                    row["entity_id"],
+                    actor,
+                    json.dumps(
+                        {"outgoing_number_conflicts": number_conflicts},
+                        ensure_ascii=False,
+                    ),
+                    now,
+                ),
+            )
+        return {"number_conflicts": number_conflicts}
 
     def list_incoming_work(
         self,
@@ -8666,6 +9411,7 @@ class WorkflowService:
             LEFT JOIN outlook_messages
               ON outlook_messages.source_key =
                  outlook_attachments.message_key
+            WHERE uploads.status != 'trashed'
             GROUP BY uploads.id
             ORDER BY COALESCE(
                 MIN(outlook_messages.received_at), uploads.created_at
@@ -8676,7 +9422,9 @@ class WorkflowService:
         )
 
     def count_incoming_work(self) -> int:
-        row = self.db.fetch_one("SELECT COUNT(*) AS count FROM uploads")
+        row = self.db.fetch_one(
+            "SELECT COUNT(*) AS count FROM uploads WHERE status != 'trashed'"
+        )
         return int(row.get("count") or 0) if row else 0
 
     def get_upload_pages(self, upload_id: str) -> list[dict[str, Any]]:
@@ -9661,6 +10409,7 @@ class WorkflowService:
                     FROM response_letters
                     WHERE response_letters.response_group_id IN ({placeholders})
                       AND TRIM(COALESCE(response_letters.outgoing_number, '')) != ''
+                      AND response_letters.manually_sent_at IS NULL
                       AND NOT EXISTS (
                           SELECT 1 FROM outlook_outgoing_messages
                           WHERE outlook_outgoing_messages.response_letter_id =
@@ -10419,6 +11168,8 @@ class WorkflowService:
                      LIMIT 1) AS resent_at
                 FROM cases
                 JOIN uploads ON uploads.id = cases.upload_id
+                WHERE cases.status != 'trashed'
+                  AND uploads.status != 'trashed'
             )
         """
         conditions: list[str] = []

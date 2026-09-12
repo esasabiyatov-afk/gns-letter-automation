@@ -253,7 +253,9 @@ class WordTemplateService:
 
         replacements = {
             self.TOKENS["today"]: self._format_date(date.today()),
-            self.TOKENS["district"]: clean_location(case["district_place"]),
+            self.TOKENS["district"]: self._location_for_word(
+                case["district_place"]
+            ),
             self.TOKENS["position"]: self._position_for_word(
                 case["recipient_position"]
             ),
@@ -293,6 +295,20 @@ class WordTemplateService:
         self._assert_no_tokens(working_path)
         os.replace(working_path, output_path)
         return output_path, likely_overflow
+
+    @staticmethod
+    def _location_for_word(value: str) -> str:
+        location = clean_location(value)
+        if "бишкек" in location.casefold():
+            return location
+        match = re.match(
+            r"^(.+?)\s+([^\s]+ской\s+области)$",
+            location,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return location
+        return f"{match.group(1).strip()}\n{match.group(2).strip()}"
 
     def _position_for_word(self, position: str) -> str:
         displayed = self.names.position_display(position)

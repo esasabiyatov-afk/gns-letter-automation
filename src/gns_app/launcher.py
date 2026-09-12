@@ -96,6 +96,8 @@ def _run_worker(module_name: str, arguments: list[str]) -> int:
         from gns_app.services.outlook_service import main as worker_main
     elif module_name == "gns_app.services.scanner_service":
         from gns_app.services.scanner_service import main as worker_main
+    elif module_name == "gns_app.services.word_desktop":
+        from gns_app.services.word_desktop import main as worker_main
     else:
         record_event(
             "launcher",
