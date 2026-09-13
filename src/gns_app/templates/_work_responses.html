@@ -289,7 +289,7 @@
                   {% elif letter.outlook_message and letter.outlook_message.status == 'sent' %}
                     <span class="status status-completed">Отправлено</span>
                     {% if letter.outlook_message.sent_at %}
-                      <small>{{ letter.outlook_message.sent_at[:16].replace('T', ' ') }}</small>
+                      <small>{{ letter.outlook_message.sent_at|local_datetime }}</small>
                     {% endif %}
                     {% if not letter.outlook_message.outlook_entry_id %}
                       <small>Отмечено вручную</small>

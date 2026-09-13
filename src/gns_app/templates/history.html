@@ -86,7 +86,7 @@
     {% for item in history['items'] %}
       <article class="compact-list-row history-list-grid">
         <div class="history-received">
-          <time>{{ (item.received_at or item.uploaded_at)[:16].replace('T', ' ') }}</time>
+          <time>{{ (item.received_at or item.uploaded_at)|local_datetime }}</time>
           {% if item.intake_source == 'outlook' and item.original_sender_smtp %}
             <small>Транспортный: {{ item.sender_smtp }}</small>
             <small>Исходный: {{ item.original_sender_smtp }}</small>
@@ -117,11 +117,11 @@
           {% if item.outgoing_numbers %}<strong>Исх. № {{ item.outgoing_numbers }}</strong>{% endif %}
           {% if item.mail_status == 'sent' %}
             <span class="status status-completed">Отправлено</span>
-            <small>{{ item.recipient_email }}{% if item.sent_at %} · {{ item.sent_at[:16].replace('T', ' ') }}{% endif %}</small>
+            <small>{{ item.recipient_email }}{% if item.sent_at %} · {{ item.sent_at|local_datetime }}{% endif %}</small>
             {% if item.resend_status == 'draft_created' %}
               <small>Повторный черновик подготовлен</small>
             {% elif item.resent_at %}
-              <small>Повторно: {{ item.resent_at[:16].replace('T', ' ') }}</small>
+              <small>Повторно: {{ item.resent_at|local_datetime }}</small>
             {% endif %}
           {% elif item.mail_status == 'draft_created' %}
             <span class="status status-ready">Письмо Outlook подготовлено</span>

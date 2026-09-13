@@ -5,7 +5,7 @@
       <p>
         Всего документов: {{ incoming_page.total }} ·
         {% if outlook_auto_enabled %}
-          Автопроверка включена{% if outlook_auto_status.checked_at %} · {{ outlook_auto_status.checked_at[:16].replace('T', ' ') }}{% endif %}
+          Автопроверка включена{% if outlook_auto_status.checked_at %} · {{ outlook_auto_status.checked_at|local_datetime }}{% endif %}
         {% else %}
           Проверка запускается сотрудником
         {% endif %}
@@ -85,7 +85,7 @@
     {% for upload in uploads %}
       <article class="compact-list-row incoming-row" data-testid="incoming-row">
         <div class="incoming-source">
-          <time>{{ (upload.received_at or upload.created_at)[:16].replace('T', ' ') }}</time>
+          <time>{{ (upload.received_at or upload.created_at)|local_datetime }}</time>
           <small title="{{ upload.sender_smtp or '' }}{% if upload.original_sender_smtp %} · исходный: {{ upload.original_sender_smtp }}{% endif %}">
             {% if upload.intake_source == 'outlook' and upload.original_sender_smtp %}
               Транспортный: {{ upload.sender_smtp }}<br>

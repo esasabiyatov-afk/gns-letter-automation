@@ -18,7 +18,7 @@
           <strong>{{ item.label }}</strong>
           <small>{{ 'Входящее письмо' if item.entity_type == 'upload' else 'Готовый ответ' }}</small>
         </div>
-        <time>{{ item.deleted_at[:16].replace('T', ' ') }}</time>
+        <time>{{ item.deleted_at|local_datetime }}</time>
         <form method="post" action="/trash/{{ item.id }}/restore">
           <button class="button button-secondary button-compact" type="submit">Восстановить</button>
         </form>

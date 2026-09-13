@@ -16,7 +16,7 @@
     <div class="timeline-body">
       <div class="timeline-title">
         <strong>{{ event_labels.get(event.event_type, event.event_type) }}</strong>
-        <time>{{ event.created_at.replace('T', ' ') }}</time>
+        <time>{{ event.created_at|local_datetime(true) }}</time>
       </div>
       <p>{{ entity_labels.get(event.entity_type, event.entity_type) }} · {{ event.entity_id[:12] }}… · {{ 'система' if event.actor == 'system' else event.actor }}</p>
       {% if event.payload %}

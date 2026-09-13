@@ -94,7 +94,7 @@
       <div class="inline-state inline-state-success">
         <strong>Отправлено</strong>
         {% if active_letter.outlook_message.sent_at %}
-          · {{ active_letter.outlook_message.sent_at[:16].replace('T', ' ') }}
+          · {{ active_letter.outlook_message.sent_at|local_datetime }}
         {% endif %}
         <small>Отправка подтверждена Outlook.</small>
       </div>

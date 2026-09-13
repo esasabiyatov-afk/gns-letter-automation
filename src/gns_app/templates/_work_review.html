@@ -171,7 +171,7 @@
         <div class="review-history-meta">
           <span class="review-history-kind">{{ item.kind_label }}</span>
           <time datetime="{{ item.created_at }}">
-            {{ item.created_at[:16].replace('T', ' ') }}
+            {{ item.created_at|local_datetime }}
           </time>
         </div>
         <strong>{{ item.name }}</strong>
