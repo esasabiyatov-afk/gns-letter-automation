@@ -2050,6 +2050,7 @@ def test_signed_scan_upload_route_marks_scan_ready(workflow, monkeypatch):
     preview = client.get(f"/signed-response-scans/{scan['id']}")
     assert preview.status_code == 200
     assert preview.headers["content-type"] == "application/pdf"
+    assert preview.headers["content-disposition"].startswith("inline;")
     assert "filename*=utf-8''" in preview.headers["content-disposition"]
 
     drawer = client.get(
@@ -2063,6 +2064,7 @@ def test_signed_scan_upload_route_marks_scan_ready(workflow, monkeypatch):
     )
     assert "Открыть PDF" not in drawer.text
     assert "Проверить скан" not in drawer.text
+    assert "Пересканировать" in drawer.text
 
     assert workflow.get_signed_response_scan(scan["id"])["status"] == "confirmed"
 
@@ -2388,6 +2390,73 @@ def test_outlook_draft_can_be_recreated_from_same_confirmed_pdf(workflow):
     )
     with pytest.raises(OutlookIntegrationError, match="пересоздать нельзя"):
         outgoing.recreate_draft(workflow, letter["id"])
+
+
+def test_replacement_scan_updates_existing_outlook_draft_in_place(workflow):
+    workflow.initialize_gns_offices()
+    workflow.initialize_gns_office_emails()
+    _, letter = _ready_response_letter(workflow)
+    workflow.set_outgoing_number(letter["id"], "9551")
+    first_scan = workflow.register_signed_response_scan(
+        letter["id"], "first.png", _png_scan()
+    )
+
+    class Gateway:
+        def __init__(self):
+            self.requests = []
+            self.attachments = []
+
+        def create_draft(self, **request):
+            self.requests.append(request)
+            self.attachments.append(request["attachment_path"].read_bytes())
+            return OutlookDraftResult(
+                entry_id="draft-entry",
+                recipient_email=request["recipient_email"],
+                subject=request["subject"],
+                attachment_name=request["attachment_name"],
+                existing=bool(request["replace_existing"]),
+            )
+
+    gateway = Gateway()
+    outgoing = OutlookOutgoingService(
+        workflow.db, workflow.settings, OutlookService(gateway)
+    )
+    created = outgoing.create_draft(workflow, letter["id"])
+    replacement_session = workflow.start_signed_scan_session(letter["id"])
+    assert replacement_session["status"] == "collecting"
+
+    replacement_bytes = BytesIO()
+    Image.new("RGB", (1240, 1754), "black").save(replacement_bytes, "PNG")
+    replacement_bytes.seek(0)
+    second_scan = workflow.register_signed_response_scan(
+        letter["id"], "replacement.png", replacement_bytes
+    )
+    rebound = workflow.db.fetch_one(
+        "SELECT * FROM outlook_outgoing_messages WHERE id = ?",
+        (created["id"],),
+    )
+
+    assert workflow.get_signed_response_scan(first_scan["id"])["status"] == (
+        "superseded"
+    )
+    assert rebound["signed_scan_id"] == second_scan["id"]
+    assert rebound["status"] == "scan_replaced"
+    assert workflow.get_signed_scan_session(replacement_session["id"])[
+        "status"
+    ] == "cancelled"
+
+    rebuilt = outgoing.create_draft(workflow, letter["id"])
+
+    assert rebuilt["id"] == created["id"]
+    assert rebuilt["status"] == "draft_created"
+    assert gateway.requests[1]["draft_key"] == gateway.requests[0]["draft_key"]
+    assert gateway.requests[1]["replace_existing"] is True
+    assert gateway.requests[1]["create_if_missing"] is True
+    assert gateway.attachments[1] == Path(second_scan["pdf_path"]).read_bytes()
+    assert gateway.attachments[1] != gateway.attachments[0]
+    assert workflow.db.fetch_one(
+        "SELECT COUNT(*) AS count FROM outlook_outgoing_messages"
+    )["count"] == 1
 
 
 def test_external_send_can_be_marked_once_without_outlook(workflow, monkeypatch):

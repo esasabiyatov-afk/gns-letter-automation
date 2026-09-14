@@ -774,6 +774,13 @@ def test_created_response_actions_are_reachable_without_card_expansion():
     assert "Подготовить черновик Outlook" in template
     assert "Открыть письмо повторно" in template
     assert "Скачать копию Word" in template
+    signed_print = template.index("Печатать подписанные PDF")
+    bulk_menu = template.index('class="compact-menu bulk-action-menu"')
+    word_print = template.index("Печатать Word")
+    assert signed_print < bulk_menu < word_print
+    assert "Пересканировать" in drawer
+    assert "Скан заменён — обновите письмо" in template
+    assert "Обновить письмо Outlook" in template
     assert "/response-letters/actions/open-word" not in template
     assert "data-word-page-count" not in template
     assert "/word-page-count" not in script

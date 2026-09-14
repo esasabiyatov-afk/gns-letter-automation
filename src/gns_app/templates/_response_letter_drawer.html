@@ -90,6 +90,18 @@
               title="Подписанный ответ, {{ scan.page_count }} {{ page_word(scan.page_count) }}">
       </iframe>
     </section>
+    {% if not active_letter.outlook_message
+          or active_letter.outlook_message.status not in ('sent', 'send_requested', 'creating') %}
+      <form method="post"
+            action="/response-letters/{{ active_letter.id }}/scan-session/start"
+            data-scan-drawer-form
+            onsubmit="return confirm('Заменить текущий скан новым?');">
+        <input type="hidden" name="group_id" value="{{ active_group.id }}">
+        <button class="button button-secondary button-compact" type="submit">
+          Пересканировать
+        </button>
+      </form>
+    {% endif %}
     {% if active_letter.outlook_message and active_letter.outlook_message.status == 'sent' %}
       <div class="inline-state inline-state-success">
         <strong>Отправлено</strong>
@@ -109,7 +121,7 @@
             action="/response-letters/{{ active_letter.id }}/outlook-draft">
         <input type="hidden" name="group_id" value="{{ active_group.id }}">
         <button class="button button-primary" type="submit">
-          {% if active_letter.outlook_message and active_letter.outlook_message.status == 'draft_created' %}Открыть письмо{% else %}Подготовить письмо в Outlook{% endif %}
+          {% if active_letter.outlook_message and active_letter.outlook_message.status == 'draft_created' %}Открыть письмо{% elif active_letter.outlook_message and active_letter.outlook_message.status == 'scan_replaced' %}Обновить письмо Outlook{% else %}Подготовить письмо в Outlook{% endif %}
         </button>
       </form>
     {% endif %}

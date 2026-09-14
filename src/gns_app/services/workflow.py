@@ -7815,6 +7815,127 @@ class WorkflowService:
             (letter_id,),
         )
 
+    def _assert_signed_scan_replacement_allowed(
+        self,
+        letter_id: str,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
+        query = """
+            SELECT response_letters.manually_sent_at,
+                   (
+                       SELECT outlook_outgoing_messages.status
+                       FROM outlook_outgoing_messages
+                       JOIN signed_response_scans
+                         ON signed_response_scans.id =
+                            outlook_outgoing_messages.signed_scan_id
+                       WHERE signed_response_scans.response_letter_id =
+                             response_letters.id
+                         AND signed_response_scans.status IN (
+                             'needs_confirmation', 'confirmed'
+                         )
+                         AND outlook_outgoing_messages.status IN (
+                             'creating', 'send_requested', 'sent'
+                         )
+                       ORDER BY outlook_outgoing_messages.created_at DESC
+                       LIMIT 1
+                   ) AS outlook_status
+            FROM response_letters
+            WHERE response_letters.id = ?
+        """
+        row = (
+            connection.execute(query, (letter_id,)).fetchone()
+            if connection is not None
+            else self.db.fetch_one(query, (letter_id,))
+        )
+        if not row:
+            raise WorkflowValidationError("Готовое письмо не найдено")
+        if row["manually_sent_at"]:
+            raise WorkflowValidationError(
+                "Письмо уже отмечено отправленным; скан заменять нельзя"
+            )
+        status = str(row["outlook_status"] or "")
+        if status == "creating":
+            raise WorkflowValidationError(
+                "Outlook сейчас создаёт письмо; дождитесь завершения"
+            )
+        if status == "send_requested":
+            raise WorkflowValidationError(
+                "Письмо уже отправляется; скан заменять нельзя"
+            )
+        if status == "sent":
+            raise WorkflowValidationError(
+                "Письмо уже отправлено; используйте повторную отправку"
+            )
+
+    @staticmethod
+    def _replaceable_outlook_message(
+        connection: sqlite3.Connection,
+        letter_id: str,
+    ) -> sqlite3.Row | None:
+        return connection.execute(
+            """
+            SELECT outlook_outgoing_messages.id,
+                   outlook_outgoing_messages.signed_scan_id
+            FROM outlook_outgoing_messages
+            JOIN signed_response_scans
+              ON signed_response_scans.id =
+                 outlook_outgoing_messages.signed_scan_id
+            WHERE signed_response_scans.response_letter_id = ?
+              AND signed_response_scans.status IN (
+                  'needs_confirmation', 'confirmed'
+              )
+              AND outlook_outgoing_messages.status IN (
+                  'draft_created', 'technical_error', 'scan_replaced'
+              )
+            ORDER BY outlook_outgoing_messages.created_at DESC
+            LIMIT 1
+            """,
+            (letter_id,),
+        ).fetchone()
+
+    @staticmethod
+    def _rebind_outlook_message_to_scan(
+        connection: sqlite3.Connection,
+        message: sqlite3.Row | None,
+        scan_id: str,
+        scan_sha256: str,
+        now: str,
+        actor: str,
+    ) -> None:
+        if message is None:
+            return
+        connection.execute(
+            """
+            UPDATE outlook_outgoing_messages
+            SET signed_scan_id = ?, status = 'scan_replaced',
+                attachment_sha256 = ?, error_message = NULL,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (scan_id, scan_sha256, now, message["id"]),
+        )
+        connection.execute(
+            """
+            INSERT INTO audit_events(
+                entity_type, entity_id, event_type,
+                actor, payload_json, created_at
+            ) VALUES ('outlook_outgoing_message', ?,
+                      'outlook_draft_rebound_to_replacement_scan', ?, ?, ?)
+            """,
+            (
+                message["id"],
+                actor,
+                json.dumps(
+                    {
+                        "previous_scan_id": message["signed_scan_id"],
+                        "replacement_scan_id": scan_id,
+                    },
+                    ensure_ascii=False,
+                ),
+                now,
+            ),
+        )
+
     def response_groups_for_letters(
         self, letter_ids: list[str]
     ) -> list[dict[str, Any]]:
@@ -7934,6 +8055,7 @@ class WorkflowService:
     ) -> dict[str, Any]:
         if not self.get_response_letter(letter_id):
             raise WorkflowValidationError("Готовое письмо не найдено")
+        self._assert_signed_scan_replacement_allowed(letter_id)
         existing = self.get_active_signed_scan_session(letter_id)
         if existing:
             return existing
@@ -8390,6 +8512,13 @@ class WorkflowService:
             digest = self._file_sha256(pdf_path)
             now = utc_now()
             with self.db.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                self._assert_signed_scan_replacement_allowed(
+                    session["response_letter_id"], connection
+                )
+                replaceable_message = self._replaceable_outlook_message(
+                    connection, session["response_letter_id"]
+                )
                 connection.execute(
                     """
                     UPDATE signed_response_scans
@@ -8425,6 +8554,14 @@ class WorkflowService:
                         now,
                         now,
                     ),
+                )
+                self._rebind_outlook_message_to_scan(
+                    connection,
+                    replaceable_message,
+                    scan_id,
+                    digest,
+                    now,
+                    actor,
                 )
                 connection.execute(
                     """
@@ -8546,6 +8683,7 @@ class WorkflowService:
         letter = self.get_response_letter(letter_id)
         if not letter:
             raise WorkflowValidationError("Готовое письмо не найдено")
+        self._assert_signed_scan_replacement_allowed(letter_id)
         if source not in {"upload", "wia"}:
             raise WorkflowValidationError("Неизвестный источник скана")
         safe_name = sanitize_filename(original_filename or "scan.pdf")
@@ -8582,6 +8720,13 @@ class WorkflowService:
             page_count = self._make_scan_pdf(original, pdf_path)
             now = utc_now()
             with self.db.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                self._assert_signed_scan_replacement_allowed(
+                    letter_id, connection
+                )
+                replaceable_message = self._replaceable_outlook_message(
+                    connection, letter_id
+                )
                 connection.execute(
                     """
                     UPDATE signed_response_scans
@@ -8642,6 +8787,14 @@ class WorkflowService:
                         ),
                         now,
                     ),
+                )
+                self._rebind_outlook_message_to_scan(
+                    connection,
+                    replaceable_message,
+                    scan_id,
+                    digest.hexdigest(),
+                    now,
+                    actor,
                 )
                 connection.execute(
                     """

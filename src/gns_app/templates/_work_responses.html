@@ -150,17 +150,17 @@
                   formaction="/response-letters/actions/send"
                   data-response-action="send" disabled>Отправить</button>
           <button class="button button-secondary button-compact" type="submit"
-                  formaction="/response-letters/actions/print-word"
-                  data-response-action="print-word" disabled
-                  onclick="return confirm('Распечатать выбранные Word-ответы?');">
-            Печатать Word
+                  formaction="/signed-response-scans/print-selected"
+                  formtarget="_blank" data-response-action="print-signed" disabled>
+            Печатать подписанные PDF
           </button>
           <details class="compact-menu bulk-action-menu">
             <summary class="button button-secondary button-compact">Ещё</summary>
             <div class="compact-menu-panel">
-              <button type="submit" formaction="/signed-response-scans/print-selected"
-                      formtarget="_blank" data-response-action="print-signed" disabled>
-                Печатать подписанные PDF
+              <button type="submit" formaction="/response-letters/actions/print-word"
+                      data-response-action="print-word" disabled
+                      onclick="return confirm('Распечатать выбранные Word-ответы?');">
+                Печатать Word
               </button>
               <button type="button" data-response-upload disabled>Загрузить сканы</button>
               <button type="submit" formaction="/response-letters/actions/mark-sent"
@@ -296,6 +296,8 @@
                     {% endif %}
                   {% elif letter.outlook_message and letter.outlook_message.status == 'send_requested' %}
                     <span class="status status-processing">Отправляется</span>
+                  {% elif letter.outlook_message and letter.outlook_message.status == 'scan_replaced' %}
+                    <span class="status status-needs_review">Скан заменён — обновите письмо</span>
                   {% elif letter.outlook_message and letter.outlook_message.status == 'draft_created' %}
                     <span class="status status-ready">Письмо подготовлено</span>
                   {% elif letter.signed_scan and letter.signed_scan.status == 'confirmed' %}
@@ -360,7 +362,7 @@
                               action="/response-letters/{{ letter.id }}/outlook-draft">
                           <input type="hidden" name="group_id" value="{{ group.id }}">
                           <button class="button button-primary button-compact" type="submit">
-                            {% if letter.outlook_message and letter.outlook_message.status == 'draft_created' %}Открыть письмо{% else %}Подготовить письмо в Outlook{% endif %}
+                            {% if letter.outlook_message and letter.outlook_message.status == 'draft_created' %}Открыть письмо{% elif letter.outlook_message and letter.outlook_message.status == 'scan_replaced' %}Обновить письмо Outlook{% else %}Подготовить письмо в Outlook{% endif %}
                           </button>
                         </form>
                       {% endif %}
@@ -404,7 +406,7 @@
                     <a href="/response-groups/{{ group.id }}">Скачать копию Word</a>
                     {% if group.opened_for_print_at %}
                       <a href="/?tab=responses&amp;response_view=created&amp;focus_letter={{ letter.id }}#letter-workflow">
-                        Загрузить готовый скан
+                        {% if letter.signed_scan %}Заменить скан{% else %}Загрузить готовый скан{% endif %}
                       </a>
                     {% endif %}
                     {% if outlook_test_send_enabled

@@ -771,6 +771,9 @@ EVENT_LABELS = {
     "abs_account_manually_checked": "Вручную проверено наличие счёта в АБС",
     "signed_response_scan_registered": "Зарегистрирован подписанный скан",
     "signed_response_scan_confirmed": "Подписанный скан проверен",
+    "outlook_draft_rebound_to_replacement_scan": (
+        "Черновик Outlook привязан к новому скану"
+    ),
     "signed_response_print_bundle_created": "Подготовлены выбранные сканы к печати",
     "district_place_edge_noise_removed": (
         "Удалены лишние краевые символы в реквизите ГНС"
@@ -2540,6 +2543,7 @@ def download_signed_response_scan(scan_id: str):
         path,
         media_type="application/pdf",
         filename=workflow.signed_scan_download_filename(scan_id),
+        content_disposition_type="inline",
     )
 
 

@@ -2904,6 +2904,14 @@ class OutlookOutgoingService:
             "SELECT * FROM outlook_outgoing_messages WHERE signed_scan_id = ?",
             (scan["id"],),
         )
+        replacing_scan_draft = bool(
+            existing and existing.get("status") == "scan_replaced"
+        )
+        if replacing_scan_draft:
+            # The database row was rebound to a newer signed scan. Keep the
+            # original key so the worker updates that Outlook draft in place.
+            draft_key = str(existing.get("draft_key") or draft_key)
+            replace_existing = True
         reopening_existing = bool(
             existing
             and existing.get("status") == "draft_created"
