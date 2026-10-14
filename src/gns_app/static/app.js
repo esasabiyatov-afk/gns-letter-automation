@@ -1103,8 +1103,9 @@
     const now = new Date();
     time.dateTime = now.toISOString();
     time.textContent = now.toLocaleString("ru-RU", {
-      day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit",
-    });
+      day: "2-digit", month: "2-digit", year: "numeric",
+      hour: "2-digit", minute: "2-digit",
+    }).replace(",", "");
     meta.append(kind, time);
 
     const title = document.createElement("strong");

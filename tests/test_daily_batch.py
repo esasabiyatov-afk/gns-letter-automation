@@ -2329,14 +2329,14 @@ def test_outlook_sent_reconciliation_updates_status_once(workflow, monkeypatch):
     )
     assert page.status_code == 200
     assert "Отправлено" in page.text
-    assert "2026-09-04 10:30" in page.text
+    assert "04.09.2026 10:30" in page.text
     assert "002lenin@sti.gov.kg" in page.text
     assert "Повторный черновик" in page.text
     assert "Подготовить письмо в Outlook" not in page.text
     history = client.get("/history")
     assert history.status_code == 200
     assert "Отправлено" in history.text
-    assert "2026-09-04 10:30" in history.text
+    assert "04.09.2026 10:30" in history.text
 
 
 def test_outlook_draft_can_be_recreated_from_same_confirmed_pdf(workflow):

@@ -63,7 +63,7 @@ from gns_app.services.workflow import (
     WorkflowValidationError,
 )
 from gns_app.text_cleanup import clean_taxpayer_name
-from gns_app.time_display import local_datetime
+from gns_app.time_display import local_date, local_datetime
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -607,6 +607,7 @@ ASSET_VERSION = str(
 )
 templates.env.globals["asset_version"] = ASSET_VERSION
 templates.env.filters["local_datetime"] = local_datetime
+templates.env.filters["local_date"] = local_date
 
 
 STATUS_LABELS = {

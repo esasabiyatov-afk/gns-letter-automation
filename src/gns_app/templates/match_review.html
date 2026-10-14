@@ -83,7 +83,7 @@
           <dt>Период</dt>
           <dd>
             {% if source.period_start and source.period_end %}
-              {{ source.period_start }} — {{ source.period_end }}
+              {{ source.period_start|local_date }} — {{ source.period_end|local_date }}
             {% elif source.period_route == 'odb' %}по данным ОДБ
             {% else %}без ОДБ{% endif %}
           </dd>

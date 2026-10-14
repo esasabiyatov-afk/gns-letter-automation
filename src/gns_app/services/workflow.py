@@ -79,6 +79,7 @@ from gns_app.services.taxpayer_service import (
 )
 from gns_app.services.word_service import WordTemplateError, WordTemplateService
 from gns_app.text_cleanup import clean_location, clean_taxpayer_name
+from gns_app.time_display import local_day_end_utc, local_day_start_utc
 
 
 class WorkflowValidationError(ValueError):
@@ -11335,16 +11336,13 @@ class WorkflowService:
                 )"""
             )
             parameters.append(outgoing_filter)
+        # Отметки хранятся в UTC, а фильтр задаётся днями по местному времени.
         if from_filter:
-            conditions.append(
-                "substr(COALESCE(received_at, uploaded_at), 1, 10) >= ?"
-            )
-            parameters.append(from_filter)
+            conditions.append("COALESCE(received_at, uploaded_at) >= ?")
+            parameters.append(local_day_start_utc(from_filter))
         if to_filter:
-            conditions.append(
-                "substr(COALESCE(received_at, uploaded_at), 1, 10) <= ?"
-            )
-            parameters.append(to_filter)
+            conditions.append("COALESCE(received_at, uploaded_at) < ?")
+            parameters.append(local_day_end_utc(to_filter))
         if district_filter:
             conditions.append("district_place = ?")
             parameters.append(district_filter)

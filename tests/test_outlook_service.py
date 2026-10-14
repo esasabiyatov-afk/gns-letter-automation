@@ -16,6 +16,7 @@ from PIL import Image
 from pypdf import PdfWriter
 
 from gns_app.database import utc_now
+from gns_app.time_display import outlook_time_to_utc
 
 from gns_app.services.outlook_service import (
     OutlookAccountInfo,
@@ -1036,7 +1037,8 @@ def test_com_gateway_confirms_only_exact_sent_item(monkeypatch, tmp_path):
         OutlookSentMatch(
             draft_key="gns-scan-confirmed",
             entry_id="sent-entry-1",
-            sent_at="2026-09-04T10:30:00",
+            # Outlook local wall-clock time is stored as UTC.
+            sent_at=outlook_time_to_utc(datetime(2026, 9, 4, 10, 30)),
         ),
     )
 

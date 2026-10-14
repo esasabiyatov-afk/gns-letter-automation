@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 from uuid import uuid4
@@ -487,6 +487,7 @@ class Database:
             self._release_legacy_superseded_outgoing_numbers(connection)
             self._clean_legacy_district_places(connection)
             self._normalize_legacy_taxpayer_names(connection)
+            self._fix_legacy_outlook_local_timestamps(connection)
 
     @staticmethod
     def _ensure_upload_columns(connection: sqlite3.Connection) -> None:
@@ -905,6 +906,101 @@ class Database:
                         "WHERE id = ?",
                         (cleaned, utc_now(), row["id"]),
                     )
+
+    OUTLOOK_TIME_FIX_SETTING = "migration.outlook_local_timestamps_fixed"
+
+    @staticmethod
+    def _fix_legacy_outlook_local_timestamps(
+        connection: sqlite3.Connection,
+    ) -> None:
+        # Ранние версии сохраняли время Outlook (местное) с пометкой UTC,
+        # из-за чего интерфейс показывал его на смещение пояса позже.
+        # Исправляются только значения, которые точно пришли из Outlook:
+        # время получения и время отправки, подтверждённое журналом.
+        if connection.execute(
+            "SELECT 1 FROM settings WHERE key = ?",
+            (Database.OUTLOOK_TIME_FIX_SETTING,),
+        ).fetchone():
+            return
+
+        def convert(value: str) -> str | None:
+            try:
+                parsed = datetime.fromisoformat(value)
+            except (TypeError, ValueError):
+                return None
+            if parsed.utcoffset() not in (None, timedelta(0)):
+                return None
+            local = parsed.replace(tzinfo=None).astimezone()
+            return local.astimezone(UTC).isoformat(timespec="seconds")
+
+        fixed: dict[str, int] = {"received_at": 0, "sent_at": 0, "resent_at": 0}
+        for row in connection.execute(
+            "SELECT source_key, received_at FROM outlook_messages"
+        ).fetchall():
+            converted = convert(row["received_at"])
+            if converted and converted != row["received_at"]:
+                connection.execute(
+                    "UPDATE outlook_messages SET received_at = ? "
+                    "WHERE source_key = ?",
+                    (converted, row["source_key"]),
+                )
+                fixed["received_at"] += 1
+
+        confirmations = (
+            ("sent_at", "outlook_sent_confirmed"),
+            ("resent_at", "outlook_resend_confirmed"),
+        )
+        for column, event_type in confirmations:
+            confirmed: set[tuple[str, str]] = set()
+            for event in connection.execute(
+                "SELECT entity_id, payload_json FROM audit_events "
+                "WHERE entity_type = 'outlook_outgoing_message' "
+                "AND event_type = ?",
+                (event_type,),
+            ).fetchall():
+                try:
+                    sent_at = json.loads(event["payload_json"]).get("sent_at")
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if sent_at:
+                    confirmed.add((str(event["entity_id"]), str(sent_at)))
+            for row in connection.execute(
+                f"SELECT id, {column} FROM outlook_outgoing_messages "
+                f"WHERE {column} IS NOT NULL"
+            ).fetchall():
+                if (str(row["id"]), str(row[column])) not in confirmed:
+                    continue
+                converted = convert(row[column])
+                if converted and converted != row[column]:
+                    connection.execute(
+                        f"UPDATE outlook_outgoing_messages SET {column} = ? "
+                        "WHERE id = ?",
+                        (converted, row["id"]),
+                    )
+                    fixed[column] += 1
+
+        now = utc_now()
+        connection.execute(
+            "INSERT INTO settings(key, value, updated_at) VALUES (?, ?, ?)",
+            (Database.OUTLOOK_TIME_FIX_SETTING, now, now),
+        )
+        if any(fixed.values()):
+            connection.execute(
+                """
+                INSERT INTO audit_events(
+                    entity_type, entity_id, event_type,
+                    actor, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "database",
+                    "outlook_timestamps",
+                    "outlook_local_timestamps_fixed",
+                    "system",
+                    json.dumps(fixed, ensure_ascii=False),
+                    now,
+                ),
+            )
 
     def execute(self, sql: str, parameters: Sequence[Any] = ()) -> None:
         with self.connect() as connection:

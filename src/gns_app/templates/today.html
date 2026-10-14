@@ -123,7 +123,7 @@
       </div>
       <div class="odb-quick-actions">
         <small>
-          {% if item.period_start %}Период с {{ item.period_start }}
+          {% if item.period_start %}Период с {{ item.period_start|local_date }}
           {% else %}Маршрут ОДБ выбран сотрудником{% endif %}
         </small>
       </div>

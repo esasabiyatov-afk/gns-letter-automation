@@ -87,7 +87,7 @@
       <div><dt>Полное ФИО</dt><dd>{{ case.recipient_full_name or '—' }}</dd></div>
       <div><dt>Период</dt><dd>
         {% if case.period_start and case.period_end %}
-          {{ case.period_start }} — {{ case.period_end }}
+          {{ case.period_start|local_date }} — {{ case.period_end|local_date }}
         {% elif case.period_route == 'odb' %}
           Даты не читаются · проверить в ОДБ
         {% elif case.period_route == 'no_odb' %}

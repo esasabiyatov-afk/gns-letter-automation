@@ -300,7 +300,7 @@
       <div class="outlook-status outlook-status-{{ outlook_status.state }}">
         <strong>{{ outlook_status.message }}</strong>
         {% if outlook_status.checked_at %}
-          <small>Проверено: {{ outlook_status.checked_at }}</small>
+          <small>Проверено: {{ outlook_status.checked_at|local_datetime(true) }}</small>
         {% endif %}
       </div>
       {% if outlook_test_mode %}

@@ -24,6 +24,7 @@ from gns_app.config import Settings
 from gns_app.diagnostics import record_event, record_exception
 from gns_app.runtime_commands import module_command
 from gns_app.database import Database, utc_now
+from gns_app.time_display import outlook_time_to_utc
 from gns_app.services.storage import (
     SUPPORTED_INPUT_EXTENSIONS,
     StorageError,
@@ -1628,7 +1629,9 @@ class PyWin32OutlookGateway:
                     else:
                         fallback_keys: list[str] = []
                         try:
-                            comparable_sent_on = sent_on.astimezone()
+                            comparable_sent_on = datetime.fromisoformat(
+                                outlook_time_to_utc(sent_on)
+                            )
                         except (AttributeError, OSError, ValueError):
                             rejected += 1
                             continue
@@ -1658,7 +1661,7 @@ class PyWin32OutlookGateway:
                         OutlookSentMatch(
                             draft_key=matched_key,
                             entry_id=entry_id,
-                            sent_at=sent_on.isoformat(),
+                            sent_at=outlook_time_to_utc(sent_on),
                         )
                     )
                 except Exception:
@@ -1973,7 +1976,9 @@ class PyWin32OutlookGateway:
                                 OutlookScannedMessage(
                                     source_key=source_key,
                                     sender_smtp=sender_smtp,
-                                    received_at=received_time.isoformat(),
+                                    received_at=outlook_time_to_utc(
+                                        received_time
+                                    ),
                                     attachment_count=0,
                                     pdf_attachment_count=0,
                                     attachments=(),
@@ -2029,7 +2034,7 @@ class PyWin32OutlookGateway:
                         OutlookScannedMessage(
                             source_key=source_key,
                             sender_smtp=sender_smtp,
-                            received_at=received_time.isoformat(),
+                            received_at=outlook_time_to_utc(received_time),
                             attachment_count=attachment_count,
                             pdf_attachment_count=supported_count,
                             attachments=tuple(attachments),
@@ -2497,7 +2502,7 @@ class OutlookService:
         mailbox: str = "",
     ) -> OutlookDiagnosticResult:
         started = time.monotonic()
-        checked_at = datetime.now().astimezone().strftime("%d.%m.%Y %H:%M:%S")
+        checked_at = utc_now()
         try:
             with self._operation_lock:
                 probe = self.gateway.inspect(
@@ -4486,7 +4491,7 @@ class OutlookInboxImporter:
                 try:
                     received_day = datetime.fromisoformat(
                         message.received_at
-                    ).date().isoformat()
+                    ).astimezone().date().isoformat()
                 except ValueError:
                     received_day = date.today().isoformat()
                 # Учитываем путь из локальных настроек, а не только значение,
